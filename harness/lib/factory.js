@@ -88,9 +88,12 @@ function validatePlan(plan, o) {
 }
 
 // ── 합류(통합 브랜치에 하나씩) ────────────────────────────────────────────────
+// [2026-10-25 사용 분석 · C++ 저장소] 실패한 검사는 go · accept 처럼 한 번 더 돌린다 — 불안정한 시험 하나(1 failing)로 카드를 되돌리고
+//   처음부터 다시 돌렸다(재시도 10번 중 8번 · 카드 한 번에 수십 분 · 수 달러). 프로젝트 블록 rerun_failed: off 면 다시 돌리지 않는다.
 async function runChecks(c) {
   if (!c.commands.length) return null;
-  return K.runAll(c.intWt, c.commands, { timeoutMs: c.checkTimeoutMs });
+  const rerun = !/^(off|false|no)$/i.test(K.yamlString(c.root, 'rerun_failed') || '');
+  return (await K.runJudged(c.intWt, c.commands, { timeoutMs: c.checkTimeoutMs, rerun })).judged;
 }
 async function mergeCard(c, card, task) {
   if (c.baselineP) await c.baselineP;   // 통합 worktree 에서 기준선 검사가 끝난 뒤에만 합친다
@@ -250,7 +253,7 @@ function finish(c, log) {
 // ── 보고 · 상태 · 멈춤 ───────────────────────────────────────────────────────
 function report(root, run) {
   const ko = run.language === 'Korean', cli = 'node harness/cli.js';
-  const L = [`pilot factory ${run.id} — ${String(run.status).toUpperCase()}`, `${ko ? '이유' : 'why'}: ${run.reason || ''}`,
+  const L = [`pilot factory ${run.id} — ${String(run.status).toUpperCase()}${deadMark(run)}`, `${ko ? '이유' : 'why'}: ${run.reason || ''}`,
     `${ko ? '요구' : 'request'}: ${String(run.request).replace(/\s+/g, ' ').slice(0, 200)}`,
     `${ko ? '통합 브랜치' : 'integration branch'}: ${run.branch}${run.head ? ` @ ${run.head.slice(0, 10)}` : ''} (${ko ? '기준' : 'from'} ${run.base_branch} @ ${String(run.base_commit).slice(0, 10)}) — ${ko ? '사용자 브랜치는 그대로다' : 'your branch is unchanged'}`,
     `${ko ? '비용' : 'cost'}: $${run.spent_usd != null ? run.spent_usd : '?'} / ${ko ? '상한' : 'budget'} $${run.budget_usd} · ${ko ? '동시' : 'jobs'} ${run.jobs}`,
@@ -265,8 +268,10 @@ function report(root, run) {
   if (run.status === 'done' || run.status === 'partial') L.push(`${ko ? '다음' : 'next'}: ${ko ? '통합 브랜치를 확인한 뒤 받아들이기(사용자가 말한 뒤)' : 'review the integration branch, then accept it (only after the user says so)'}: git log ${run.branch} · ${cli} factory accept ${run.id}`);
   return L.join('\n');
 }
+// [2026-10-25 사용 분석 · C++ 저장소] 프로세스가 죽은 실행이 RUNNING 으로 남아(20개 중 11개) 무엇이 실제로 도는지 알 수 없었다 — go 의 status 처럼 OWNER DEAD 를 붙인다.
+const deadMark = r => r.status === 'running' && r.owner && !S.ownerAlive(r.owner) ? ' · OWNER DEAD' : '';
 function status(root) {
-  return listRuns(root).map(r => `${r.id} ${String(r.status).toUpperCase()} stage ${r.stage} · ${r.cards.filter(x => x.status === 'merged').length}/${r.cards.length} merged · $${r.spent_usd != null ? r.spent_usd : '?'} — ${String(r.request).replace(/\s+/g, ' ').slice(0, 80)}`).join('\n') || 'no factory runs';
+  return listRuns(root).map(r => `${r.id} ${String(r.status).toUpperCase()}${deadMark(r)} stage ${r.stage} · ${r.cards.filter(x => x.status === 'merged').length}/${r.cards.length} merged · $${r.spent_usd != null ? r.spent_usd : '?'} — ${String(r.request).replace(/\s+/g, ' ').slice(0, 80)}`).join('\n') || 'no factory runs';
 }
 function requestStop(root, fid) {
   const r = readRun(root, fid);

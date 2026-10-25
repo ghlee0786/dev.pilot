@@ -526,7 +526,15 @@ const claudeWrite = (repo, sid, file, tool) => hook('track', { hook_event_name: 
         tool('Write', `${W3}/.harness/t-20261020-000000-aaaa/PLAN.md`), tool('Write', `${W3}/tests/billing/test_x.py`), decAt('Set-Content -Path .\\src\\billing\\c.py -Value x', 'PowerShell')];
       const ownBlock = [decAt('echo x > src/other/a.py', 'Bash'), decAt('rm -rf src', 'Bash'), decAt('mv src/billing/a.py src/shared/a.py', 'Bash'), decAt('rm -rf .', 'Bash'),
         tool('Edit', `${W3}/src/shared/util.py`), tool('Write', `${W3}/tests/billing/test_y.py`), tool('MultiEdit', `${W3}/docsx/a.md`), decAt('Set-Content -Path .\\src\\shared\\c.py -Value x', 'PowerShell')];
+      // [2026-10-25 사용 분석] git 이 무시하는 산출물(build/)은 소유 경로 밖이어도 지우고 만든다 · 추적되는 소스는 그대로 막는다
+      const exclude = path.join(require('node:child_process').spawnSync('git', ['rev-parse', '--git-common-dir'], { cwd: wtA, encoding: 'utf8' }).stdout.trim().replace(/^(?![A-Za-z]:|\/)/, `${wtA}/`), 'info', 'exclude');
+      const exclude0 = fs.existsSync(exclude) ? fs.readFileSync(exclude, 'utf8') : null;
+      fs.mkdirSync(path.dirname(exclude), { recursive: true }); fs.writeFileSync(exclude, `${exclude0 || ''}\nbuild/\n`);
+      const ignPass = [decAt('Remove-Item -Recurse -Force build/check', 'PowerShell'), decAt('rm -rf build/sc && mkdir -p build/sc', 'Bash'), tool('Write', `${W3}/build/e2e/run.ps1`)];
+      const ignBlock = [decAt('rm -rf src/shared', 'Bash'), decAt('Remove-Item -Recurse -Force src', 'PowerShell')];
+      if (exclude0 === null) fs.rmSync(exclude, { force: true }); else fs.writeFileSync(exclude, exclude0);
       if (keepOwns === undefined) delete process.env.HARNESS_OWNS; else process.env.HARNESS_OWNS = keepOwns;
+      R.check('[guard/worker-owns] git 이 무시하는 산출물(build/)은 소유 경로 밖이어도 지우고 만든다 · 추적 소스(src)는 막는다', ignPass.every(x => !x) && ignBlock.every(x => x && /소유/.test(x)), JSON.stringify({ p: ignPass.map(x => x && String(x).slice(-70)), b: ignBlock.map(x => !!x) }));
       R.check('[guard/worker-owns] 소유 경로 안 · 하네스 기록 · 임시 폴더는 쓴다(셸 · Edit/Write · PowerShell · 폴더 접두 · 정확한 파일)', ownPass.every(x => !x), JSON.stringify(ownPass.map(x => x && String(x).slice(-80))));
       R.check('[guard/worker-owns] 소유 경로 밖(다른 폴더 · 상위 폴더 삭제 · 밖으로 이동 · worktree 전체 · 이름만 비슷한 폴더)은 막고 이유에 소유 경로를 적는다', ownBlock.every(x => x && /소유/.test(x)), JSON.stringify(ownBlock.map(x => x && String(x).slice(-60))));
       const noOwns = [tool('Edit', `${W3}/src/anything.py`), tool('Write', `${U}/k.txt`)];

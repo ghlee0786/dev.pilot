@@ -356,6 +356,12 @@ fs.writeFileSync(process.env.DUMP,JSON.stringify(e));process.stdin.resume();proc
     const rcArgs = require('../../harness/lib/runner-claude.js').buildArgs({ model: 'opus', addDirs: ['C:/r/docs/prds', 'C:/r/docs/designs'] }, 'S.json', 'u-1');
     const ai = rcArgs.indexOf('--add-dir');
     R.check('[RN-16] addDirs 는 --add-dir 로 넘기고 다음 인자는 옵션이다(가변 인자를 끊는다)', ai > 0 && rcArgs[ai + 1] === 'C:/r/docs/prds' && rcArgs.lastIndexOf('--add-dir') > ai && /^-/.test(rcArgs[rcArgs.lastIndexOf('--add-dir') + 2] || '-'), rcArgs.join(' '));
+    // ── [2026-10-25 사용 분석] 작업 worktree 에서 돌면 하네스가 정해 준 임시 폴더(TEMP)를 --add-dir 로 연다 — acceptEdits 가 그 폴더의 Write 를 거부했다 ──
+    const tmpBase0 = process.env.HARNESS_TMP_BASE; process.env.HARNESS_TMP_BASE = path.join(base, 'tmpbase');
+    const wt27 = path.join(base, 'repo27', '.harness-worktrees', 't-20261025-000000-abcd'), tmp27 = require('../../harness/lib/resources.js').envFor(wt27).TEMP;
+    const a27 = rc.buildArgs({ cwd: wt27 }, 'S.json', 'u-1'), o27 = rc.buildArgs({ cwd: path.join(base, 'plain') }, 'S.json', 'u-1');
+    if (tmpBase0 === undefined) delete process.env.HARNESS_TMP_BASE; else process.env.HARNESS_TMP_BASE = tmpBase0;
+    R.check('[RN-20] 작업 worktree 의 Claude 작업자는 그 작업의 임시 폴더를 --add-dir 로 받는다 · worktree 밖이면 없다', !!tmp27 && a27[a27.indexOf('--add-dir') + 1] === tmp27 && !o27.includes('--add-dir'), JSON.stringify({ tmp27, a27 }));
     // ── [2026-09-30 실측] Codex Windows 샌드박스 — elevated 가 준비 안 된 PC 에서 모든 쓰기·실행이 "apply deny-read ACLs" 로 실패했다 ──
     const cxArgs = o => rx.buildArgs({ cwd: 'W', ...o }).join(' ');
     R.check('[RN-14] Windows 에서는 기본으로 windows.sandbox="unelevated" 를 넘긴다', cxArgs({ platform: 'win32', env: {} }).includes('-c windows.sandbox="unelevated"'), cxArgs({ platform: 'win32', env: {} }));

@@ -610,8 +610,13 @@ function ownsCheck(root, norm, t, ctx) {
   if (!globs) return null;
   const rel = path.relative(C.real(root), norm).replace(/\\/g, '/');
   if (rel === '') return `${REASONS.workerOwns} (대상: worktree 전체)`;
-  if (/^\.harness(\/|$)/.test(rel) || owned(rel, globs)) return null;
+  if (/^\.harness(\/|$)/.test(rel) || owned(rel, globs) || gitIgnored(root, rel)) return null;
   return `${REASONS.workerOwns} (대상: ${rel} · 소유: ${globs.join(', ')})`;
+}
+// [2026-10-25 사용 분석 · C++ 저장소] git 이 무시하는 곳(build/ 같은 산출물)은 worktree 마다 따로라 다른 작업자와 엉키지 않는다 —
+//   소유 경로로 막으니 카드 작업자가 자기 빌드 폴더를 지우고 다시 만들지 못해 우회했다. 추적되는 파일은 무시 규칙에 걸려도 막는다(check-ignore 기본).
+function gitIgnored(root, rel) {
+  try { return require('node:child_process').spawnSync('git', ['check-ignore', '-q', '--', rel], { cwd: root, windowsHide: true, timeout: 5000 }).status === 0; } catch { return false; }
 }
 // 파일 쓰기 도구(Edit · Write · MultiEdit · NotebookEdit) — 셸 명령과 같은 경계(worktree · 소유 경로)
 function checkFileWrite(file, cwd, owns) {

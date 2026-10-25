@@ -195,6 +195,24 @@ fs.mkdirSync(p.join(o.cwd,'src','z'),{recursive:true});fs.writeFileSync(p.join(o
     R.check('[FA-10] (#44 #45) factory - · --goal-file — 계획자가 받는 요청이 stdin · 파일 본문 · 둘 다 주면 2(회차 없음)', /STDIN-BODY/.test(s10.prompt) && /FILE-BODY/.test(f10.prompt) && b10.code === 2 && !b10.prompt,
       JSON.stringify({ s: s10.prompt.slice(0, 80), f: f10.prompt.slice(0, 80), b: b10.code, e: b10.errs.slice(0, 120) }));
 
+    // FA-11 — [2026-10-25 사용 분석] 통합 브랜치 검사가 한 번만 흔들려 실패(다시 돌리면 통과)하면 카드를 되돌리지 않는다 — go · accept 처럼 실패한 검사를 한 번 더 돌린다
+    const r11 = repo(), flag11 = JSON.stringify(path.join(base, 'flaky11.flag'));
+    write(path.join(r11, 'check.js'), `const fs=require('fs');if(fs.existsSync('src/a/a.js')&&/-int/.test(process.cwd())&&!fs.existsSync(${flag11})){fs.writeFileSync(${flag11},'x');console.log('# pass 0\\n# fail 1');process.exit(1)}console.log('# pass 1\\n# fail 0')\n`);
+    git(r11, 'add', '-A'); git(r11, 'commit', '-qm', 'flaky check');
+    const f11 = fake([plan([{ id: 'ka', title: 'ka', goal: 'create src/a/a.js', owns: ['src/a/**'], depends_on: [] }])], { ka: o => write(path.join(o.cwd, 'src/a/a.js'), '1\n') });
+    const g11 = await F.start({ ...quiet, root: r11, request: 'make ka', run: f11.run });
+    const ka11 = F.readRun(r11, g11.id).cards.find(c => c.id === 'ka');
+    R.check('[FA-11] 통합 검사가 한 번 흔들려도(다시 돌리면 통과) 카드를 되돌려 다시 돌리지 않는다 — 한 번에 merged · 작업자 1회', g11.status === 'done' && ka11.status === 'merged' && ka11.attempts === 1 && f11.calls.work.length === 1 && fs.existsSync(JSON.parse(flag11)),
+      JSON.stringify({ s: g11.status, why: g11.reason, st: ka11.status, at: ka11.attempts, w: f11.calls.work.length }));
+
+    // FA-12 — [2026-10-25 사용 분석] 프로세스가 죽은 실행은 status · 보고에 OWNER DEAD 가 붙는다(살아 있는 실행 · 끝난 실행은 붙지 않는다)
+    const run12 = F.readRun(r11, g11.id), dead12 = { ...run12, status: 'running', owner: { pid: 2147483646, host: os.hostname() } };
+    fs.writeFileSync(F.dirs(r11, g11.id).file, JSON.stringify(dead12));
+    const st12 = F.status(r11), rp12 = F.report(r11, F.readRun(r11, g11.id));
+    fs.writeFileSync(F.dirs(r11, g11.id).file, JSON.stringify({ ...dead12, owner: { pid: process.pid, host: os.hostname() } }));
+    const live12 = F.status(r11);
+    R.check('[FA-12] 죽은 실행은 RUNNING · OWNER DEAD(status · 보고) · 살아 있으면 붙지 않는다', /RUNNING · OWNER DEAD/.test(st12) && /RUNNING · OWNER DEAD/.test(rp12.split('\n')[0]) && !/OWNER DEAD/.test(live12) && !/OWNER DEAD/.test(F.status(r2)), JSON.stringify({ st12, live12 }));
+
     // FA-06 — 상태 · 멈춤
     R.check('[FA-06] factory status 는 실행마다 한 줄', F.status(r2).split('\n').length === 1 && /ACCEPTED/.test(F.status(r2)), F.status(r2));   // FA-07 이 받아들인 뒤
     R.check('[FA-06] 끝난 실행의 멈춤 요청은 "not running"', F.requestStop(r2, g2.id).reason === 'not running');

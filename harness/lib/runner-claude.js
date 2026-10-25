@@ -41,6 +41,10 @@ function buildArgs(o, settingsFile, sessionIdForNew) {
   // 무인 실행: 묻는 도구는 아무도 답하지 않으므로 즉시 거부되게 한다(2.1.283 에 있음 · 2.1.248 에는 없음 → 호출자가 버전으로 켠다).
   if (o.promptsNone) a.push('--permission-prompts', 'none');
   for (const d of o.addDirs || []) a.push('--add-dir', String(d));   // 읽기용 추가 폴더(--doc 명세) — 다음 인자는 항상 '-' 로 시작해 가변 인자를 끊는다
+  // [2026-10-25 사용 분석 · C++ 저장소] 하네스가 작업마다 정해 준 임시 폴더(TEMP)는 worktree 밖이라 acceptEdits 가 Write · Edit 를 거부했다 —
+  //   guard 는 허용하고 "임시 파일은 이 폴더에" 라고 안내하면서, 작업자는 거기에 스크립트를 쓰다 막혀 우회했다(작업 58개 중 6번). 작업 폴더로 더한다.
+  const tmp = o.cwd ? require('./resources').envFor(o.cwd).TEMP : null;
+  if (tmp) a.push('--add-dir', tmp);
   if (o.sessionId) a.push('--resume', String(o.sessionId));
   else a.push('--session-id', sessionIdForNew);
   return a;
