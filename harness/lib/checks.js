@@ -163,6 +163,17 @@ function lintArgv(cmd, files) {
   if (!(files || []).length) return null;
   return [c.replace(/{files}/g, files.map(shq).join(' '))];
 }
+// [자동 이슈 #38] 작업에 기록된 린트를 프로젝트 블록의 지금 lint_command 에 맞춘다(resume · accept) — 작업 뒤 {files} 로 바꿔도
+//   시작 때 값으로 계속 거절했다. dirs 순서대로 처음 찾은 값을 쓴다. 바뀌었으면 { from, to }, 그대로면 null.
+function syncLint(task, dirs) {
+  let now = null;
+  for (const d of dirs) { if (d && (now = yamlString(d, 'lint_command'))) break; }
+  const was = task.checks.lint ? task.checks.lint.command : null;
+  if ((now || null) === (was || null)) return null;
+  if (now) task.checks.lint = { command: now, files: /{files}/.test(now), baseline_ok: null, last: null };
+  else delete task.checks.lint;
+  return { from: was, to: now || null };
+}
 
 // ── 검사 정의(M6) ─────────────────────────────────────────────────────
 // 검사 명령 문자열은 작업 시작 때 고정되지만, 그 명령이 읽는 정의(package.json scripts.test · pytest 설정 · 명령이 가리키는 스크립트)는
@@ -415,6 +426,6 @@ function failureExcerpt(judged) {
     `### \`${r.command}\` — exit ${r.exit_code == null ? 'none' : r.exit_code}${r.timed_out ? ' (timed out)' : ''}${r.found ? ` · ${r.pass} pass / ${r.fail} fail` : ''}\n\`\`\`\n${clip(r.output, 1500, 2500).trim()}\n\`\`\``).join('\n\n');
 }
 
-module.exports = { lintArgv, yamlNumber, yamlString, yamlList, yamlListOf, spawnSpec, DEFAULT_ALLOW, NEVER_ALLOW, CHECK_TIMEOUT_MS, splitCommand, display, isShellString, discover, repoKinds, allowCommands, programName, parseSummary,
+module.exports = { lintArgv, syncLint, yamlNumber, yamlString, yamlList, yamlListOf, spawnSpec, DEFAULT_ALLOW, NEVER_ALLOW, CHECK_TIMEOUT_MS, splitCommand, display, isShellString, discover, repoKinds, allowCommands, programName, parseSummary,
   runCheck, runAll, runJudged, isolateHangs, STALL_MS, summarize, brief, judge, worseThan, signature, firstAssertion, failureExcerpt, clip, killTree, childEnv,
   definitions, commandsForJudge, checksModified, isNpmTest, npmTestScript, yamlTestCommandOf };

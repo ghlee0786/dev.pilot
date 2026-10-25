@@ -45,8 +45,9 @@ function find(wt, base, o) {
   const on = r => !off.has(r);
   const untracked = new Set(G.statusEntries(wt).filter(e => e.code === '??').map(e => rel(e.path)));
   const modified = new Set(G.diffNames(wt, base, null, ['--diff-filter=M']).map(rel));
+  const own = D.harnessCopy(wt);
   const changed = [...new Set([...G.diffNames(wt, base, null, ['--diff-filter=AM']).map(rel), ...untracked])]
-    .filter(f => !D.SKIP.test(f) && !/^\.harness\//.test(f) && fs.existsSync(path.join(wt, f)) && (D.CODE_EXT.test(f) || CONF_EXT.test(f)));
+    .filter(f => !D.SKIP.test(f) && !/^\.harness\//.test(f) && !own(f) && fs.existsSync(path.join(wt, f)) && (D.CODE_EXT.test(f) || CONF_EXT.test(f)));
   const out = [], defs = [], amap = D.addedMap(wt, base);
   for (const f of changed) {
     const lines = readLines(path.join(wt, f)); if (!lines) continue;
@@ -89,7 +90,7 @@ function find(wt, base, o) {
     const stat = extra => { const m = new Map(); for (const l of G.git(wt, ['-c', 'core.quotepath=off', 'diff', '--numstat', '--no-renames', ...extra, base], { allowFail: true }).out.split(/\r?\n/)) { const p = /^(\d+|-)\t(\d+|-)\t(.+)$/.exec(l); if (p) m.set(rel(p[3]), p[1] === '-' ? -1 : Number(p[1]) + Number(p[2])); } return m; };
     const all = stat([]), ws = stat(['-w', '--ignore-blank-lines']);
     for (const f of modified) {
-      if (D.SKIP.test(f) || /^\.harness\//.test(f) || !(all.get(f) > 0)) continue;
+      if (D.SKIP.test(f) || /^\.harness\//.test(f) || own(f) || !(all.get(f) > 0)) continue;
       if (!(ws.get(f) > 0)) out.push({ rule: 'format-only', file: f, line: 0, text: '공백 · 들여쓰기만 바뀌었다' });
     }
   }

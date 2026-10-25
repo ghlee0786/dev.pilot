@@ -41,7 +41,7 @@ const REFUSE_KO = [
   [/^uncommitted changes in (\S+) touch files this (?:task changed|task changes|would change): (.*) — commit them first$/s, m => `${m[1]} 의 미커밋 변경이 이 작업의 파일과 겹친다: ${m[2]} — 먼저 커밋하세요`],
   [/^target branch (\S+) is not checked out in any checkout(.*)$/s, m => `대상 브랜치 ${m[1]} 가 어느 체크아웃에도 열려 있지 않다 — 메인 체크아웃에서 열고 다시 하세요`],
   [/^checks fail after bringing (\S+) into (\S+) \((\d+) failing\)(.*)$/s, m => `${m[1]} 를 ${m[2]} 에 들인 뒤 검사가 실패한다(${m[3]}건) — 결과 브랜치에 ${m[1]} 가 들어 있다. resume 하거나 고친 뒤 다시 accept`],
-  [/^lint fails on (\S+) \((.*?)\): (.*) — resume or fix it, then accept again$/s, m => `${m[1]} 에서 린트가 실패한다(${m[2]}): ${m[3]} — resume 하거나 고친 뒤 다시 accept`],
+  [/^lint fails on (\S+) \((.*?)\): (.*) — resume or fix it, then accept again( \(this lints the whole repository.*\))?$/s, m => `${m[1]} 에서 린트가 실패한다(${m[2]}): ${m[3]} — resume 하거나 고친 뒤 다시 accept${m[4] ? ' (저장소 전체 린트다 — lint_command 에 {files} 를 쓰면 바꾼 파일만 본다(accept 는 지금 값을 읽는다) · 또는 accept --force)' : ''}`],
   [/^this task is stacked on (\S+) \(task (\S+?)(?:, (\w+))?\) — (.*)$/s, m => `이 작업은 ${m[1]} 위에 쌓은 작업이다(앞 작업 ${m[2]}${m[3] ? ` · ${m[3]}` : ''}) — 앞 작업을 먼저 accept 하면(그러면 이 작업도 같은 브랜치로 따라간다) 되고, 아니면 --into <브랜치>`],
   [/^the previous worktree (\S+) is still being removed(.*)$/s, m => `이전 worktree ${m[1]} 가 아직 지워지는 중이다(다른 프로세스가 파일을 잡고 있다) — 1분쯤 뒤 다시 하세요`],
 ];
@@ -286,8 +286,12 @@ async function accept(o) {
     }
     // 린트 — 대상 브랜치를 들인 뒤에도 작업이 바꾼 파일에서 다시 본다(루프에서 통과했어도 그 뒤의 커밋 · 대상 브랜치가 깨뜨릴 수 있다).
     //   [2026-10-14 자동 이슈 #3] 새로 만든 worktree 는 빌드 · 복원 산출물이 없어(--no-restore 린트) 루프에서 통과한 린트가 거절됐다.
+    const lintSync = K.syncLint(task, [co.path, root, P.wt]);
+    if (lintSync) S.log(root, task.id, { event: 'lint_command_changed', phase: 'accept', ...lintSync });
     const lintPassedInLoop = task.checks.lint && task.checks.lint.last && task.checks.lint.last.ok;
     if (task.checks.lint && unchangedSinceLoop && !broughtTarget && lintPassedInLoop) S.log(root, task.id, { event: "lint", phase: "accept", ok: true, reused: "passed in the loop; nothing changed since" });
+    // [자동 이슈 #38] --force 는 사용자가 검사 결과를 알고 합치기로 한 것 — 검사(#31)처럼 린트도 건너뛴다(기록은 남긴다)
+    else if (task.checks.lint && o.force) S.log(root, task.id, { event: 'lint', phase: 'accept', skipped: 'force' });
     else if (task.checks.lint) {
       const lt = task.checks.lint;
       const changed = G.diffNames(root, target, task.branch).filter(f => !f.startsWith('.harness/') && fs.existsSync(path.join(P.wt, f)));
@@ -295,7 +299,7 @@ async function accept(o) {
       if (argv) {
         const lr = await K.runCheck(P.wt, argv, { timeoutMs: checkTimeout(task, o) });
         S.log(root, task.id, { event: 'lint', phase: 'accept', ok: lr.ok, exit_code: lr.exit_code });
-        if (!lr.ok && (lt.files || lt.baseline_ok !== false)) { S.writeTask(root, task); return refused(task, `lint fails on ${task.branch} (${lr.command}): ${K.firstAssertion(lr).slice(0, 200)} — resume or fix it, then accept again`); }
+        if (!lr.ok && (lt.files || lt.baseline_ok !== false)) { S.writeTask(root, task); return refused(task, `lint fails on ${task.branch} (${lr.command}): ${K.firstAssertion(lr).slice(0, 200)} — resume or fix it, then accept again${lt.files ? '' : ' (this lints the whole repository; put {files} in lint_command to lint only the changed files — accept reads the current value — or accept --force)'}`); }
       }
     }
     if (!G.isAncestor(root, target, task.branch)) { S.writeTask(root, task); return refused(task, `${target} kept moving while integrating; run accept again`); }

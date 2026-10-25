@@ -201,6 +201,16 @@ const steps = list => { const calls = []; const run = async o => { const n = cal
       R.check('[QL-07] 사유를 단 억누르기 · 테스트 파일의 억누르기는 잡지 않는다(사유 없는 것은 잡는다)', sup === 'src/api.py:18', JSON.stringify(f.filter(x => x.rule === 'suppress')));
     }
     {
+      // [자동 이슈 #47] 설치된 하네스 사본(harness/.harness-version)이 대상 브랜치에서 들어와 바뀌어도 품질 규칙이 지적하지 않는다 · 표식 없는 harness/(원본)와 작업 코드는 그대로 본다
+      const { d, b } = qrepo({ 'harness/.harness-version': 'harness 5\n', 'harness/lib/quality.js': 'const A = 1;\n' });
+      write(path.join(d, 'harness/lib/quality.js'), 'const A = 1;\nconst SUPPRESS = /eslint-disable|@ts-ignore/;\nconsole.log(SUPPRESS);\n');
+      write(path.join(d, 'src/x.ts'), '// @ts-ignore\nexport const x = 1;\n');
+      const f = Q.find(d, b), files = [...new Set(f.map(x => x.file))].join(',');
+      fs.rmSync(path.join(d, 'harness/.harness-version'));
+      const f2 = Q.find(d, b);
+      R.check('[QL-08] (#47) 설치된 하네스 사본(harness/)의 변경은 품질 규칙 대상이 아니다 · 작업 코드는 잡는다 · 표식이 없으면 harness/ 도 본다', files === 'src/x.ts' && f2.some(x => x.file === 'harness/lib/quality.js' && x.rule === 'suppress'), JSON.stringify({ f: f.map(x => [x.rule, x.file]), f2: f2.map(x => [x.rule, x.file]) }));
+    }
+    {
       // 루프: 품질 규칙 · 중복은 한 번에 모아 한 번만 돌려보낸다 → 고치면 done · 남겨도 done(정체 아님) · 보고에 규칙별로
       const d9 = dupRepo(); const calls9 = [];
       const run9 = async o => { calls9.push(o.prompt); write(path.join(o.cwd, 'src/b.js'), calls9.length === 1 ? `${FN.replace('function total', 'function total2')}console.log("x");\ndebugger;\nmodule.exports = { total2 };\n` : 'const { total } = require("./a");\nmodule.exports = { total2: total };\n'); return { ok: true, session_id: o.newSessionId || o.sessionId, final_text: 'ok', cost_usd: 0.1, is_error: false, permission_denials: [] }; };
@@ -213,6 +223,20 @@ const steps = list => { const calls = []; const run = async o => { const n = cal
       await L.go({ ...quiet, root: d11, goal: 'x', run: async o => { calls11.push(o.prompt); write(path.join(o.cwd, 'src/c.js'), 'console.log(1);\n'); return { ok: true, session_id: o.newSessionId || o.sessionId, final_text: 'ok', cost_usd: 0.1, is_error: false, permission_denials: [] }; } });
       R.check('[QL-06] quality: off 면 내장 규칙을 돌리지 않는다', calls11.length === 1, String(calls11.length));
     }
+    // LT-10 — [자동 이슈 #38] thin 작업(기준선 없음)을 전체 린트가 옛 빚으로 막은 뒤 사용자가 lint_command 를 {files} 로 바꾸면 accept 가 지금 값을 따른다 · --force 는 린트를 건너뛴다
+    const I = require('../../harness/lib/integrate');
+    const r9 = repo('node lint.js', { 'old.js': 'console.log("legacy")\n' });
+    const g9 = await L.go({ ...quiet, mode: 'thin', root: r9, goal: 'add x', run: steps([o => write(path.join(o.cwd, 'x.js'), 'module.exports=2;\n')]) });
+    write(path.join(r9, 'other.txt'), 'x\n'); git(r9, 'add', 'other.txt'); git(r9, 'commit', '-qm', 'main moved on');   // 대상이 앞서 나가 accept 가 대상을 들이고 린트를 돌린다
+    const a9 = await I.accept({ root: r9, id: g9.id, log: () => {} });
+    write(path.join(r9, 'AGENTS.md'), '# p\n\n```yaml\ntest_command: "node check.js"\nlint_command: "node lint.js {files}"\n```\n'); git(r9, 'commit', '-qam', 'lint only changed files');
+    const a9b = await I.accept({ root: r9, id: g9.id, log: () => {} });
+    const r9f = repo('node lint.js', { 'old.js': 'console.log("legacy")\n' });
+    const g9f = await L.go({ ...quiet, mode: 'thin', root: r9f, goal: 'add x', run: steps([o => write(path.join(o.cwd, 'x.js'), 'module.exports=2;\n')]) });
+    write(path.join(r9f, 'other.txt'), 'x\n'); git(r9f, 'add', 'other.txt'); git(r9f, 'commit', '-qm', 'main moved on');
+    const a9f = await I.accept({ root: r9f, id: g9f.id, log: () => {}, force: true });
+    R.check('[LT-10] (#38) accept 는 바뀐 lint_command({files})를 따른다 — 처음엔 옛 빚으로 거절 · 바꾼 뒤 합친다 · --force 는 린트를 건너뛴다', g9.status === 'done' && a9.refused === true && /lint fails/.test(a9.reason) && a9b.status === 'accepted' && a9f.status === 'accepted',
+      JSON.stringify({ g: g9.status, a: [a9.status, String(a9.reason).slice(0, 100)], b: [a9b.status, String(a9b.reason).slice(0, 100)], f: [a9f.status, String(a9f.reason).slice(0, 100)] }));
   } catch (e) { R.check('예외 없이 끝난다', false, String(e && e.stack || e).slice(0, 800)); }
   finally { try { fs.rmSync(base, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }); } catch { /* 정리 실패는 결과와 무관 */ } }
   R.done();

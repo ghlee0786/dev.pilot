@@ -187,6 +187,14 @@ fs.mkdirSync(p.join(o.cwd,'src','z'),{recursive:true});fs.writeFileSync(p.join(o
     R.check('[FA-09] 계획 · 통합 · 시험 설계 worktree 는 빈 폴더까지 치운다', !(fs.existsSync(path.join(r9, '.harness-worktrees')) ? fs.readdirSync(path.join(r9, '.harness-worktrees')) : []).some(n => /^f-.*-(plan|int|int-qad+)$/.test(n)), JSON.stringify(fs.existsSync(path.join(r9, '.harness-worktrees')) ? fs.readdirSync(path.join(r9, '.harness-worktrees')) : []));
     R.check('[FA-09] 보고에 검증 라인(파도 · 시험 에이전트 · 고유 · 재현 · 고침)과 결함별 상태', /검증 라인: 파도 2 · 시험 에이전트 3 · 보고 3 · 고유 2 · 재현됨 1 \(고침 1\)/.test(g9.report) && /f\d FIXED \[high\]/.test(g9.report) && /NOT_REPRODUCED/.test(g9.report), g9.report);
 
+    // FA-10 — [자동 이슈 #44 #45] factory 도 go 처럼 "-"(stdin) · --goal-file 로 요청을 받는다 — "-" 를 요청 본문으로 쓰거나 --goal-file 을 버리지 않는다 · 두 곳에서 주면 사용법 오류
+    const CLI = require('../../harness/cli.js');
+    const planOf = async argv => { const fk = fake(['not json'], {}); const errs = []; const code = await CLI.main(argv, { run: fk.run, stdin: '표준 입력 요청 STDIN-BODY', out: () => {}, err: s => errs.push(s) }); return { code, prompt: (fk.calls.plan[0] || {}).prompt || '', errs: errs.join('\n') }; };
+    const r10 = repo(); const gf10 = path.join(base, 'goal10.txt'); write(gf10, '﻿파일 요청 FILE-BODY\n');
+    const s10 = await planOf(['factory', '-', '--root', r10]), f10 = await planOf(['factory', '--goal-file', gf10, '--root', r10]), b10 = await planOf(['factory', '-', '--goal-file', gf10, '--root', r10]);
+    R.check('[FA-10] (#44 #45) factory - · --goal-file — 계획자가 받는 요청이 stdin · 파일 본문 · 둘 다 주면 2(회차 없음)', /STDIN-BODY/.test(s10.prompt) && /FILE-BODY/.test(f10.prompt) && b10.code === 2 && !b10.prompt,
+      JSON.stringify({ s: s10.prompt.slice(0, 80), f: f10.prompt.slice(0, 80), b: b10.code, e: b10.errs.slice(0, 120) }));
+
     // FA-06 — 상태 · 멈춤
     R.check('[FA-06] factory status 는 실행마다 한 줄', F.status(r2).split('\n').length === 1 && /ACCEPTED/.test(F.status(r2)), F.status(r2));   // FA-07 이 받아들인 뒤
     R.check('[FA-06] 끝난 실행의 멈춤 요청은 "not running"', F.requestStop(r2, g2.id).reason === 'not running');

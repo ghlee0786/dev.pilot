@@ -51,14 +51,18 @@ function addedMap(wt, base) {
   return map;
 }
 const eligible = f => CODE_EXT.test(f) && !SKIP.test(f) && !TEST.test(f);
+// [자동 이슈 #47] 설치된 하네스 사본(harness/.harness-version 이 있는 harness/)은 작업이 쓴 코드가 아니다 — 자동 갱신이 대상 브랜치로 들어와 섞여도 품질 · 중복 검사에서 뺀다.
+//   하네스 원본 저장소(표식 없음)의 harness/ 는 그대로 본다.
+const harnessCopy = wt => fs.existsSync(path.join(wt, 'harness', '.harness-version')) ? (f => f.startsWith('harness/')) : (() => false);
 
 // → [{ file, start, end, lines, other: 'path:start-end' }] (최대 10)
 function find(wt, base, o) {
   const K = Math.max(4, Number(o && o.minLines) || 8);
   // 추적되지 않은 새 파일은 git diff 에 나오지 않는다 — 모든 줄이 더한 줄이다(2026-10-17 적대적 검증: 커밋 전 새 파일의 복사를 놓쳤다)
   const untracked = new Set(G.statusEntries(wt).filter(e => e.code === '??').map(e => e.path.replace(/\\/g, '/')));
+  const own = harnessCopy(wt);
   const changed = G.diffNames(wt, base, null, ['--diff-filter=AM']).concat([...untracked])
-    .map(f => f.replace(/\\/g, '/')).filter((f, i, a) => a.indexOf(f) === i && eligible(f) && fs.existsSync(path.join(wt, f)));
+    .map(f => f.replace(/\\/g, '/')).filter((f, i, a) => a.indexOf(f) === i && eligible(f) && !own(f) && fs.existsSync(path.join(wt, f)));
   if (!changed.length) return [];
   const exts = new Set(changed.map(f => path.extname(f).toLowerCase()));
   // 색인: 같은 확장자의 모든 파일(추적 + 새 파일)의 K줄 창 → 위치들
@@ -97,4 +101,4 @@ function find(wt, base, o) {
   return uniq.slice(0, 10);
 }
 
-module.exports = { find, meaningful, addedLines, addedMap, CODE_EXT, SKIP, TEST };
+module.exports = { find, meaningful, addedLines, addedMap, harnessCopy, CODE_EXT, SKIP, TEST };

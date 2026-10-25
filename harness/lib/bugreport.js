@@ -44,6 +44,8 @@ function entryOf(kind, err) {
 
 function versions() {
   let harness = null; try { harness = fs.readFileSync(path.join(__dirname, '..', '.harness-version'), 'utf8').split(/\r?\n/)[0].trim(); } catch { /* 원본(설치 사본이 아님) */ }
+  // 표식 줄은 늘 "harness 5" 다 — 보고만 보고는 어느 판에서 났는지(이미 고친 결함인지) 알 수 없었다. 릴리스의 harness/VERSION 을 붙인다.
+  try { const v = fs.readFileSync(path.join(__dirname, '..', 'VERSION'), 'utf8').trim(); if (v) harness = `${harness || 'source'} · v${v.replace(/^v/i, '')}`; } catch { /* 릴리스가 아닌 설치 */ }
   let gitv = null; try { gitv = require('node:child_process').spawnSync('git', ['--version'], { encoding: 'utf8', windowsHide: true, timeout: 5000 }).stdout.trim().replace(/^git version /, ''); } catch { /* 없음 */ }
   return { harness: harness || 'source', node: process.version, git: gitv, os: `${os.platform()} ${os.release()} ${os.arch()}` };
 }

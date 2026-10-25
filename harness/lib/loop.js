@@ -248,6 +248,9 @@ async function resume(o) {
     if (!['thin', 'full'].includes(m)) { lock.release(); throw Object.assign(new Error(`unknown mode: ${o.mode} (thin or full)`), { code: 'USAGE' }); }
     if (m !== (task.mode || 'full')) { S.log(root, task.id, { event: 'mode_changed', from: task.mode || 'full', to: m }); task.mode = m; if (m === 'full') delete task.checks.deferred; }
   }
+  // [자동 이슈 #38] 작업 뒤 바꾼 lint_command 를 따른다(시작 때 값에 묶이지 않게)
+  const lintSync = K.syncLint(task, [o.root, root, P.wt]);
+  if (lintSync) S.log(root, task.id, { event: 'lint_command_changed', phase: 'resume', ...lintSync });
   const wasBlocked = task.status === 'blocked';
   task.allow = [...(task.allow || []), ...added];
   task.status = 'running'; task.reason = ''; task.owner = S.ownerRecord(); task.last_signature = null;
@@ -526,6 +529,8 @@ async function loop(c, kind) {
     //   (.NET 작은 수정 11.9분 · Python 막연한 요청 40분+). 취소할 작업은 검사 비용을 아예 쓰지 않는다.
     if (task.checks.commands.length && task.mode === 'thin') {
       task.checks.deferred = true;
+      // [자동 이슈 #41] 이 턴 전에 잰 결과(check <id> 미리 보기 · 거절된 accept)는 지금 코드의 것이 아니다 — 남기면 accept 가 그 통과로 검사 없이 합친다
+      delete task.checks.last; delete task.checks.verdict;
       S.writeTask(root, task);
     } else if (task.checks.commands.length) {
       const checkNow =() => K.runJudged(P.wt, K.commandsForJudge(P.wt, task.checks), { timeoutMs: Math.min(c.o.checkTimeoutMs || task.checks.timeout_ms || K.CHECK_TIMEOUT_MS, Math.max(1000, deadline - Date.now() + 60000)), rerun: task.checks.rerun, serialRoot: task.checks.serial ? root : null });

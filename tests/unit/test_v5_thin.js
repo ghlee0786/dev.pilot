@@ -112,6 +112,18 @@ const events = (root, id) => { try { return fs.readFileSync(S.taskPaths(root, id
     R.check('[TH-11] (#30) resume --mode thin — full 작업이 thin 으로 이어져 done · 모드 바뀜 기록 · 끝 검사 미룸', t11.status === 'blocked' && t11b.status === 'done' && k11.mode === 'thin' && mc11 && mc11.from === 'full' && mc11.to === 'thin' && k11.checks.deferred === true,
       JSON.stringify({ a: t11.status, b: t11b.status, m: k11.mode, mc: mc11, why: t11b.reason }));
 
+    // TH-12 — [자동 이슈 #41] 미리 본 검사(check <id> · 통과) 뒤 resume 으로 다시 바꾼 작업: 옛 통과 기록으로 검사 없이 합치지 않는다 — accept 가 다시 재고 막는다
+    const r12 = repo('r12', 2); let n12 = 0;
+    const run12 = async o => { n12++; if (n12 === 1) setTo(o, 2, '// 정리\n'); else setTo(o, 9); return ok(o); };
+    const t12 = await L.go({ ...quiet, root: r12, mode: 'thin', goal: '값을 2 로', run: run12 });
+    const c12 = await I.check({ root: r12, id: t12.id, log: () => {} });
+    L.addNote(r12, t12.id, '값을 다시 바꿔라');   // 끝난 작업은 덧붙인 지시로만 이어 간다(resume --note)
+    const t12b = await L.resume({ ...quiet, root: r12, id: t12.id, run: run12 });
+    const main12 = git(r12, 'rev-parse', 'main');
+    const a12 = await I.accept({ root: r12, id: t12.id, log: () => {} });
+    R.check('[TH-12] (#41) 미리 본 통과 뒤 다시 바꾼 thin 작업 — accept 가 다시 재서 막는다 · main 그대로', S.readTask(r12, t12.id).checks.last.ok === false && t12b.status === 'done' && a12.refused === true && git(r12, 'rev-parse', 'main') === main12,
+      JSON.stringify({ c: c12.status, b: t12b.status, a: a12.status, why: String(a12.reason).slice(0, 160) }));
+
     // TH-07 — [2026-10-21 사용자 지시: 배포 때 기존 세션 작업의 맥락을 놓치지 않게] 갱신 전에 만들어진 작업(기록에 mode 없음)은 이어 가도 예전 방식(full) 그대로
     const Pr = require('../../harness/lib/prompts');
     const old = { id: 't-old', goal: 'g', checks: { source: 'repo', commands: [['node', 'check.js']] }, caps: { budget_usd: 1 }, spent: { cost_usd: 0 } };

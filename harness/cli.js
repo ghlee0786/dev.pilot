@@ -48,7 +48,7 @@ usage:
   node harness/cli.js doc index | doc check [--json] | doc history <path> [--json] | doc restore <path> <version>
   node harness/cli.js doc adopt <path> [--status draft|active|done] [--with <project>] [--direction outgoing|incoming]   (bring an existing doc under management)
       documents are created only when the user asks; nothing is generated automatically
-  node harness/cli.js factory "<request>" | --request-file <path> [--jobs N] [--budget-usd N] [--card-budget-usd N] [--max-cards N] [--test-agents N] [--waves N] [--verify] [--check "<cmd>"]... [--mode thin|full] [--base <branch>] [--detach|--foreground]
+  node harness/cli.js factory "<request>" | --request-file <path> | - [--jobs N] [--budget-usd N] [--card-budget-usd N] [--max-cards N] [--test-agents N] [--waves N] [--verify] [--check "<cmd>"]... [--mode thin|full] [--base <branch>] [--detach|--foreground]
       split the request into cards (planner agent) · run the cards as parallel tasks with owned paths · merge them one at a time into harness/factory/<id> · then testers (charters) test the merged result, defects reproduced by another agent become fix cards
   node harness/cli.js factory status [<id>] | factory wait <id> | factory stop <id> | factory accept <id>   (accept merges into your branch — only after the user says so)
   node harness/cli.js help
@@ -514,10 +514,14 @@ async function factoryCommand(rest, o, root, out, err, io, argv) {
     if (sub === 'wait') return factoryWait(main, needFid(rest[1]), o, out, err, null);
   } catch (e) { if (e.code === 'USAGE') { err(`${e.message}\n${USAGE}`); return 2; } err(e.message); return 1; }
   const child = process.env.HARNESS_DETACHED_CHILD === '1' && F.FID_RE.test(process.env.HARNESS_FACTORY_ID || '');
+  // [자동 이슈 #44 #45] go 와 같이 --goal-file · "-"(stdin) 도 받는다 — 전에는 --goal-file 을 버리고 "-" 를 요청 본문으로 써서 빈 회차를 띄웠다.
   let request;
+  const srcFile = o['request-file'] != null ? o['request-file'] : o['goal-file'], fromStdin = rest.length === 1 && rest[0] === '-';
+  if (!child && [srcFile != null, fromStdin, !fromStdin && rest.length > 0].filter(Boolean).length > 1) { err(`factory takes the request from one place: --request-file (--goal-file), "-" (stdin) or the arguments\n${USAGE}`); return 2; }
   try {
     if (child) request = fs.readFileSync(process.env.HARNESS_FACTORY_REQUEST, 'utf8');
-    else if (o['request-file'] != null) request = fs.readFileSync(path.resolve(o['request-file']), 'utf8');
+    else if (srcFile != null) request = fs.readFileSync(path.resolve(srcFile), 'utf8');
+    else if (fromStdin) request = (io && typeof io.stdin === 'string') ? io.stdin : fs.readFileSync(0, 'utf8');
     else request = rest.join(' ');
   } catch (e) { err(`cannot read the request: ${e.message}`); return 2; }
   request = String(request || '').replace(/^\uFEFF/, '').trim();
