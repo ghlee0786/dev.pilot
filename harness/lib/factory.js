@@ -93,7 +93,17 @@ function validatePlan(plan, o) {
 async function runChecks(c) {
   if (!c.commands.length) return null;
   const rerun = !/^(off|false|no)$/i.test(K.yamlString(c.root, 'rerun_failed') || '');
-  return (await K.runJudged(c.intWt, c.commands, { timeoutMs: c.checkTimeoutMs, rerun })).judged;
+  const judged = (await K.runJudged(c.intWt, c.commands, { timeoutMs: c.checkTimeoutMs, rerun })).judged;
+  restoreTracked(c);
+  return judged;
+}
+// [자동 이슈 #51] 검사가 추적 파일(산출물 · 스냅숏)을 다시 쓰면 통합 worktree 가 더러워져 다음 병합 · 되돌림(revert)이 실패했고,
+//   카드를 처음부터 다시 돌렸다. 통합 worktree 는 하네스만 쓰므로 검사 뒤 추적 파일 변경을 HEAD 로 되돌린다(추적 안 된 · 무시된 파일은 그대로).
+function restoreTracked(c) {
+  const files = G.dirtyFiles(c.intWt).filter(e => e.code !== '??').map(e => e.path);
+  if (!files.length) return;
+  G.git(c.intWt, ['checkout', '-q', 'HEAD', '--', '.'], { allowFail: true });
+  event(c.root, c.run.id, { event: 'restored_after_checks', files: files.slice(0, 20) });
 }
 async function mergeCard(c, card, task) {
   if (c.baselineP) await c.baselineP;   // 통합 worktree 에서 기준선 검사가 끝난 뒤에만 합친다

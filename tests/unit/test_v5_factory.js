@@ -205,6 +205,19 @@ fs.mkdirSync(p.join(o.cwd,'src','z'),{recursive:true});fs.writeFileSync(p.join(o
     R.check('[FA-11] 통합 검사가 한 번 흔들려도(다시 돌리면 통과) 카드를 되돌려 다시 돌리지 않는다 — 한 번에 merged · 작업자 1회', g11.status === 'done' && ka11.status === 'merged' && ka11.attempts === 1 && f11.calls.work.length === 1 && fs.existsSync(JSON.parse(flag11)),
       JSON.stringify({ s: g11.status, why: g11.reason, st: ka11.status, at: ka11.attempts, w: f11.calls.work.length }));
 
+    // FA-13 — [자동 이슈 #51] 검사가 추적 파일을 다시 쓰면(통합 worktree 가 더러워짐) 카드 병합이 실패해 같은 카드를 처음부터 다시 돌렸다 —
+    //   통합 worktree 의 검사가 바꾼 추적 파일은 검사 뒤 되돌린다(그 worktree 는 하네스만 쓴다)
+    const r13 = repo();
+    write(path.join(r13, 'check.js'), "const fs=require('fs');fs.mkdirSync('gen',{recursive:true});fs.writeFileSync('gen/stamp.txt',process.cwd()+'\\n');console.log('# pass 1\\n# fail 0')\n");
+    write(path.join(r13, 'gen/stamp.txt'), 'init\n');
+    git(r13, 'add', '-A'); git(r13, 'commit', '-qm', 'check rewrites a tracked file');
+    const f13 = fake([plan([{ id: 'ka', title: 'ka', goal: 'create src/a/a.js and refresh gen/stamp.txt', owns: ['src/a/**', 'gen/**'], depends_on: [] }])],
+      { ka: o => { write(path.join(o.cwd, 'src/a/a.js'), '1\n'); write(path.join(o.cwd, 'gen/stamp.txt'), 'card\n'); } });
+    const g13 = await F.start({ ...quiet, root: r13, request: 'make ka', run: f13.run });
+    const ka13 = F.readRun(r13, g13.id).cards.find(c => c.id === 'ka');
+    R.check('[FA-13] (#51) 검사가 추적 파일을 다시 써도 카드 병합이 실패하지 않는다 — 한 번에 merged · 작업자 1회 · 통합 브랜치에 카드의 내용', g13.status === 'done' && ka13.status === 'merged' && ka13.attempts === 1 && f13.calls.work.length === 1 && git(r13, 'show', `${F.readRun(r13, g13.id).branch}:gen/stamp.txt`) === 'card',
+      JSON.stringify({ s: g13.status, why: g13.reason, st: ka13.status, at: ka13.attempts, r: ka13.reason, note: ka13.retry_note }));
+
     // FA-12 — [2026-10-25 사용 분석] 프로세스가 죽은 실행은 status · 보고에 OWNER DEAD 가 붙는다(살아 있는 실행 · 끝난 실행은 붙지 않는다)
     const run12 = F.readRun(r11, g11.id), dead12 = { ...run12, status: 'running', owner: { pid: 2147483646, host: os.hostname() } };
     fs.writeFileSync(F.dirs(r11, g11.id).file, JSON.stringify(dead12));
