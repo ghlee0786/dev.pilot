@@ -283,6 +283,8 @@ function spawnSpec(argv, forceShell) {
 
 // 출력이 이만큼 멈추면 멈춘 것으로 본다 — 멈춘 테스트를 떼어 낼 줄 아는 러너(언어 팩 hang)에만. o.stallMs: 0 이면 끔.
 const STALL_MS = Number(process.env.HARNESS_CHECK_STALL_MS) || 5 * 60 * 1000;   // 환경 값은 테스트용
+// 검사의 부모가 끝난 뒤 남은 출력을 기다리는 시간 — 그 뒤에도 파이프가 닫히지 않으면 자손이 붙든 것으로 본다(#53).
+const EXIT_GRACE_MS = 3000;
 function runCheck(cwd, argv, o) {
   const timeoutMs = Math.max(1000, (o && o.timeoutMs) || CHECK_TIMEOUT_MS);
   const opt = o || {};
@@ -307,6 +309,19 @@ function runCheck(cwd, argv, o) {
     child.stdout.on('data', push); child.stderr.on('data', push);
     child.on('error', e => finish(null, e.message));
     child.on('close', code => finish(code));
+    // [2026-10-28 자동 이슈 #53] 검사(dotnet test)는 끝났는데 남은 자손(MSBuild 노드 · nodeReuse)이 출력 파이프를 붙들어 'close' 가 오지 않았다 —
+    //   결과가 상한(15분)까지 돌아오지 않았다. 부모가 끝나면 잠시 남은 출력을 받고, 그래도 닫히지 않으면 남은 자손을 거두고 결과를 낸다.
+    child.on('exit', code => {
+      if (done || timedOut) return;
+      const t = setTimeout(() => {
+        if (done || timedOut) return;
+        // 부모는 이미 거둬졌다 — 그 pid 하나에 신호를 보내지 않는다(재사용됐을 수 있다). 그룹 · 자손 목록으로만 거둔다.
+        try { require('./resources').reapDescendants(child.pid, t0); } catch { /* 거두기 실패는 결과를 막지 않는다 */ }
+        try { child.stdout.destroy(); child.stderr.destroy(); } catch { /* 이미 닫힘 */ }
+        finish(code);
+      }, EXIT_GRACE_MS);
+      t.unref();
+    });
   });
 }
 

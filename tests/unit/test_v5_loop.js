@@ -752,6 +752,41 @@ const go = (root, extra) => L.go({ ...quiet, root, goal: 'make impl.txt say good
     const l49c = g49c.report.split('\n');
     R.check('[LP-49] blocked 보고: 요약은 막힘 · 다음은 허용해 이어 가는 resume --allow 줄',
       /^요약: 막힘/.test(l49c[1]) && /^다음: .*resume .*--allow "Bash\(docker build:\*\)"/.test(l49c[2]), l49c.slice(0, 3).join(' | '));
+    // ── [2026-10-28 자동 이슈 #54] Windows 에서 worktree 정리가 'Filename too long' 으로 실패했는데 git 은 등록과 .git 파일을 이미 지웠다 —
+    //    파일이 든 폴더만 남았고, 보고는 그 폴더에서 직접 이어 받으라고 했다(그 안의 git 은 상위 저장소를 본다). 가짜 git 으로 그 실패를 흉내 낸다(POSIX). ──
+    if (process.platform !== 'win32') {
+      const shimDir = path.join(base, 'gitshim'), realGit = spawnSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' }).stdout.trim();
+      write(path.join(shimDir, 'git'), `#!/bin/sh
+if [ "$1" = worktree ] && [ "$2" = remove ] && [ -f "$3/.git" ]; then
+  wt="$3"; gd=$(sed -n 's/^gitdir: //p' "$wt/.git")
+  rm -rf "$gd" "$wt/.git"
+  echo "error: failed to delete '$wt': Filename too long" >&2; exit 255
+fi
+exec "${realGit}" "$@"
+`);
+      fs.chmodSync(path.join(shimDir, 'git'), 0o755);
+      const oldPath = process.env.PATH, rmSync = fs.rmSync;
+      const blocked = o => { write(path.join(o.cwd, '.harness', path.basename(o.cwd), 'BLOCKED.md'), 'need a decision\n'); };
+      try {
+        process.env.PATH = shimDir + path.delimiter + oldPath;
+        const r99 = checkRepo();
+        const t99 = await go(r99, { run: fake([blocked]) });
+        const k99 = S.readTask(r99, t99.id);
+        R.check('[LP-99] git 이 등록만 지우고 파일이 든 폴더를 남기면(긴 경로) 하네스가 마저 지운다 — 내용은 이미 브랜치에 있다',
+          t99.status === 'blocked' && !k99.worktree_kept && !fs.existsSync(S.taskPaths(r99, t99.id).wt) && !/worktree 가 .* 남아 있다|the worktree is kept at/.test(t99.report),
+          `${t99.status} kept=${k99.worktree_kept} exists=${fs.existsSync(S.taskPaths(r99, t99.id).wt)}`);
+        // 마저 지우지도 못하면(잠긴 파일) 폴더를 남기되, 그 폴더에서 이어 받으라고 하지 않는다 — 새 worktree 를 안내한다
+        const r99b = checkRepo();
+        fs.rmSync = function (p, ...a) { if (/\.harness-worktrees/.test(String(p))) { const e = new Error('EPERM: locked'); e.code = 'EPERM'; throw e; } return rmSync.call(this, p, ...a); };
+        const t99b = await go(r99b, { run: fake([blocked]) });
+        fs.rmSync = rmSync;
+        const k99b = S.readTask(r99b, t99b.id);
+        R.check('[LP-99] 못 지운 폴더는 남김으로 적고(등록이 사라졌다) · 보고는 그 폴더가 아니라 git worktree add 로 이어 받으라고 한다',
+          t99b.status === 'blocked' && /registration is gone/.test(k99b.worktree_kept || '') && k99b.worktree_orphaned === true
+          && !/worktree 가 .* 남아 있다|the worktree is kept at/.test(t99b.report) && /git worktree add \.\.\/.*-t-/.test(t99b.report),
+          `${t99b.status} kept=${k99b.worktree_kept} | ${t99b.report.split('\n').filter(l => /이어 받|take it over/.test(l)).join(' | ')}`);
+      } finally { process.env.PATH = oldPath; fs.rmSync = rmSync; }
+    } else console.log('  ℹ [LP-99] Windows — 가짜 git(sh) 으로 긴 경로 실패를 흉내 내지 못한다(POSIX 에서 잰다)');
   } catch (e) { R.check('예외 없이 끝난다', false, String(e && e.stack || e).slice(0, 800)); }
   finally { try { fs.rmSync(base, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }); } catch { /* 임시 디렉터리 정리 실패는 결과와 무관 */ } }
   R.done();

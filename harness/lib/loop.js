@@ -254,7 +254,7 @@ async function resume(o) {
   const wasBlocked = task.status === 'blocked';
   task.allow = [...(task.allow || []), ...added];
   task.status = 'running'; task.reason = ''; task.owner = S.ownerRecord(); task.last_signature = null;
-  delete task.worktree_kept; delete task.commit_error;
+  delete task.worktree_kept; delete task.worktree_orphaned; delete task.commit_error;
   S.writeTask(root, task);
   S.log(root, task.id, { event: 'resume', caps: task.caps, from: wasBlocked ? 'blocked' : undefined, allow_added: added.length ? added : undefined });
   if (added.length && task.runtime === 'codex') log(`[pilot] ${task.id} — note: allow rules have no effect on the Codex runtime; its sandbox governs what runs`);
@@ -681,7 +681,7 @@ function finish(c, status, reason) {
     else {
       // 무시된 파일(git 밖)이 바뀌었으면 지우지 않는다(M4) — 지우면 보고 직후 산출물이 사라진다.
       const rm = G.removeWorktree(root, P.wt, { include: task.worktree_include || [] });
-      if (!rm.ok) task.worktree_kept = rm.error; else delete task.worktree_alt;
+      if (!rm.ok) { task.worktree_kept = rm.error; if (rm.leftover) task.worktree_orphaned = true; } else delete task.worktree_alt;
     }
   }
   // [PRD R1] 이 작업이 띄운 컨테이너 · 네트워크를 내리고 임시 폴더를 지운다(볼륨 · 이미지 · 프로젝트 정리 명령은 accept · cancel · gc 때)
@@ -914,7 +914,8 @@ function reportKo(task, P) {
     }
   }
   if (task.status === 'blocked') {
-    L.push(task.worktree_kept ? `직접 이어 받으려면: worktree 가 ${task.worktree} 에 남아 있다(브랜치 ${task.branch})`
+    // 등록이 사라진 폴더(#54)는 worktree 가 아니다 — 그 안의 git 은 상위 저장소를 본다. 새 worktree 를 안내한다.
+    L.push(task.worktree_kept && !task.worktree_orphaned ? `직접 이어 받으려면: worktree 가 ${task.worktree} 에 남아 있다(브랜치 ${task.branch})`
       : `직접 이어 받으려면: git worktree add ../${path.basename(P.root || '.') || 'repo'}-${task.id} ${task.branch}`);
   }
   L.push(`받아들이기: ${cli} accept ${task.id}${task.base_branch ? '' : ' --into <브랜치>'}   (${task.base_branch || '<브랜치>'} 에 병합 — 사용자가 말할 때만)`);
@@ -974,7 +975,7 @@ function report(task, P) {
     lines.push(...deniedLines(task));
   }
   if (task.status === 'blocked') {
-    lines.push(task.worktree_kept ? `to take it over by hand: the worktree is kept at ${task.worktree} (branch ${task.branch})`
+    lines.push(task.worktree_kept && !task.worktree_orphaned ? `to take it over by hand: the worktree is kept at ${task.worktree} (branch ${task.branch})`
       : `to take it over by hand: git worktree add ../${path.basename(P.root || '.') || 'repo'}-${task.id} ${task.branch}`);
   }
   lines.push(`accept: node harness/cli.js accept ${task.id}${task.base_branch ? '' : ' --into <branch>'}   (merges into ${task.base_branch || '<branch>'} only when you say so)`);

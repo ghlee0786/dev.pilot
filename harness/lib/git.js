@@ -267,6 +267,9 @@ function removeWorktree(root, wt, o) {
     //   진짜 이유를 덮고 거부로 끝났다. 등록이 사라졌으면 prune 하고 남은 빈 폴더를 치운다.
     if (/is not a working tree/i.test(r.err) && !worktreeRegistered(root, wt)) {
       git(root, ['worktree', 'prune'], { allowFail: true });
+      // [2026-10-28 자동 이슈 #54] Windows 에서 1차 시도가 'Filename too long' 으로 실패했는데 git 은 등록과 .git 파일을 이미 지웠다 — 파일이 든 폴더만 남아
+      //   그 안의 git 이 상위 저장소를 대상으로 삼았다. 지우기 전에 깨끗함을 확인한 폴더라 내용은 브랜치에 있다 — git 이 마저 못 지운 것을 지운다(Node 는 긴 경로를 다룬다).
+      try { fs.rmSync(wt, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }); } catch { /* 잠긴 파일 — 아래에서 남김으로 */ }
       const gone = removeEmptyDir(wt);
       if (gone) { try { const parent = path.dirname(wt); if (fs.readdirSync(parent).length === 0) fs.rmdirSync(parent); } catch { /* 다른 worktree 가 남아 있다 */ } return { ok: true, removed: true, recovered: first }; }
       return { ok: false, error: `the worktree registration is gone but the folder ${wt} is not empty — inspect it and remove it by hand (first error: ${first.slice(0, 200)})`, leftover: true };
