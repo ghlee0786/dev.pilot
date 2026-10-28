@@ -319,7 +319,7 @@ ${I.format(x.a)}`);
   } catch (e) {
     if (e.code === 'USAGE') { err(`${e.message}\n${USAGE}`); return 2; }
     // 예기치 못한 예외 = 하네스 결함일 수 있다 — 가려서 기록하고 보고 방법을 알린다(없는 작업 · 잠금 같은 운영 오류는 빼고).
-    const bug = !['UNKNOWN_TASK', 'LOCK_HELD'].includes(e.code) && require('./lib/bugreport').record(root, 'cli', e);
+    const bug = !['UNKNOWN_TASK', 'LOCK_HELD', 'GIT_LOCKED'].includes(e.code) && require('./lib/bugreport').record(root, 'cli', e);
     r = { id: rest[0] || null, status: 'error', reason: `${e.code ? e.code + ': ' : ''}${e.message}`, report: `pilot error: ${e.stack || e.message}${bug ? `\n하네스 결함으로 보입니다(서명 ${bug.sig}) — 내용을 확인하고 보고하려면: node harness/cli.js report-bug` : ''}` };
   }
   // 쌓인 하네스 보고를 자동으로 올린다(설치된 사본 · 로그인이 있을 때만 · 실패는 조용히).
