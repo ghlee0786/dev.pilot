@@ -124,6 +124,20 @@ const events = (root, id) => { try { return fs.readFileSync(S.taskPaths(root, id
     R.check('[TH-12] (#41) 미리 본 통과 뒤 다시 바꾼 thin 작업 — accept 가 다시 재서 막는다 · main 그대로', S.readTask(r12, t12.id).checks.last.ok === false && t12b.status === 'done' && a12.refused === true && git(r12, 'rev-parse', 'main') === main12,
       JSON.stringify({ c: c12.status, b: t12b.status, a: a12.status, why: String(a12.reason).slice(0, 160) }));
 
+    // TH-13 — [자동 이슈 #57] accept 검사가 추적되는 outside_git_ok 산출물을 다시 쓰고 거절됐다: 그 산출물을 작업 브랜치에 커밋하지 않는다
+    //   (커밋하면 사용자가 메인 체크아웃에서 시험을 돌려 같은 파일이 바뀐 것만으로 다음 accept 가 "uncommitted changes … touch files" 로 막힌다)
+    const r13 = repo('r13', 2);
+    write(path.join(r13, 'AGENTS.md'), '# p\n\noutside_git_ok: ["gen/stamp.txt"]\n\n```yaml\ntest_command: "node check.js"\n```\n');
+    write(path.join(r13, 'check.js'), "require('fs').writeFileSync('gen/stamp.txt',String(Date.now())+Math.random());const v=require('./src/app.js');const ok=v===2;console.log('# pass '+(ok?1:0)+'\\n# fail '+(ok?0:1));process.exit(ok?0:1);\n");
+    write(path.join(r13, 'gen', 'stamp.txt'), '0\n'); git(r13, 'add', '-A'); git(r13, 'commit', '-qm', 'stamp');
+    let n13 = 0;
+    const t13 = await L.go({ ...quiet, root: r13, mode: 'thin', goal: '값을 바꿔라', run: async o => { n13++; setTo(o, 5); return ok(o); } });
+    const a13 = await I.accept({ root: r13, id: t13.id, log: () => {} });
+    const k13 = S.readTask(r13, t13.id), changed13 = git(r13, 'diff', '--name-only', 'main', k13.branch).split(/\r?\n/).filter(Boolean);
+    const rs13 = events(r13, t13.id).find(e => e.event === 'restored_after_checks');
+    R.check('[TH-13] (#57) 거절된 accept 의 검사가 다시 쓴 outside_git_ok 추적 파일 — 작업 브랜치에 들어가지 않는다 · 되돌림 기록', a13.refused === true && !changed13.includes('gen/stamp.txt') && changed13.includes('src/app.js') && rs13 && rs13.files.includes('gen/stamp.txt'),
+      JSON.stringify({ refused: a13.refused, changed13, rs13, why: String(a13.reason).slice(0, 160) }));
+
     // TH-07 — [2026-10-21 사용자 지시: 배포 때 기존 세션 작업의 맥락을 놓치지 않게] 갱신 전에 만들어진 작업(기록에 mode 없음)은 이어 가도 예전 방식(full) 그대로
     const Pr = require('../../harness/lib/prompts');
     const old = { id: 't-old', goal: 'g', checks: { source: 'repo', commands: [['node', 'check.js']] }, caps: { budget_usd: 1 }, spent: { cost_usd: 0 } };

@@ -310,6 +310,13 @@ const parents = (cwd, ref) => git(cwd, ['rev-list', '--parents', '-n', '1', ref]
     fs.mkdirSync(path.join(r17, 'nested'), { recursive: true });
     let thrown = null; try { G.commitAll(path.join(r17, 'nested'), 'x'); } catch (e) { thrown = e; }
     R.check('[IN-18] commitAll 은 worktree 루트가 아닌 폴더에서 NOT_WORKTREE_ROOT 로 거부한다', thrown && thrown.code === 'NOT_WORKTREE_ROOT' && git(r17, ['rev-parse', 'HEAD']) === main17, thrown ? thrown.message : 'no throw');
+    // [자동 이슈 #58] 다시 시도해도 남은 index.lock — 하네스 결함(GIT_FAILED → 결함 보고)이 아니라 운영 오류(GIT_LOCKED)로 던지고, 그 파일을 지우라고 알린다
+    const r18 = mkRepo(), main18 = git(r18, ['rev-parse', 'HEAD']), lock18 = path.join(r18, '.git', 'index.lock');
+    write(path.join(r18, 'c.txt'), 'pending\n'); write(lock18, '');
+    let thrown18 = null; try { G.commitAll(r18, 'x'); } catch (e) { thrown18 = e; }
+    fs.rmSync(lock18, { force: true });
+    R.check('[IN-18b] (#58) 남은 index.lock — commitAll 은 GIT_LOCKED 로 던지고 · 메시지에 잠금 파일과 지우라는 안내 · 커밋 없음', thrown18 && thrown18.code === 'GIT_LOCKED' && /index\.lock is left over; if no git command is running/.test(thrown18.message) && git(r18, ['rev-parse', 'HEAD']) === main18,
+      thrown18 ? `${thrown18.code}: ${thrown18.message}` : 'no throw');
 
     // ── accept 의 검사는 작업에 기록된 검사 상한(check_timeout_min · --check-timeout-min)을 쓴다 ──
     //   [적대 2026-10-02] accept · cancel 은 o.checkTimeoutMs 만 봐서 작업의 상한(예: 20분 저장소)을 버리고 기본 15분으로 돌았다.

@@ -239,7 +239,13 @@ async function accept(o) {
 
     // 2. 대상 브랜치를 가져와 최신화(충돌 → 같은 세션이 푼다 · 예산 안에서만) → 검사
     const checkHere = async (why) => {
-      const run1 = async () => (await K.runJudged(P.wt, K.commandsForJudge(P.wt, task.checks), { timeoutMs: checkTimeout(task, o), rerun: task.checks.rerun, serialRoot: task.checks.serial ? root : null })).judged;
+      const run1 = async () => {
+        const j1 = (await K.runJudged(P.wt, K.commandsForJudge(P.wt, task.checks), { timeoutMs: checkTimeout(task, o), rerun: task.checks.rerun, serialRoot: task.checks.serial ? root : null })).judged;
+        // [자동 이슈 #57] 검사가 다시 쓴 outside_git_ok 산출물은 되돌린다 — 아래 거절 커밋이 그것을 작업 브랜치에 넣어 다음 accept 를 막았다
+        const restored = G.restoreOutsideOk(P.wt);
+        if (restored.length) S.log(root, task.id, { event: 'restored_after_checks', phase: 'accept', files: restored.slice(0, 50) });
+        return j1;
+      };
       let j = await run1();
       // 늦은 기준선(D2): 실패했는데 기준선이 없으면 지금 작업 시작 시점에서 잰다 — 명령이 바뀌면(멈춘 테스트 · 빠진 검사) 다시 잰다
       if (!j.ok && !task.checks.baseline) { const before = JSON.stringify(task.checks.commands); await L.ensureBaseline(root, task, { o: { checkTimeoutMs: checkTimeout(task, o) }, log }); if (JSON.stringify(task.checks.commands) !== before) j = await run1(); }

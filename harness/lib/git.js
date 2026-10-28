@@ -13,8 +13,12 @@ function run(cwd, args, o) {
   const r = spawnSync('git', args, { cwd, encoding: 'utf8', windowsHide: true, maxBuffer: 256 * 1024 * 1024, input: opt.input, env: opt.env ? { ...process.env, ...opt.env } : process.env });
   return { ok: r.status === 0, code: r.status, out: String(r.stdout || ''), err: String(r.stderr || (r.error && r.error.message) || '') };
 }
+// [자동 이슈 #58] 다시 시도한 뒤에도 남은 잠금 파일(index.lock …)은 운영 오류다 — 하네스 결함으로 기록하지 않고(GIT_LOCKED) 무엇을 하면 되는지 알린다(#20 과 같은 안내).
+const LEFT_LOCK = /Unable to create '([^'\n]+\.lock)': File exists/;
 function fail(args, r) {
-  return Object.assign(new Error(`git ${args.join(' ')} failed (${r.code}): ${r.err.trim().slice(0, 600)}`), { code: 'GIT_FAILED', stderr: r.err, stdout: r.out });
+  const lock = LEFT_LOCK.exec(r.err);
+  const hint = lock ? ` — ${lock[1]} is left over; if no git command is running (editor, another session), delete that file and run the command again` : '';
+  return Object.assign(new Error(`git ${args.join(' ')} failed (${r.code}): ${r.err.trim().slice(0, 600)}${hint}`), { code: lock ? 'GIT_LOCKED' : 'GIT_FAILED', stderr: r.err, stdout: r.out });
 }
 // 기본: 실패하면 던지고 stdout(끝 공백 제거)을 돌려준다. allowFail 이면 {ok, out, err}.
 function git(cwd, args, o) {
@@ -123,6 +127,15 @@ function ignoredChanges(wt, include) {
     .flatMap(p => expandDir(wt, p)).filter(p => !CACHE_RE.test(p))
     .filter(p => !ok.some(re => re.test(p)))
     .filter(p => !(inc.has(p) && (inc.get(p) == null || inc.get(p) === sha1(path.join(wt, p)))));
+}
+// [자동 이슈 #57] 검사가 다시 쓴 추적 파일 중 outside_git_ok 로 선언된 것을 HEAD 로 되돌린다 — 검사 산출물이 작업 브랜치에 커밋되지 않게.
+//   추적되지 않은 파일과 무시된 파일은 그대로 둔다. 되돌린 경로를 돌려준다.
+function restoreOutsideOk(wt) {
+  const ok = outsideOkPatterns(wt);
+  if (!ok.length) return [];
+  const paths = dirtyFiles(wt).filter(e => e.code !== '??' && !e.orig && ok.some(re => re.test(e.path))).map(e => e.path);
+  for (let i = 0; i < paths.length; i += 100) git(wt, ['checkout', '-q', 'HEAD', '--', ...paths.slice(i, i + 100).map(p => `:(literal)${p}`)], { retryLock: true, allowFail: true });
+  return paths;
 }
 // 이미 있는 git 저장소(worktree 포함)인가. 없는 경로는 false.
 function isRepo(dir) { return fs.existsSync(dir) && git(dir, ['rev-parse', '--show-toplevel'], { allowFail: true }).ok; }
@@ -534,6 +547,6 @@ function copyWorktreeInclude(root, wt) {
 module.exports = {
   git, identityArgs, headSha, isWorktreeRoot, removeEmptyDir, clearWorktreeSlot, slotOpts, useAltWorktree, keepEol, procsIn, killProcsIn, salvageLeftover, currentBranch, branchExists, tagExists, isAncestor, ensureRepo, isRepo, statusEntries, dirtyFiles, isClean, ignoredChanges,
   commitAll, unaddablePaths, isSecretPath, ensureExclude, addWorktree, worktreeList, worktreeRegistered, checkoutOf, mainWorktree, removeWorktree, samePath,
-  diffNames, mergeBase, unmergedFiles, mergeInProgress, hasConflictMarkers, hasConflictMarkersText, MARKER_RE, worktreeIncludeFiles, copyWorktreeInclude, sha1, LOCK_ERR,
+  diffNames, mergeBase, unmergedFiles, mergeInProgress, hasConflictMarkers, hasConflictMarkersText, MARKER_RE, restoreOutsideOk, worktreeIncludeFiles, copyWorktreeInclude, sha1, LOCK_ERR,
   gitlinks, fillSubmodules, dropSubmoduleClones, worktreeLinks,
 };
