@@ -124,7 +124,7 @@ const claudeWrite = (repo, sid, file, tool) => hook('track', { hook_event_name: 
     const m10Block = [
       ['git stash', 'Bash'], ['git stash -u', 'Bash'], ['git stash push -m wip', 'Bash'], ['git stash save wip', 'PowerShell'], ['git stash pop', 'Bash'], ['git stash apply', 'Bash'],
       ['git pull', 'Bash'], ['git pull --rebase origin main', 'PowerShell'], ['git commit --amend -m x', 'Bash'], ['git commit --amend --no-edit', 'Bash'],
-      ['git update-ref refs/heads/main HEAD~1', 'Bash'], ['git branch -f main HEAD~1', 'Bash'], ['git branch --force main v1', 'Bash'], ['git branch -M main', 'Bash'],
+      ['git update-ref refs/heads/main HEAD~1', 'Bash'], ['git branch -f main HEAD~1', 'Bash'], ['git branch --force main v1', 'Bash'], ['git branch -M nosuch main', 'Bash'],
       ['git checkout -B main HEAD~1', 'Bash'], ['git switch -C main', 'Bash'], ['git switch --force-create main', 'Bash'],
       ['git reset --soft HEAD~1', 'Bash'], ['git reset --mixed HEAD~1', 'Bash'], ['git reset HEAD~1', 'PowerShell'], ['git reset --keep HEAD^', 'Bash'],
       ['git rm -rf .', 'Bash'], ['git rm -r :/', 'Bash'],
@@ -134,7 +134,7 @@ const claudeWrite = (repo, sid, file, tool) => hook('track', { hook_event_name: 
     const m10Allow = [
       ['git stash list', 'Bash'], ['git stash show stash@{0}', 'PowerShell'], ['git reset', 'Bash'], ['git reset HEAD', 'Bash'], ['git reset --soft HEAD', 'Bash'],
       ['git reset -- src/a.js', 'Bash'], ['git reset src/a.js', 'Bash'], ['git reset HEAD~1 -- src/a.js', 'Bash'], ['git rm -r --cached .', 'Bash'], ['git rm src/a.js', 'Bash'],
-      ['git rm -r -n .', 'Bash'], ['git branch -m old new', 'Bash'], ['git commit -m "amend later"', 'Bash'], ['git checkout -b fresh', 'Bash'], ['rm -f .git/index.lock', 'Bash'],
+      ['git rm -r -n .', 'Bash'], ['git branch -m old new', 'Bash'], ['git branch -M main', 'Bash'],   // [2026-10-29 감사 오탐] 지금 브랜치(main)를 같은 이름으로 — 덮어쓸 것이 없다 ['git commit -m "amend later"', 'Bash'], ['git checkout -b fresh', 'Bash'], ['rm -f .git/index.lock', 'Bash'],
       ['git fetch --all', 'Bash'],
     ];
     for (const [c, t] of m10Allow) { const r = pre(c, t); R.check(`[guard/M10] 통과(${t}): ${c}`, isAllow(r), JSON.stringify(r).slice(0, 300)); }
@@ -206,6 +206,17 @@ const claudeWrite = (repo, sid, file, tool) => hook('track', { hook_event_name: 
     R.check('[guard] 깨진 입력 → exit 0 · 출력 없음(허용)', isAll(bad), JSON.stringify(bad));
     R.check('[guard] 깨진 입력은 hook-errors.log 에 남는다', fs.existsSync(errLog) && /"hook":"guard"/.test(fs.readFileSync(errLog, 'utf8')));
     R.check('[guard] 빈 입력 · tool_input 없음 → 허용', isAllow(hook('guard', '', [], repo)) && isAllow(hook('guard', { tool_name: 'Bash', cwd: repo })));
+    // [2026-10-29 감사] 판정 중 예외(여기서는 lexer 재귀 한도)는 허용으로 끝났다 — git · 삭제를 언급하면 막고, 그 밖은 열어 둔다. 둘 다 기록한다.
+    {
+      const deep = n => '$('.repeat(n) + 'true' + ')'.repeat(n);
+      const before = fs.existsSync(errLog) ? fs.readFileSync(errLog, 'utf8').length : 0;
+      const ex1 = pre(': ' + deep(20000) + ' ; git push --force origin main', 'Bash');
+      const ex2 = pre(': ' + deep(20000) + ' ; echo hi', 'Bash');
+      const logged = fs.existsSync(errLog) ? fs.readFileSync(errLog, 'utf8').slice(before) : '';
+      R.check('[guard] 내부 예외 + git 언급 → deny(내부 오류라고 적는다)', isDeny(ex1) && /내부 오류/.test(ex1.json.hookSpecificOutput.permissionDecisionReason), JSON.stringify(ex1).slice(0, 300));
+      R.check('[guard] 내부 예외 + git · 삭제 언급 없음 → 허용(열어 둔다)', isAllow(ex2), JSON.stringify(ex2).slice(0, 300));
+      R.check('[guard] 내부 예외는 둘 다 hook-errors.log 에 남는다', (logged.match(/"hook":"guard"/g) || []).length >= 2, logged.slice(0, 300));
+    }
 
     // ── track ─────────────────────────────────────────────────────────
     const tr = mkRepo('track', { 'README.md': '# t\n', 'src/a.js': 'a\n' });

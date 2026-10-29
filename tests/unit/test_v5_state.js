@@ -214,6 +214,22 @@ function runChildren(n, script, env) {
     const removed = S.removeDeadLocks(repo);
     R.check('[ST-11] removeDeadLocks: 죽은 잠금만 지운다', removed.includes('dead-one') && !removed.includes('alive-one') && fs.existsSync(S.lockDir(repo, 'alive-one')), JSON.stringify(removed));
     keep.release();
+
+    // [2026-10-29 감사] 같은 호스트의 주인 — pid 가 살아 있어도(EPERM · 재사용) 신호가 사흘 멈췄거나 시작 시각이 다르면 죽은 것
+    {
+      const sl = sleeper(), spawnedAt = Date.now();
+      await wait(300);
+      const host = os.hostname(), old = new Date(Date.now() - 3 * 86400000).toISOString(), fresh = new Date().toISOString();
+      const v6 = S.ownerAlive({ pid: sl.pid, host, heartbeat_at: old });
+      const reused = S.ownerAlive({ pid: sl.pid, host, at: fresh, started_at: old });
+      const real = S.ownerAlive({ pid: sl.pid, host, at: old, started_at: new Date(spawnedAt).toISOString() });
+      const nowFresh = S.ownerAlive({ pid: sl.pid, host, heartbeat_at: fresh });
+      const selfStart = S.procStartMs(process.pid);
+      R.check('[ST-14] 같은 호스트: 신호가 사흘 멈춘 옛 기록 → 죽음 · 시작 시각이 다른(재사용된) pid → 죽음 · 시작 시각이 맞으면 오래 쥐어도 산 것 · 새 신호면 산 것 · 없는 pid 는 none',
+        !v6 && !reused && real && nowFresh && typeof selfStart === 'number' && Math.abs(selfStart - Date.parse(S.PROC_STARTED_AT)) < 10000 && S.procStartMs(deadPid()) === 'none',
+        JSON.stringify({ v6, reused, real, nowFresh, selfStart, started: S.PROC_STARTED_AT }));
+      sl.kill();
+    }
   } catch (e) { R.check('예외 없이 끝난다', false, String(e && e.stack || e).slice(0, 800)); }
   finally { try { fs.rmSync(base, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }); } catch { /* 임시 디렉터리 정리 실패는 결과와 무관 */ } }
   R.done();

@@ -35,16 +35,44 @@ function portEnv(root, id) {
 
 // ── 포트 구역 ────────────────────────────────────────────────────────────────
 //   [2026-10-25 사용자 "구조적으로 막을 수 있다"] 병렬 작업이 같은 포트(개발 서버 · 시험 DB)를 잡아 서로 깨뜨렸다 — 작업마다 겹치지 않는
-//   구역(기본 20000-39999 에서 20개씩)을 장부(<git-common-dir>/harness/ports.json)에 잡아 준다. 장부 쓰기는 잠금 아래 · 원자적으로.
-//   잡기 전에 기록이 없거나 끝난(accepted · cancelled) 작업의 구역을 푼다. 작업 끝(onTaskEnd)에는 남긴다 — done 작업은 accept 때 다시 검사한다.
+//   구역(기본 20000-39999 에서 20개씩)을 장부에 잡아 준다. 장부 쓰기는 잠금 아래 · 원자적으로.
+//   잡기 전에 기록이 없거나 끝난(accepted · cancelled) 작업의 구역을 푼다. 끝난 작업에는 새로 잡지 않는다.
+//   [2026-10-29 감사] 장부가 저장소마다(<git-common-dir>/harness/ports.json) 따로라 다른 저장소의 레인끼리 같은 구역(20000)을 받았다 —
+//   장부는 PC 에 하나: <HARNESS_TMP_BASE 또는 OS 임시 폴더>/harness/ports.json(작업 환경에도 HARNESS_TMP_BASE 를 물려주므로 같은 파일) ·
+//   HARNESS_PORTS_FILE 로 바꿀 수 있다. 항목마다 그 저장소(root)를 적어 끝난 작업을 알아본다.
 //   프로젝트 yaml: port_range: "20000-39999" · port_block: 20 (없거나 이상하면 기본).
 const PORT_FINAL = new Set(['accepted', 'cancelled']);
-const portsFile = root => path.join(require('./state').paths(root).harnessDir, 'ports.json');
+const machinePortsFile = () => process.env.HARNESS_PORTS_FILE || path.join(baseTmp(), 'harness', 'ports.json');
 const okEntry = e => !!e && typeof e === 'object' && Number.isInteger(e.base) && Number.isInteger(e.count) && e.count > 0;
 function readLedger(file) {
   const raw = require('./state').readJson(file, null), led = {};
   if (raw && typeof raw === 'object' && !Array.isArray(raw)) for (const [k, v] of Object.entries(raw)) if (okEntry(v)) led[k] = v;
   return led;
+}
+const realRoot = root => { try { return require('./state').paths(root).root; } catch { return path.resolve(root); } };
+const sameRoot = (a, b) => !!a && !!b && (process.platform === 'win32' ? path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase() : path.resolve(a) === path.resolve(b));
+// PC 장부의 잠금 — 저장소 잠금(state.acquire)은 저장소마다라 쓸 수 없다. 같은 mkdir 원자 잠금 · 죽은 주인은 빼앗는다(state.staleInfo · takeOver).
+function withMachineLock(file, fn, waitMs) {
+  const S = require('./state'), dir = `${file}.lock`, deadline = Date.now() + (waitMs || 15000);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  for (;;) {
+    let made = false;
+    try { fs.mkdirSync(dir); made = true; } catch (e) { if (e.code !== 'EEXIST' && e.code !== 'EPERM') throw e; }
+    if (made) {
+      const owner = { pid: process.pid, host: S.HOST, at: S.nowIso(), token: crypto.randomBytes(6).toString('hex') };
+      try {
+        S.writeJsonAtomic(path.join(dir, 'owner.json'), owner, { noMkdir: true });
+        return fn();
+      } finally {
+        const cur = S.readJson(path.join(dir, 'owner.json'), null);
+        if (!cur || cur.token === owner.token) { try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* 남으면 다음에 빼앗긴다 */ } }
+      }
+    }
+    const st = S.staleInfo(dir);
+    if (st.stale && S.takeOver(dir, st.owner)) continue;
+    if (Date.now() >= deadline) throw Object.assign(new Error(`the port ledger ${file} is locked by another process`), { code: 'LOCK_HELD', owner: st.owner });
+    S.sleepSync(30 + Math.floor(Math.random() * 30));
+  }
 }
 function portConf(root) {
   let lo = 20000, hi = 39999, count = 20;
@@ -61,41 +89,49 @@ function portConf(root) {
 function portBlock(root, id) {
   const S = require('./state');
   if (!S.validId(id)) throw Object.assign(new Error(`invalid task id: ${id}`), { code: 'USAGE' });
-  const file = portsFile(root), have = readLedger(file)[id];
-  if (have) return { base: have.base, count: have.count };   // 이미 잡았으면 잠그지 않는다(작업자 · 검사가 띄울 때마다 불린다)
-  return S.withLockSync(root, 'ports', () => {
+  const rr = realRoot(root), file = machinePortsFile(), have = readLedger(file)[id];
+  if (have && sameRoot(have.root, rr)) return { base: have.base, count: have.count };   // 이미 잡았으면 잠그지 않는다(작업자 · 검사가 띄울 때마다 불린다)
+  // [2026-10-29 감사] 끝난(accepted) 레인의 남은 worktree 에서 세션을 열면 board 가 그 작업에 구역을 새로 잡고 gc 는 풀지 않았다 — 끝난 · 없는 작업에는 잡지 않는다.
+  const task = S.readTask(root, id);
+  if (!task) throw Object.assign(new Error(`unknown task: ${id}`), { code: 'UNKNOWN_TASK' });
+  if (PORT_FINAL.has(task.status)) throw Object.assign(new Error(`task ${id} is ${task.status} — no port block`), { code: 'TASK_FINISHED' });
+  return withMachineLock(file, () => {
     const led = readLedger(file);
-    if (led[id]) return { base: led[id].base, count: led[id].count };
-    let changed = false;
+    if (led[id] && sameRoot(led[id].root, rr)) return { base: led[id].base, count: led[id].count };
     for (const k of Object.keys(led)) {
-      if (k === id) continue;
-      const t = S.validId(k) ? S.readTask(root, k) : null;
-      if (!t || PORT_FINAL.has(t.status)) { delete led[k]; changed = true; }
+      if (k === id) { delete led[k]; continue; }   // 같은 id 의 다른 저장소 항목(있을 수 없지만) — 이 작업으로 다시 잡는다
+      let t = null;
+      try { t = S.validId(k) && led[k].root && fs.existsSync(led[k].root) ? S.readTask(led[k].root, k) : null; } catch { t = null; }
+      if (!t || PORT_FINAL.has(t.status)) delete led[k];
     }
     const { lo, hi, count } = portConf(root);
     const taken = Object.values(led).map(e => [e.base, e.base + e.count]);
     for (let b = lo; b + count - 1 <= hi;) {
       const hit = taken.find(([s, e]) => b < e && s < b + count);
-      if (!hit) { led[id] = { base: b, count, at: S.nowIso() }; S.writeJsonAtomic(file, led); return { base: b, count }; }
+      if (!hit) { led[id] = { base: b, count, at: S.nowIso(), root: rr }; S.writeJsonAtomic(file, led); return { base: b, count }; }
       b = Math.max(hit[1], b + 1);
     }
-    if (changed) S.writeJsonAtomic(file, led);
+    S.writeJsonAtomic(file, led);
     throw Object.assign(new Error(`no free port block of ${count} in ${lo}-${hi} (${Object.keys(led).length} tasks hold blocks)`), { code: 'PORTS_EXHAUSTED' });
-  }, { waitMs: 15000 });
+  });
 }
 // 이 작업의 구역을 푼다 — 풀었으면 그 구역, 없었으면 null
 function freePorts(root, id) {
-  const S = require('./state'), file = portsFile(root);
-  if (!readLedger(file)[id]) return null;
-  return S.withLockSync(root, 'ports', () => {
+  const file = machinePortsFile(), rr = realRoot(root);
+  const mine = e => !!e && (!e.root || sameRoot(e.root, rr));
+  if (!mine(readLedger(file)[id])) return null;
+  return withMachineLock(file, () => {
     const led = readLedger(file), had = led[id];
-    if (!had) return null;
-    delete led[id]; S.writeJsonAtomic(file, led);
+    if (!mine(had)) return null;
+    delete led[id]; require('./state').writeJsonAtomic(file, led);
     return { base: had.base, count: had.count };
-  }, { waitMs: 15000 });
+  });
 }
-// 장부 그대로(상태 표시용) — { "<id>": { base, count, at } }
-const portsOf = root => { try { return readLedger(portsFile(root)); } catch { return {}; } };
+// 이 저장소의 장부 항목(상태 표시용) — { "<id>": { base, count, at, root } }
+const portsOf = root => {
+  try { const rr = realRoot(root), led = readLedger(machinePortsFile()); return Object.fromEntries(Object.entries(led).filter(([, e]) => sameRoot(e.root, rr))); }
+  catch { return {}; }
+};
 // [2026-10-21 자동 이슈 #25 · #26] 작업자 · 검사의 dotnet test/build 가 MSBuild 작업 노드(/nodemode:1)를 수백 개씩 띄우고, 부모가 끝나면
 //   고아로 남아 1,000개 · 수십 GB 까지 쌓였다(작업 끝 점검은 부모를 잃은 노드를 작업 소속으로 알아보지 못한다). 처음부터 띄우지 않게 한다:
 //   노드 재사용 끔 · MSBuild 서버 끔 · Roslyn 컴파일러 서버(VBCSCompiler) 끔. 빌드는 조금 느려지지만 남는 프로세스가 없다.
@@ -166,13 +202,10 @@ function removeTmp(root, id) {
   return { dir, removed: true, residue: [] };
 }
 
-// ── 남은 프로세스 ────────────────────────────────────────────────────────────
-//   [2026-10-20 실측] 끝난 작업의 작업자 세션이 띄운 Monitor(tail -f)가 하루 넘게 살아 있었다. 명령줄에 **그 작업의 worktree 경로**가 든 프로세스만 끝낸다
-//   — 다른 작업 · 사용자의 프로세스는 건드리지 않는다. Claude Code 는 작업 폴더 경로의 글자 아닌 것을 '-' 로 바꿔 임시 폴더 이름에 쓴다
-//   (…\claude\C--repo--harness-worktrees-<id>\…) — 그 꼴도 본다. HARNESS_PROC_CLEANUP=off 면 보지 않는다(테스트 러너).
-//   작업이 시작된 뒤 생긴 프로세스만 · 사용자가 그 폴더를 연 편집기 · 탐색기는 빼고.
+// ── 프로세스 목록 · 끝내기 ──────────────────────────────────────────────────
+//   v7 은 작업 끝에 프로세스를 회수하지 않는다(무인 작업자가 없다 · release 에 프로세스 단계 없음) — 등록이 사라진 남은 worktree 폴더를 붙잡은
+//   프로세스만 git.js 의 killProcsIn 이 끝낸다. 여기 둘은 평가(eval/run.js)가 작업공간의 남은 프로세스를 치울 때 쓴다.
 const IS_WIN = process.platform === 'win32';
-const USER_APPS = /(^|[\\/"])(code|code - insiders|code-insiders|cursor|windsurf|devenv|rider64|rider|idea64|idea|pycharm64|explorer|finder)(\.exe)?["\s]/i;
 // ps 의 etime([[dd-]hh:]mm:ss) → 초
 const etimeSec = s => { const m = /^(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)$/.exec(String(s).trim()); return m ? ((+m[1] || 0) * 86400 + (+m[2] || 0) * 3600 + +m[3] * 60 + +m[4]) : null; };
 function defaultProcs() {

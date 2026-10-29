@@ -8,10 +8,10 @@ description: Pilot(하네스) — 여러 세션이 한 저장소에서 일할 �
 ## 만들거나 고쳐 달라는 요청
 - 한두 줄 수정 · 질문 · 조사, 그리고 같은 체크아웃에서 다른 세션이 일하지 않을 때의 작업은 **그 자리에서** 하고 고친 파일만 커밋한다(`git commit -m "…" -- <파일>`).
 - 다른 세션이 같은 체크아웃에서 일하거나(board 훅이 알린다), 여러 세션이 도는 중에 여러 파일에 걸친 일을 하면 **레인**을 만든다:
-  1. 요청 원문을 임시 파일에 쓰고(셸 명령줄에 넣지 않는다 — 따옴표 · `$(…)` · 백틱이 바뀐다) `node harness/cli.js start --goal-file "<파일>"`.
+  1. 짧은 요청은 따옴표 인자로 `node harness/cli.js start "<짧은 요청>"`. 요청이 길거나 따옴표 · `$` · 백틱이 들었으면 임시 파일에 써서 `node harness/cli.js start --goal-file "<파일>"`(셸이 원문을 바꾼다).
   2. 나온 worktree 경로와 여는 법(`cd "<폴더>" ; claude` 또는 VS Code)을 사용자에게 전한다 — 그 폴더의 세션이 일하고 진행하며 커밋한다.
-  3. 비슷한 작업이 이미 있다고 나오면 처음부터 다시 하지 말고 `start --from <id> --goal-file "<파일>"`(그 브랜치에서 이어 간다).
-- 사람 없이 맡길 일은 Claude Code 백그라운드 세션(`claude --bg "<요청>"`) — 끝나면 그 브랜치를 accept 한다. 백그라운드 세션도 push 하지 않는다.
+  3. 비슷한 작업이 이미 있다고 나오면 처음부터 다시 하지 말고 `start --from <id>`(그 브랜치에서 이어 간다 · 목표는 1 과 같은 방법으로).
+- 사람 없이 맡길 일은 자기 worktree 의 Claude Code 백그라운드 세션(`claude --bg -w <이름> "<요청>"`) — 끝나면 그 브랜치를 `node harness/cli.js batch --branch <브랜치>` 로 묶어 검사하고, 사용자가 말한 뒤 `batch accept <bid>`(accept 는 작업 id 만 받는다). 백그라운드 세션도 push 하지 않는다.
 - 일에 맞는 스킬 · MCP 가 이 세션에 있으면 먼저 쓴다 · 없는 것은 `node harness/cli.js toolkit` 으로 보고 사용자에게 제안만 한다.
 
 ## 받아들이기 · 묶어 합치기 · 취소 · 되살리기
@@ -26,4 +26,4 @@ description: Pilot(하네스) — 여러 세션이 한 저장소에서 일할 �
 - 끝난 작업의 worktree · 프로세스 · 컨테이너 · 임시 폴더 · 포트 정리: `node harness/cli.js gc`(하네스가 만든 것만).
 
 ## 하네스 보고 (자동)
-- 하네스가 오류로 멈추거나 의도와 다르게 행동하거나 더 나은 방향이 보이면 묻지 말고 `node harness/cli.js report --kind <bug|intent|improve> --title "…" --body "…"` — 하네스 동작만 쓰고 프로젝트 코드 · 이름 · 경로는 쓰지 않는다. 사용자가 하네스에 대한 건의를 말하면 그것도 이렇게 올린다(`--kind improve`).
+- 이슈 발행은 공개 저장소로 나가는 쓰기지만 사용자가 자동 발행에 미리 동의했기 때문에 묻지 않는다(끄기: 프로젝트 블록 `bug_report: off`). 하네스가 오류로 멈추거나 의도와 다르게 행동하거나 더 나은 방향이 보이면 `node harness/cli.js report --kind <bug|intent|improve> --title "…" --body "…"` — 하네스 동작만 쓰고 프로젝트 코드 · 이름 · 경로는 쓰지 않는다. 사용자가 하네스에 대한 건의를 말하면 그것도 이렇게 올린다(`--kind improve`).

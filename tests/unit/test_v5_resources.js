@@ -14,6 +14,9 @@ const St = require('../../harness/lib/status');
 const R = makeReporter('자원 장부 — 임시 폴더 · 데이터 구역 · 회수 · 남은 것');
 
 const base = fs.mkdtempSync(path.join(os.tmpdir(), 'harness-v5-res-'));
+// 포트 장부는 PC 에 하나다 — 이 시험의 장부는 임시 디렉터리에(사용자의 장부를 건드리지 않게)
+const PORTS = path.join(base, 'machine-ports.json');
+process.env.HARNESS_PORTS_FILE = PORTS;
 const write = (f, t) => { fs.mkdirSync(path.dirname(f), { recursive: true }); fs.writeFileSync(f, t); };
 const git = (cwd, ...a) => (spawnSync('git', a, { cwd, encoding: 'utf8', windowsHide: true }).stdout || '').trim();
 const quiet = { log: () => {} };
@@ -129,12 +132,9 @@ function fakeDocker(state) {
     commitIn(t7.worktree, { 'feat3.js': 'module.exports = 3;\n' });
     const can = await I.cancel({ ...quiet, root: r5, id: t7.id });
     R.check('[RS-05] cancel 도 회수한다', can.status === 'cancelled' && S.readTask(r5, t7.id).resources.release_at && fs.readFileSync(cleaned, 'utf8') === Res.dataNs(t7.id), JSON.stringify({ status: can.status, res: S.readTask(r5, t7.id).resources }));
-    // RS-07 — 쓰기 소유권(PRD R3): start --owns → 작업 기록 · 잘못된 경로 거부
-    const t8 = Ln.start({ ...quiet, root: r5, goal: 'billing only', owns: ['src/billing/**', 'tests\\billing\\**'] });
-    R.check('[RS-07] --owns: 작업 기록에 남는다(경로 구분자는 / 로)', t8.status === 'open' && JSON.stringify(S.readTask(r5, t8.id).owns) === JSON.stringify(['src/billing/**', 'tests/billing/**']), JSON.stringify({ status: t8.status, owns: S.readTask(r5, t8.id).owns }));
-    let bad = null; try { Ln.start({ ...quiet, root: r5, goal: 'x', owns: ['../other/**'] }); } catch (e) { bad = e; }
-    let bad2 = null; try { Ln.start({ ...quiet, root: r5, goal: 'x', owns: ['C:/abs/**'] }); } catch (e) { bad2 = e; }
-    R.check('[RS-07] --owns 는 저장소 안의 상대 경로만(.. · 절대 경로는 거부)', bad && bad.code === 'USAGE' && bad2 && bad2.code === 'USAGE', String(bad && bad.message));
+    // RS-07 — [2026-10-29 감사] start --owns 는 기록만 되고 어디서도 읽지 않았다(guard --worker 가 빠진 뒤 죽은 옵션) — 레인은 owns 를 받지 않는다
+    const t8 = Ln.start({ ...quiet, root: r5, goal: 'billing only', owns: ['src/billing/**'] });
+    R.check('[RS-07] start 는 owns 를 기록하지 않는다(효과 없는 옵션을 믿게 하지 않는다)', t8.status === 'open' && S.readTask(r5, t8.id).owns === undefined, JSON.stringify({ status: t8.status, owns: S.readTask(r5, t8.id).owns }));
 
     // RS-09 — CLI 는 할 일을 마치면 남은 핸들이 있어도 끝난다(분리된 go 가 done 뒤 24분 살아 있던 실측) — 새는 타이머를 미리 심어 재현
     const leak = path.join(base, 'leak.js'); write(leak, 'setInterval(() => {}, 1000);\n');
@@ -142,19 +142,20 @@ function fakeDocker(state) {
     const cli9 = spawnSync(process.execPath, ['-r', leak, path.join(__dirname, '..', '..', 'harness', 'cli.js'), 'status', '--root', r9], { encoding: 'utf8', windowsHide: true, timeout: 40000 });
     R.check('[RS-09] 남은 핸들(타이머)이 있어도 CLI 는 일을 마치고 몇 초 안에 끝난다(종료 코드 유지)', !cli9.error && cli9.status === 0 && Date.now() - t9 < 25000, JSON.stringify({ err: cli9.error && cli9.error.code, status: cli9.status, ms: Date.now() - t9, out: (cli9.stdout || '').slice(0, 120) }));
 
-    // RS-12 — 작업마다의 포트 구역: 장부(<common>/harness/ports.json) · 같은 작업은 같은 구역 · 다른 작업은 겹치지 않음 · 끝난/없는 작업은 회수
+    // RS-12 — 작업마다의 포트 구역: 장부(PC 에 하나) · 같은 작업은 같은 구역 · 다른 작업은 겹치지 않음 · 끝난/없는 작업은 회수
     { const r12 = repo({ 'a.txt': 'x\n' });
+      const ledgerFile = path.join(base, 'ports-12.json');   // 앞 시험의 레인(t8)이 잡은 구역과 섞이지 않게 새 장부
+      process.env.HARNESS_PORTS_FILE = ledgerFile;
       const A = 't-20261025-090000-aaaa', B = 't-20261025-090000-bbbb', C = 't-20261025-090000-cccc', D = 't-20261025-090000-dddd';
       const mk = (id, status) => S.writeTask(r12, S.newTask({ id, status }));
       mk(A, 'open'); mk(B, 'done');
       const a1 = Res.portBlock(r12, A), b1 = Res.portBlock(r12, B), a2 = Res.portBlock(r12, A);
-      const ledgerFile = path.join(S.paths(r12).harnessDir, 'ports.json');
       const disjoint = (x, y) => x.base + x.count <= y.base || y.base + y.count <= x.base;
       R.check('[RS-12] 기본 구역: 20000 부터 20개씩 · 같은 작업은 다시 물어도 같은 구역 · 다른 작업은 겹치지 않는 다음 구역',
         a1.base === 20000 && a1.count === 20 && JSON.stringify(a2) === JSON.stringify(a1) && b1.base === 20020 && b1.count === 20 && disjoint(a1, b1), JSON.stringify({ a1, a2, b1 }));
       const led = JSON.parse(fs.readFileSync(ledgerFile, 'utf8'));
-      R.check('[RS-12] 장부는 <git-common-dir>/harness/ports.json 의 { id: { base, count, at } } · portsOf 가 그대로 보인다',
-        led[A] && led[A].base === 20000 && led[A].count === 20 && typeof led[A].at === 'string' && led[B].base === 20020 && JSON.stringify(Object.keys(Res.portsOf(r12)).sort()) === JSON.stringify([A, B]), JSON.stringify(led));
+      R.check('[RS-12] 장부는 PC 에 하나(HARNESS_PORTS_FILE)의 { id: { base, count, at, root } } · portsOf 는 그 저장소의 것만 보인다',
+        led[A] && led[A].base === 20000 && led[A].count === 20 && typeof led[A].at === 'string' && typeof led[A].root === 'string' && led[B].base === 20020 && JSON.stringify(Object.keys(Res.portsOf(r12)).sort()) === JSON.stringify([A, B]), JSON.stringify(led));
       // A 가 받아들여지면(accepted) · 기록이 없는 작업(D)의 구역은 다음 잡기 때 풀린다 — 가장 낮은 빈 구역(20000)을 C 가 받는다
       const raw = JSON.parse(fs.readFileSync(ledgerFile, 'utf8')); raw[D] = { base: 20040, count: 20, at: 'x' }; fs.writeFileSync(ledgerFile, JSON.stringify(raw));
       mk(A, 'accepted'); mk(C, 'open');
@@ -197,6 +198,31 @@ function fakeDocker(state) {
       R.check('[RS-12] 두 프로세스가 동시에 12개 작업의 구역을 잡아도 서로 겹치지 않고 장부에 모두 남는다',
         p1.code === 0 && p2.code === 0 && blocks.length === 12 && allDisjoint && Object.keys(ledP).length === 12 && Object.entries(got).every(([id, b]) => ledP[id] && ledP[id].base === b.base),
         JSON.stringify({ c1: p1.code, c2: p2.code, got, led: Object.keys(ledP).length })); }
+
+    // RS-13 — [2026-10-29 감사] 장부가 저장소마다라 다른 저장소의 레인이 같은 구역을 받았다 — PC 에 하나인 장부에서 겹치지 않게
+    { process.env.HARNESS_PORTS_FILE = path.join(base, 'ports-13.json');
+      const one = repo({ 'a.txt': 'x\n' }), two = repo({ 'b.txt': 'y\n' });
+      const a = Ln.start({ ...quiet, root: one, goal: 'proj one lane a' }), b = Ln.start({ ...quiet, root: one, goal: 'proj one lane b' }), c = Ln.start({ ...quiet, root: two, goal: 'proj two lane c' });
+      const blocks = [a.ports, b.ports, c.ports];
+      const disj = (x, y) => x.base + x.count <= y.base || y.base + y.count <= x.base;
+      const eC = Res.envFor(path.join(two, '.harness-worktrees', c.id)), eA = Res.envFor(path.join(one, '.harness-worktrees', a.id));
+      R.check('[RS-13] 서로 다른 저장소의 레인도 겹치지 않는 포트 구역을 받는다 · envFor 도 같은 구역', blocks.every(Boolean) && disj(a.ports, b.ports) && disj(a.ports, c.ports) && disj(b.ports, c.ports)
+        && eC.HARNESS_PORT_BASE === String(c.ports.base) && eA.HARNESS_PORT_BASE === String(a.ports.base) && eC.HARNESS_PORT_BASE !== eA.HARNESS_PORT_BASE, JSON.stringify({ blocks, eA: eA.HARNESS_PORT_BASE, eC: eC.HARNESS_PORT_BASE }));
+      // 다른 저장소의 끝난 작업은 다음 잡기 때 풀린다(장부 항목마다 저장소를 적는다)
+      const ta = S.readTask(one, a.id); ta.status = 'accepted'; S.writeTask(one, ta);
+      const d = Ln.start({ ...quiet, root: two, goal: 'proj two lane d' });
+      R.check('[RS-13] 다른 저장소에서 끝난(accepted) 작업의 구역은 다음 잡기 때 풀려 다시 쓰인다', d.ports && d.ports.base === a.ports.base && !Res.portsOf(one)[a.id], JSON.stringify({ d: d.ports, a: a.ports }));
+
+      // RS-14 — 끝난(accepted) 레인의 남은 worktree 에서 세션을 열어도(envFor · board) 구역을 새로 잡지 않는다 · gc 는 남은 구역을 푼다
+      const tb = S.readTask(one, b.id); tb.status = 'accepted'; S.writeTask(one, tb);
+      Res.freePorts(one, b.id);
+      const eB = Res.envFor(path.join(one, '.harness-worktrees', b.id));
+      R.check('[RS-14] accepted 작업의 worktree 에서 envFor 는 포트 변수를 주지 않고 장부에 잡지 않는다(다른 변수는 그대로)', eB.HARNESS_TASK_ID === b.id && !('HARNESS_PORT_BASE' in eB) && !Res.portsOf(one)[b.id], JSON.stringify(eB));
+      const raw = JSON.parse(fs.readFileSync(process.env.HARNESS_PORTS_FILE, 'utf8')); raw[b.id] = { base: 39000, count: 20, at: 'x', root: S.paths(one).root }; fs.writeFileSync(process.env.HARNESS_PORTS_FILE, JSON.stringify(raw));
+      St.gc({ root: one });
+      R.check('[RS-14] gc 는 끝난 작업에 남은 구역을 푼다(회수 시각이 이미 있어도)', !Res.portsOf(one)[b.id], JSON.stringify(Res.portsOf(one)));
+      // RS-15 — 프로세스 정리 구역은 평가(eval/run.js)가 쓰는 두 함수만 남는다
+      R.check('[RS-15] listProcesses · killProcess · teardownCompose 는 그대로 내보낸다', typeof Res.listProcesses === 'function' && typeof Res.killProcess === 'function' && typeof Res.teardownCompose === 'function'); }
   } catch (e) { R.check('예외 없이 끝난다', false, String(e && e.stack || e).slice(0, 900)); }
   finally { try { fs.rmSync(base, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }); } catch { /* 정리 실패는 결과와 무관 */ } }
   R.done();

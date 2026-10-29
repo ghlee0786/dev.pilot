@@ -30,8 +30,9 @@ git clone https://github.com/ghlee0786/dev.pilot
 node dev.pilot/harness/cli.js install --root <내 저장소>
 ```
 
-`<내 저장소>` 에 `harness/` 사본 · `AGENTS.md` 관리 블록 · `CLAUDE.md` 의 `@AGENTS.md` · Claude Code / Codex 훅 · `harness` 스킬이 들어간다.
+`<내 저장소>` 에 `harness/` 사본 · `AGENTS.md` 관리 블록 · `CLAUDE.md` 의 `@AGENTS.md` · Claude Code / Codex 훅 · `harness` 스킬 · `.vscode/settings.json` 의 worktree 제외(파일 감시 · 검색 · `git.detectWorktrees: false` — 레인이 많아도 VS Code 가 무거워지지 않게, 없는 키만 더한다)가 들어간다.
 **자동 갱신** — 하네스를 쓰는 시점에 하루 한 번 최신 릴리스를 확인해 백그라운드로 설치한다. 새 판에서 빠진 하네스 파일은 지운다(설치 기록에 하네스가 깐 것으로 적힌 것만). 손으로는 `node harness/cli.js update`(`--dry-run` 은 비교만) · 걷어 내기는 `uninstall`.
+**일하는 세션의 맥락을 지킨다** — 설치 · 갱신은 하네스가 일하는 중이면(산 주인 · 20분 안에 바뀐 작업 기록 · 레인 세션 기록 · 검사/병합 잠금) 거부하고 자동 갱신은 1시간 뒤로 미룬다. 끝나지 않은 v6 작업이 있으면 `--migrate` 를 줄 때만 설치하고, 작업마다 이어 가는 명령(`start --from <id>` · `claude --resume <세션>`)을 `<git-common-dir>/harness/v7-migration.md` 에 먼저 적는다 — 자동 갱신은 이행하지 않는다.
 
 ## 명령
 
@@ -39,25 +40,25 @@ node dev.pilot/harness/cli.js install --root <내 저장소>
 
 | 명령 | 하는 일 |
 |---|---|
-| `start "<요청>"` | **레인** — 자기 worktree · 브랜치(`harness/<id>`) · 포트 구역. 그 폴더에서 세션을 열어 일하고 진행하며 커밋한다. `--from <id>` 는 앞 작업의 브랜치에서 이어 간다 · `--base <브랜치>` · 비슷한 작업이 있으면 알린다 |
+| `start "<요청>"` | **레인** — 자기 worktree · 브랜치(`harness/<id>`) · 포트 구역. 그 폴더에서 세션을 열어 일하고 진행하며 커밋한다. `--from <id>` 는 앞 작업의 브랜치에서 이어 간다(v6 작업은 남은 worktree 를 그 자리에서 레인으로 받고 `claude --resume <세션>` 을 알려 준다) · `--base <브랜치>` · 비슷한 작업이 있으면 알린다 |
 | `status` | 레인 · 작업 · 산 세션(플랫폼 목록 · busy/idle) · 주인이 죽은 작업(DEAD) · 겹치는 파일 · 주인 없는 미커밋 변경 |
 | `accept <id>` | 사용자 브랜치로 병합(사용자가 말한 뒤) — 검사 한 번 · 나빠졌을 때만 거절 · 커밋 안 된 대량 삭제는 커밋하지 않고 멈춤 · 검사가 다시 쓴 산출물은 되돌림 · 검사 뒤 문서만 들어오면 재검사 생략. 충돌은 그 레인에 병합을 남겨 두고 알린다(그 레인에서 풀고 다시 accept) |
-| `batch <id>... \| --all \| --branch <이름>` · `batch accept <bid>` | 끝난 작업 · 브랜치를 `harness/batch/<bid>` 에 묶고(충돌하는 것은 건너뜀) 검사를 **한 번만** · `batch accept` 가 병합(사용자가 말한 뒤) · `batch status\|drop` |
+| `batch <id>... \| --all \| --branch <이름>` · `batch accept <bid>` | 끝난 작업 · 브랜치를 `harness/batch/<bid>` 에 묶고(충돌하는 것 · 산 세션이 일하는 레인은 건너뜀) 검사를 **한 번만** · `batch accept` 가 병합(사용자가 말한 뒤) · `batch status\|drop` |
 | `check <id>` | 검사를 지금 돌려 기록(병합하지 않음) |
 | `cancel <id>` · `restore <id>` | 병합 되돌리기(revert) · 되살리기 |
 | `push [<remote>] [<branch>]` · `push --tag <이름>` | 빨리감기 push · 릴리스 태그(사용자가 명시한 뒤 · 강제 없음) |
-| `gc` | 끝난 작업 정리 — 하네스가 만든 것만 |
+| `gc` | 끝난 작업 정리 — 하네스가 만든 것만(열린 레인 · 끝나지 않은 v6 작업은 남긴다) |
 | `toolkit` | 이 저장소 스택(C++ · Qt · .NET · Python · 웹 …)에 맞는 스킬 · MCP · 플러그인 중 있는 것 · 없는 것(이유 · 설치 방법) · 주의할 것(보관된 MCP 서버 등). 읽기만 한다 · 세션 시작 때 하루 한 번 한 줄로도 |
 | `report --kind <bug\|intent\|improve> …` | 하네스 보고(아래) |
 | `install` · `uninstall` · `update` · `version` | 설치 · 걷어 내기 · 갱신 · 판 |
 
-사람 없이 맡길 일은 Claude Code 백그라운드 세션(`claude --bg "<요청>"`)으로 하고 끝나면 그 브랜치를 `accept` 한다. v6 의 `go` · `factory` · `resume` · `note` · `wait` · `stop` · `doc` · `metrics` · `insights` · `profile` 은 v7 에서 빠졌다(부르면 대신 쓸 것을 알려 준다). v6 에서 만든 작업은 그대로 `accept` · `cancel` 할 수 있다.
+사람 없이 맡길 일은 Claude Code 백그라운드 세션(`claude --bg -w "<요청>"`)으로 하고 끝나면 그 브랜치를 `batch --branch <브랜치>` → `batch accept <bid>` 로 들인다. v6 의 `go` · `factory` · `resume` · `note` · `wait` · `stop` · `doc` · `metrics` · `insights` · `profile` 은 v7 에서 빠졌다(부르면 대신 쓸 것을 알려 준다). v6 에서 만든 작업은 그대로 `accept` · `cancel` 하거나 `start --from <id>` 로 이어 간다.
 
 ## 자동으로 도는 것(훅)
 
 | 훅 | 하는 일 |
 |---|---|
-| guard(PreToolUse · 셸 · PowerShell · MCP) | `git push` · `reset --hard` · `clean -f` · `checkout -- .` · `rebase` · 직접 `merge` · `pull` · `stash` · `commit --amend` · 별칭 · `node -e`/`python -c` 로 감싼 git 쓰기 · MCP 의 git · GitHub 쓰기 도구 · 비밀 파일 add/commit · 루트 · 홈 · `.git` 재귀 삭제를 막는다. 훅이 실패하면 막는다 |
+| guard(PreToolUse · 셸 · PowerShell · MCP) | `git push` · `reset --hard` · `clean -f` · `checkout -- .` · `rebase` · 직접 `merge` · `pull` · `stash` · `commit --amend` · 별칭 · `node -e`/`python -c` 로 감싼 git 쓰기 · MCP 의 git · GitHub 쓰기 도구 · 비밀 파일 add/commit · 루트 · 홈 · `.git` 재귀 삭제 · `gh`/`glab` 의 병합 · 원격 쓰기를 막는다. 훅 자체가 실패하면 Claude Code 에서는 막는다(Codex 는 훅 실패 시 막기를 설정하지 않는다) |
 | track · stop · session-end | 세션이 고친 파일을 기록하고 그 파일만 커밋한다(다른 세션의 것은 건드리지 않는다) |
 | board(세션 시작 · 요청 · 쓰기 전) | 같은 폴더의 다른 세션 · 비슷한 작업 알림 · 다른 세션이 커밋하지 않은 파일 쓰기 전 확인 · 레인 세션에 작업 환경(포트 · 임시 폴더 · 이름) · 하루 한 번 도구 점검 한 줄 |
 | lang | 응답 언어 상기 |
@@ -85,7 +86,7 @@ auto_update: on                          # 최신 릴리스 자동 갱신(off �
 
 하네스가 오류로 멈추거나, 의도와 다르게 행동하거나, 더 나은 방향이 보이면 이 저장소에 이슈가 **자동으로** 올라간다(세션에 건의를 말하면 `report --kind improve` 로 올린다).
 
-- **하네스 동작만** 올라간다 — 프로젝트 코드 · 이름 · 경로 · 작업 내용은 넣지 않고, 남은 경로 · 사용자 · 호스트 · 메일 · 프로젝트 이름은 자동으로 가린다. 기준은 [CONTRIBUTING.md](CONTRIBUTING.md).
+- **하네스 동작만** 올라간다 — 프로젝트 코드 · 이름 · 경로 · 작업 내용은 넣지 않고, 남은 경로 · 사용자 · 호스트 · 메일 · 프로젝트 이름 · 토큰 · 비밀번호 · 키 · 접속 문자열 · URL · IP 는 자동으로 가린다. 예기치 못한 CLI 예외와 훅 내부 오류는 기록해 두었다가 다음 명령(install · update · version · report 제외)이 끝날 때 올린다. 기준은 [CONTRIBUTING.md](CONTRIBUTING.md).
 - 인증은 그 PC 의 GitHub 로그인(`HARNESS_GITHUB_TOKEN` · `GH_TOKEN` · `gh auth login` · git 자격 증명 관리자). 없으면 쌓아 두고 `report` 가 미리 채운 이슈 링크를 보여 준다.
 - 같은 결함은 서명으로 묶여 재발 댓글이 된다 · 하루 새 이슈 5건 상한 · 설치된 사본에서만 켜진다 · `bug_report: off` 로 끈다.
 
@@ -94,7 +95,7 @@ auto_update: on                          # 최신 릴리스 자동 갱신(off �
 | 워크플로 | 언제 | 하는 일 |
 |---|---|---|
 | `ci.yml` | push · PR | Windows · Ubuntu · macOS × Node 20 · 22 에서 `node tests/run.js` |
-| `release.yml` | `v*` 태그 | 3개 OS 테스트 → `harness/VERSION` 기록 → `harness-<판>.tar.gz` · `.zip` · `SHA256SUMS` 를 GitHub Release 로 |
+| `release.yml` | `v*` 태그 | 3개 OS 테스트 → `harness/VERSION` 기록 → `pilot-<판>.tar.gz` · `.zip` · `SHA256SUMS` 를 GitHub Release 로 |
 | `issue-triage.yml` | 이슈 열림 | `[auto]` 이슈에 `auto-report` · 종류 라벨 |
 | `self-hosted.yml` | 수동 실행 | 자체 러너에서 같은 테스트 |
 

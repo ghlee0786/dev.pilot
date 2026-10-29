@@ -23,8 +23,11 @@ function readStdinJson() {
   } catch (e) { return { input: null, raw, error: 'invalid JSON: ' + e.message }; }
 }
 
+// [2026-10-29 감사] 훅도 lib/git.run 처럼(자동 이슈 #54) Windows 에서 긴 경로를 켠다 — 꺼져 있으면 MAX_PATH 를 넘는 새 파일을
+//   미커밋으로 보지 못해(stop · session-end 가 조용히 버림) · 추적 중인 그 파일을 ' D' 로 읽어 삭제 커밋을 만들었다.
+const LONGPATHS = IS_WIN ? ['-c', 'core.longpaths=true'] : [];
 function git(cwd, args, opts) {
-  const r = spawnSync('git', args, {
+  const r = spawnSync('git', [...LONGPATHS, ...args], {
     cwd, encoding: 'utf8', windowsHide: true, maxBuffer: 64 * 1024 * 1024,
     timeout: (opts && opts.timeout) || 20000, env: (opts && opts.env) || process.env,
   });
@@ -175,16 +178,19 @@ function detectRuntime(input, argv) {
 }
 
 // 비밀 파일 — 절대 커밋하지 않는다. 템플릿(.env.example 등)과 공개 키(.pub)는 비밀이 아니다.
+//   [2026-10-29 감사] AGENTS 규칙(.env* · *.pem · *.key · id_rsa* · .npmrc · credentials* · *.tfstate · service-account*.json)보다 좁았다 —
+//   .envrc · id_rsa_github · credentials-prod.json · credentials.bak 를 guard 와 commitAll 이 함께 커밋했다. 글롭 그대로 맞춘다.
+//   credentials* 중 소스 · 문서(credentials.js · credentials_test.py)는 같은 이름의 코드다 — 비밀이 아니다.
+const SOURCE_EXT = /\.(js|mjs|cjs|jsx|ts|tsx|py|rb|go|java|cs|kt|kts|php|rs|swift|c|cc|cpp|h|hpp|scala|sh|ps1|md|rst|html|css|vue|svelte)$/;
 function isSecretPath(p) {
   const base = String(p || '').replace(/\\/g, '/').split('/').pop().toLowerCase();
   if (!base) return false;
-  if (/^\.env(\..*)?$/.test(base)) return !/\.(example|sample|template|dist|defaults)$/.test(base);
-  if (/\.(pem|key|p12|pfx|p8|jks|keystore)$/.test(base)) return true;
-  if (/^id_(rsa|dsa|ecdsa|ed25519)(\..*)?$/.test(base)) return !base.endsWith('.pub');
-  if (base === '.npmrc' || base === '.pypirc' || base === '.netrc' || base === '_netrc') return true;     // 레지스트리 토큰 · 자격 증명
+  if (base.startsWith('.env') || /\.env$/.test(base)) return !/\.(example|sample|template|dist|defaults)$/.test(base);   // .env* · prod.env
+  if (/\.(pem|key|p12|pfx|p8|jks|keystore|ppk)$/.test(base)) return true;
+  if (/^id_(rsa|dsa|ecdsa|ed25519)/.test(base)) return !base.endsWith('.pub');                          // id_rsa* · id_ed25519_work
+  if (base === '.npmrc' || base === '.pypirc' || base === '.netrc' || base === '_netrc' || base === '.git-credentials') return true;   // 레지스트리 토큰 · 자격 증명
   if (/\.tfstate(\.backup)?$/.test(base)) return true;                                                 // terraform 상태 — 리소스 비밀이 평문으로 든다
-  // 자격 증명 데이터 파일(AWS credentials · credentials.json …). 같은 이름의 소스(credentials.js)는 비밀이 아니다.
-  if (/^\.?credentials(\.(json|ya?ml|xml|ini|toml|txt|csv|conf|cfg|properties|db))?$/.test(base)) return true;
+  if (/^\.?credentials/.test(base)) return !SOURCE_EXT.test(base);                                    // credentials* (AWS credentials · credentials-prod.json · credentials.bak)
   if (/^service[-_]?account.*\.json$/.test(base)) return true;                                         // GCP 서비스 계정 키
   return false;
 }

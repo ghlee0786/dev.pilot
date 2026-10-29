@@ -45,6 +45,10 @@ const FAKE_HANG = { applies: () => true, next: Langs.PACKS.find(p => p.id === 'p
     const n4 = next(['pytest'], '===== 3 passed in 1.0s =====\n');
     R.check('[HG-02] -v 출력의 끝 줄이 결과 없는 테스트 이름이면 그것을 --deselect', n1 && n1.exclude === 'tests/a.py::TestX::test_b[x-1]' && n1.argv.slice(-2).join(' ') === '--deselect tests/a.py::TestX::test_b[x-1]', JSON.stringify(n1));
     R.check('[HG-02] -q 출력이면 먼저 -v 로(이름을 얻으려고) · 이미 -v 인데 이름이 없거나 멈춘 자리가 아니면 포기', n2 && n2.argv.join(' ') === 'pytest -v' && !n2.exclude && n3 === null && n4 === null, JSON.stringify([n2, n3, n4]));
+    // [2026-10-29 감사 G2 #17] pytest -q 의 끝 줄은 파일 이름 없이 '.' 뿐이다 — -q 를 빼고 -v 로 다시 · 공백이 든 파라미터 id 도 그대로 뺀다
+    const n5 = next(['python', '-m', 'pytest', '-q'], '.'), n6 = next(['pytest', '-qq', 'tests'], '..F'), n7 = next(['pytest', '-v'], 'tests/a.py::test_p[a b] ');
+    R.check('[HG-02b] (#17) -q 출력(끝 줄 "." · "..F")이면 -q 를 빼고 -v 로 다시 · 공백 든 id(test_p[a b])도 --deselect',
+      n5 && n5.argv.join(' ') === 'python -m pytest -v' && n6 && n6.argv.join(' ') === 'pytest tests -v' && n7 && n7.exclude === 'tests/a.py::test_p[a b]', JSON.stringify([n5, n6, n7]));
 
     // HG-03 — 멈춤 감지: 출력이 멈추면 상한(60초)까지 기다리지 않고 끊는다 · 출력이 이어지면 끊지 않는다
     const sleeper = path.join(base, 'sleep.js'); write(sleeper, "process.stdout.write('start\\n'); setInterval(() => {}, 1e6);");
@@ -56,6 +60,9 @@ const FAKE_HANG = { applies: () => true, next: Langs.PACKS.find(p => p.id === 'p
     R.check('[HG-03] 출력이 이어지는 긴 검사(4초 · 0.5초마다 출력)는 멈춤 시간(1.5초)이 지나도 끊지 않는다', r3b.ok && !r3b.timed_out, JSON.stringify({ ok: r3b.ok, t: r3b.timed_out }));
     const r3c = await K.runCheck(base, ['node', sleeper], { timeoutMs: 4000 });
     R.check('[HG-03] 떼어 낼 줄 모르는 명령(node …)은 멈춤 감지를 쓰지 않는다 — 상한에서 끝난다(stalled 없음)', r3c.timed_out && !r3c.stalled && r3c.ms >= 3500, JSON.stringify({ s: r3c.stalled, ms: r3c.ms }));
+    // HG-03b — 상한을 아주 크게(100000분 — Node 타이머 한도 2^31-1ms 초과) 줘도 곧바로 시간 초과로 끝나지 않는다
+    const r3d = await K.runCheck(base, ['node', ticker], { timeoutMs: 100000 * 60000 });
+    R.check('[HG-03b] 검사 상한 100000분(타이머 한도 초과)이어도 검사는 끝까지 돈다(곧바로 timed_out 이 아니다)', r3d.ok && !r3d.timed_out, JSON.stringify({ ok: r3d.ok, t: r3d.timed_out, ms: r3d.ms }));
 
     // HG-04 — 떼어 내기: -q 로 멈춤 → -v 로 다시 → 이름을 짚어 --deselect → 끝까지 돈다
     const iso = await K.isolateHangs(base, ['node', fake], { timeoutMs: 60000, hang: FAKE_HANG });
@@ -84,6 +91,10 @@ const FAKE_HANG = { applies: () => true, next: Langs.PACKS.find(p => p.id === 'p
       R.check('[HG-05] 뺀 테스트를 알린다(조용히 빼지 않는다) — 진행 기록에 그 테스트 이름', logs.some(l => /excluded tests that hung before the task/.test(l) && /test_device/.test(l)), logs.filter(l => /hung|멈/.test(l)).join(' | ') || logs.join(' | '));
       const acc = await I.accept({ root: d, id: lane.id, log });
       R.check('[HG-05] accept 는 멈춘 테스트를 뺀 명령으로 검사해 들인다(상한까지 멈추지 않는다)', acc.status === 'accepted', `${acc.status} | ${acc.report} | last: ${JSON.stringify((S.readTask(d, lane.id).checks || {}).last || null).slice(0, 1500)}`);   // 실패하면 무엇이 실패했는지(부하에서 한 번 흔들렸다 — 2026-10-29)
+      // HG-06 [2026-10-29 감사 G2 #17] pytest -q 로 멈춰도 떼어 낸다(-q 를 빼고 -v 로 이름을 얻는다)
+      const iq = await K.isolateHangs(d, ['python', '-m', 'pytest', '-q'], { timeoutMs: 120000 });
+      R.check('[HG-06] (#17) 실제 pytest -q — 멈춘 test_device 를 짚어 빼고 통과', iq && iq.excluded.some(x => /tests\/test_a\.py::test_device$/.test(x)) && iq.result.ok && !iq.argv.includes('-q'),
+        JSON.stringify(iq && { ex: iq.excluded, argv: iq.argv, ok: iq.result.ok }));
     } else console.log('  ℹ [HG-05] python -m pytest 가 없는 환경 — 실제 pytest 경로는 재지 않았다(HG-02 · HG-04 가 짚기 · 떼어 내기를 덮는다)');
   } finally {
     fs.rmSync(base, { recursive: true, force: true, maxRetries: 5, retryDelay: 300 });

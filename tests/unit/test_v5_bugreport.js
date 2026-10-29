@@ -113,6 +113,26 @@ function repo(name) {
     await cliA(trap(r5), apiEnv);
     R.check('[BR-16] 프로젝트 블록 bug_report: off 면 올리지 않는다(결함은 기록된다)', reqs.length === before && B.collect(r5).length === 1);
     srv.close();
+
+    // ── [2026-10-29 감사] 공개 저장소에 사람 검토 없이 올라간다 — 토큰 · 비밀번호 · 키 · 접속 문자열 · 상대 경로 · 철자가 다른 프로젝트 이름도 가린다 ──
+    {
+      const ra = path.join(base, 'acme-billing'); fs.mkdirSync(ra, { recursive: true });
+      git(ra, 'init', '-q', '-b', 'main'); git(ra, 'config', 'user.name', 't'); git(ra, 'config', 'user.email', 'kim@acme.example');
+      git(ra, 'remote', 'add', 'origin', 'https://github.com/acme-corp/acme-billing.git');
+      const body = ['accept 가 src/AcmeBilling/Payments/StripeGateway.cs 를 병합하다 멈췄다', 'STRIPE_SECRET_KEY=sk_live_FAKE0123456789abcdef', 'Authorization: Bearer ghp_FAKEBODYTOKEN0123456789',
+        'Server=10.20.30.40;User Id=sa;Password=FakeP@ss1;', 'acme_billing 의 AcmeBillingService 도'].join('\n');
+      const e = B.note(ra, 'bug', 'accept 실패 — AcmeBilling StripeGateway 병합', body);
+      const d = B.draft(e, { repo: 'o/r' });
+      const leaks = ['AcmeBilling', 'acme_billing', 'StripeGateway.cs', 'src/', 'sk_live_FAKE', 'ghp_FAKEBODYTOKEN', '10.20.30.40', 'FakeP@ss1', 'User Id=sa', 'kim@acme'].filter(x => (d.title + d.body).includes(x));
+      R.check('[BR-17] note → 초안: 상대 경로 · 비밀 키 값 · Bearer 토큰 · 접속 문자열(IP · 계정 · 비밀번호) · 철자가 다른 프로젝트 이름(AcmeBilling · acme_billing)이 없다 · 하네스 동작 말은 남는다',
+        !leaks.length && /accept 실패/.test(d.title) && /병합하다 멈췄다/.test(d.body), JSON.stringify({ leaks, title: d.title, body: d.body.slice(0, 600) }));
+      const samples = ['request failed: Authorization: Bearer ghp_X12345abcdef', 'env HARNESS_GITHUB_TOKEN=ghp_X12345abcdef', 'curl -u admin:S3cret https://x.example/a', 'docker login -p PASS123 registry',
+        'key sk-ant-api03-abcdefgh', 'aws AKIAIOSFODNN7EXAMPLE', 'see ..\\acme-client\\src\\a.cs', 'tool --password=hunter2 --token abc123def', 'jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.sig'];
+      const secrets = ['ghp_X12345abcdef', 'S3cret', 'PASS123', 'sk-ant-api03', 'AKIAIOSFODNN7EXAMPLE', 'acme-client', 'hunter2', 'abc123def', 'eyJhbGciOiJIUzI1NiJ9', 'x.example'];
+      const out = samples.map(x => B.sanitize(x)).join('\n');
+      R.check('[BR-18] sanitize: Bearer · 토큰 접두사(ghp_ · sk- · AKIA) · KEY=VALUE · -u user:pass · login -p · --password · --token · JWT · URL · 상대 경로를 가린다 · 하네스 파일과 일반 문장은 남긴다',
+        !secrets.some(x => out.includes(x)) && B.sanitize('at accept (harness/lib/integrate.js:12:3) — git push -u origin main 은 막힌다 · and/or 1/2') === 'at accept (harness/lib/integrate.js:12:3) — git push -u origin main 은 막힌다 · and/or 1/2', out);
+    }
   } catch (e) { R.check('예외 없이 끝난다', false, String(e && e.stack || e).slice(0, 800)); }
   finally { try { fs.rmSync(base, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }); } catch { /* 정리 실패는 결과와 무관 */ } }
   R.done();

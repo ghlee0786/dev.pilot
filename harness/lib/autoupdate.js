@@ -17,6 +17,8 @@ function enabled(root) {
 function stateFile(root) { return path.join(require('./state').paths(root).harnessDir, 'auto-update.json'); }
 function readState(root) { try { return JSON.parse(fs.readFileSync(stateFile(root), 'utf8')); } catch { return {}; } }
 function writeState(root, s) { try { fs.mkdirSync(path.dirname(stateFile(root)), { recursive: true }); fs.writeFileSync(stateFile(root), JSON.stringify(s, null, 2)); } catch { /* 기록 실패는 무시 */ } }
+// 미룬 갱신 — 하루가 아니라 1시간 뒤 다시 확인하게 확인 시각을 당겨 둔다(일하는 중 · 끝나지 않은 v6 작업 · 설치 거부). 자동 갱신은 거부를 크게 알리지 않는다.
+function defer(root) { writeState(root, { ...readState(root), checked_at: Date.now() - DAY_MS + RETRY_MS, deferred_at: Date.now() }); }
 
 // 확인할 때가 됐으면 update --auto 를 띄우고 true. o = { spawn(root), now } — 테스트가 바꿔 끼운다.
 function maybe(root0, o) {
@@ -40,7 +42,7 @@ function spawnUpdate(root) {
 }
 
 // 갱신 뒤: 하네스 파일을 git 이 추적하는 저장소면 갱신이 바꾼 하네스 파일만 따로 커밋한다 — 갱신 전부터 바뀌어 있던 파일(사용자 것)은 넣지 않는다.
-const MANAGED = /^(harness\/|AGENTS\.md$|CLAUDE\.md$|\.claude\/settings\.json$|\.claude\/skills\/harness\/|\.codex\/hooks\.json$|\.agents\/skills\/harness\/)/;
+const MANAGED = /^(harness\/|AGENTS\.md$|CLAUDE\.md$|\.claude\/settings\.json$|\.claude\/skills\/harness\/|\.codex\/hooks\.json$|\.agents\/skills\/harness\/|\.vscode\/settings\.json$)/;
 function dirty(root) {
   const G = require('./git');
   return new Set(G.dirtyFiles(root).map(e => e.path.replace(/\\/g, '/')));
@@ -58,4 +60,4 @@ function commitUpdate(root, before, from, to) {
   return G.headSha(root);
 }
 
-module.exports = { enabled, maybe, readState, writeState, dirty, commitUpdate, DAY_MS, RETRY_MS };
+module.exports = { enabled, maybe, readState, writeState, defer, dirty, commitUpdate, DAY_MS, RETRY_MS };

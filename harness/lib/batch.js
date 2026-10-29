@@ -25,19 +25,23 @@ const needBid = bid => { if (!BID_RE.test(String(bid || ''))) throw usage(`expec
 const VERDICT_KO = { pass: '통과', 'not-worse': '나빠지지 않음 — 대상 브랜치도 원래 같은 실패', fail: '실패 — 대상 브랜치보다 나빠졌다', indeterminate: '판정 불가 — 실패한 검사가 모두 시간 초과' };
 // 묶을 수 있는 작업: done, 또는 열린 light 칸(받아들이거나 취소한 것 · 돌고 있는 것은 아니다)
 const eligible = t => !!t && (t.status === 'done' || (t.mode === 'light' && t.status === 'open'));
+const TASK_BRANCH_RE = /^harness\/(t-\d{8}-\d{6}-[0-9a-f]{4})$/;
 
 // 구성원 고르기 — 명시한 id(맞지 않으면 아무것도 만들기 전에 거부) · --all(대상이 같은 묶을 수 있는 작업 전부) · --branch(작업 기록 없는 브랜치)
+//   [2026-10-29 감사] --branch harness/<id> 로 칸을 묶으면 작업 기록 없는 브랜치로 다뤄 받아들인 뒤에도 작업이 open 으로 남았다(그 뒤 cancel 은
+//   "병합 전에 버렸다" 고 했지만 변경은 사용자 브랜치에 그대로) — 작업 기록이 있으면 id 로 묶은 것과 같이 다룬다.
 function pickMembers(root, target, o) {
   const out = [], seen = new Set();
   const add = m => { const k = m.id || `branch:${m.branch}`; if (!seen.has(k)) { seen.add(k); out.push(m); } };
-  for (const id of o.ids || []) {
+  const addTask = id => {
     if (!S.validId(id)) throw usage(`invalid task id: ${JSON.stringify(String(id)).slice(0, 80)} (expected t-yyyymmdd-HHMMss-xxxx)`);
     const t = S.readTask(root, id);
     if (!t) throw Object.assign(new Error(`unknown task: ${id}`), { code: 'UNKNOWN_TASK' });
     if (!eligible(t)) throw usage(`task ${id} is ${t.status}${t.mode === 'light' ? ' (light)' : ''} — only done tasks and open light lanes can be bundled`);
     if (!G.branchExists(root, t.branch)) throw usage(`task ${id}: branch ${t.branch} does not exist`);
     add({ id, branch: t.branch, goal: clip(t.goal, 120) });
-  }
+  };
+  for (const id of o.ids || []) addTask(id);
   if (o.all) {
     for (const t of S.listTasks(root)) {
       if (!eligible(t) || !G.branchExists(root, t.branch) || I.acceptTarget(t, {}, root) !== target) continue;
@@ -45,12 +49,47 @@ function pickMembers(root, target, o) {
     }
   }
   for (const b0 of o.branches || []) {
-    const b = strip(b0);
+    const b = strip(b0), tm = TASK_BRANCH_RE.exec(b);
+    if (tm && S.readTask(root, tm[1])) { addTask(tm[1]); continue; }
     if (!G.branchExists(root, b)) throw usage(`branch ${b} does not exist`);
     if (b === target) throw usage(`--branch ${b} is the target itself`);
     add({ id: null, branch: b, goal: null });
   }
   return out;
+}
+
+// 그 칸의 worktree 안에서 지금 일하는 산 대화형 세션 → 이유(문자열) 또는 null. accept · check · cancel 과 같은 규칙(integrate.js):
+//   세션 파일의 root · cwd 가 그 worktree(안)이고 산 세션(플랫폼 목록 · 없으면 last_seen 30분)이면. 부른 쪽의 cwd 가 그 안이면 자기 자신이라 뺀다.
+//   [2026-10-29 조율] 사람이 아직 고치는 칸을 묶으면 반쯤 된 일이 커밋돼 들어간다 — --all 은 특히. --force 면 보지 않는다.
+const within = (p, dir) => { if (!p || !dir) return false; const Ch = require('../hooks/_common'); const rel = path.relative(Ch.real(dir), Ch.real(p)); return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel)); };
+function liveSessionIn(root, wt) {
+  const Ch = require('../hooks/_common');
+  if (within(process.cwd(), wt)) return null;
+  const common = S.paths(root).commonDir;
+  const cand = Ch.listSessions(common).filter(s => within(s.root, wt) || within(s.cwd, wt));
+  if (!cand.length) return null;   // 후보가 없으면 플랫폼에 묻지 않는다
+  let agents = null; try { agents = Ch.platformAgents(common); } catch { agents = null; }
+  const now = Date.now(), live = cand.filter(s => Ch.sessionLive(s, agents, now));
+  if (!live.length) return null;
+  return `live session ${live.map(s => Ch.sid8(s.session_id)).join(', ')} is working in ${wt} — let it finish (or end it), then batch again; --force bundles it anyway`;
+}
+
+// 칸의 작업 폴더를 묶어도 되는가 → 안 되면 이유(문자열). accept(integrate.js)와 같은 보호 —
+//   [2026-10-29 감사] 앞선 accept 가 남긴 충돌 병합을 batch 가 git add -A 로 커밋해 충돌 표식이 판정 pass 로 묶음에 들어갔다 ·
+//   [자동 이슈 #61 과 같은 자리] 커밋하지 않은 추적 파일 대량 삭제(중단된 git 작업)를 그대로 커밋했다.
+const MASS_DELETE = 20;   // integrate.js 와 같은 값
+function laneUnsafe(t, wt) {
+  if (G.mergeInProgress(wt)) {
+    const still = [...new Set([...G.unmergedFiles(wt), ...G.dirtyFiles(wt).map(e => e.path)])].filter(f => G.hasConflictMarkers(path.join(wt, f)));
+    if (still.length) return `a merge left in ${wt} still has conflict markers in ${still.slice(0, 10).join(', ')} — resolve them there, commit, then batch again`;
+    if (t.mode !== 'light') return `a merge is in progress in ${wt} — finish it there, then batch again`;
+  }
+  const del = G.statusEntries(wt).filter(e => e.code !== '??' && e.code !== '!!' && (e.x === 'D' || e.y === 'D')).map(e => e.path);
+  if (!del.length) return null;
+  const stage = G.git(wt, ['ls-files', '-s', '--', ...del.slice(0, 500).map(p => `:(literal)${p}`)], { allowFail: true }).out;
+  const gitlinks = stage.split(/\r?\n/).filter(l => /^160000 /.test(l)).map(l => l.split('\t')[1]).filter(Boolean);
+  if (!gitlinks.length && del.length < MASS_DELETE) return null;
+  return `the worktree ${wt} is missing ${del.length} tracked file(s)${gitlinks.length ? ` including submodule(s) ${gitlinks.slice(0, 5).join(', ')}` : ''} that are not committed as deleted (e.g. ${del.slice(0, 5).join(', ')}) — this looks like an interrupted git operation, not work; nothing was committed. Restore them (git -C "${wt}" checkout HEAD -- .) or commit the deletions yourself, then batch again`;
 }
 
 // 구성원이 가져온 .harness/ 계획 폴더를 묶음 브랜치에서 걷어 낸다(accept 의 archivePlan 과 같이 보관한 뒤) — 사용자 브랜치에 들어가지 않게.
@@ -75,12 +114,14 @@ function dropPlanFolders(root, b, wt) {
   return G.headSha(wt);
 }
 
-// 대상 끝(target_commit)의 같은 검사 — 실패를 원래부터 있던 것과 가르려고. loop 의 기준선 캐시와 같은 열쇠(기준 커밋 · 검사 · .worktreeinclude 내용)라
-//   같은 커밋에서 잰 앞선 작업 · 묶음의 결과를 다시 쓴다. 임시 분리 worktree 에서 재고 지운다.
-async function targetBaseline(root, b, commands, include, runOn, log) {
-  const key = crypto.createHash('sha1').update(JSON.stringify([b.target_commit, commands, (include || []).map(x => `${x.path}:${x.sha1}`)])).digest('hex');
+// 대상 끝(target_commit)의 같은 검사 — 실패를 원래부터 있던 것과 가르려고. 열쇠(기준 커밋 · 검사 · .worktreeinclude 내용 · 검사 상한)가 같으면
+//   같은 커밋에서 잰 앞선 묶음의 결과를 다시 쓴다. 임시 분리 worktree 에서 재고 지운다.
+//   [2026-10-29 감사 · baseline.js 와 같이] 시간 초과가 든 기준선은 쓰지도 읽지도 않는다 — 부하 때 잰 "원래부터 실패" 가 다음 판정을 not-worse 로 틀었다.
+const timedOut = j => (j.results || []).some(r => r && r.timed_out);
+async function targetBaseline(root, b, commands, include, runOn, log, timeoutMs) {
+  const key = crypto.createHash('sha1').update(JSON.stringify([b.target_commit, commands, (include || []).map(x => `${x.path}:${x.sha1}`), timeoutMs || null])).digest('hex');
   const cacheFile = path.join(S.paths(root).harnessDir, 'baseline-cache', `${key}.json`);
-  try { const c = JSON.parse(fs.readFileSync(cacheFile, 'utf8')); if (c && Array.isArray(c.results)) { log(`[pilot] batch ${b.id} — 대상 끝의 검사 결과를 캐시에서 다시 쓴다(${String(b.target_commit).slice(0, 10)})`); return { ...c, cached: true }; } } catch { /* 없음 */ }
+  try { const c = JSON.parse(fs.readFileSync(cacheFile, 'utf8')); if (c && Array.isArray(c.results) && !timedOut(c)) { log(`[pilot] batch ${b.id} — 대상 끝의 검사 결과를 캐시에서 다시 쓴다(${String(b.target_commit).slice(0, 10)})`); return { ...c, cached: true }; } } catch { /* 없음 */ }
   const dir = path.join(S.paths(root).worktreesDir, `${b.id}-base`);
   log(`[pilot] batch ${b.id} — 검사가 실패해 대상 끝(${String(b.target_commit).slice(0, 10)})에서 같은 검사를 잰다(원래부터 실패인지)`);
   try {
@@ -88,7 +129,7 @@ async function targetBaseline(root, b, commands, include, runOn, log) {
     try { G.copyWorktreeInclude(root, dir); } catch { /* 복사 실패는 검사가 보여 준다 */ }
     const j = (await runOn(dir, commands)).judged;
     const slim = { ...j, results: j.results.map(r => ({ ...r, output: undefined })) };
-    try { fs.mkdirSync(path.dirname(cacheFile), { recursive: true }); fs.writeFileSync(cacheFile, JSON.stringify(slim)); } catch { /* 캐시 실패는 판정을 막지 않는다 */ }
+    if (!timedOut(slim)) { try { fs.mkdirSync(path.dirname(cacheFile), { recursive: true }); fs.writeFileSync(cacheFile, JSON.stringify(slim)); } catch { /* 캐시 실패는 판정을 막지 않는다 */ } }
     return slim;
   } catch (e) { b.baseline_error = String(e.message).slice(0, 300); return null; }
   finally {
@@ -99,7 +140,7 @@ async function targetBaseline(root, b, commands, include, runOn, log) {
   }
 }
 
-// batch — o = { root, ids, all, branches, into, checks, checkTimeoutMs, log } → 결과(id · status · verdict · members · report)
+// batch — o = { root, ids, all, branches, into, checks, checkTimeoutMs, force(산 세션이 일하는 칸도 묶는다), log } → 결과(id · status · verdict · members · report)
 async function create(o) {
   const log = o.log || (() => {});
   const root = S.mainRoot(o.root || process.cwd());
@@ -112,9 +153,13 @@ async function create(o) {
   const bid = newBid(), wt = path.join(S.paths(root).worktreesDir, bid);
   const b = { id: bid, status: 'building', target, target_commit: G.headSha(root, target), branch: `harness/batch/${bid}`, worktree: wt,
     members: members.map(m => ({ ...m, status: 'pending' })), checks: null, commands: [], verdict: null, failed_tests: [], created_at: S.nowIso() };
-  saveBatch(root, b);
-  try { return await build(root, b, o, log); }
-  catch (e) { b.status = 'error'; b.error = clip(e.message, 300); saveBatch(root, b); throw e; }
+  // [2026-10-29 감사] 만드는 동안 batch-<bid> 잠금을 쥔다 — gc 가 검사 중인 묶음 작업 폴더의 등록을 지웠다(gc 는 이 잠금이 살아 있으면 건너뛴다).
+  const h = S.acquire(root, `batch-${bid}`);
+  try {
+    saveBatch(root, b);
+    try { return await build(root, b, o, log); }
+    catch (e) { b.status = 'error'; b.error = clip(e.message, 300); saveBatch(root, b); throw e; }
+  } finally { h.release(); }
 }
 async function build(root, b, o, log) {
   const bid = b.id, wt = b.worktree, target = b.target;
@@ -123,15 +168,21 @@ async function build(root, b, o, log) {
   // 1. 하나씩 합친다 — 충돌하면 그 구성원만 되돌리고(merge --abort) 건너뛴다. 모델에게 풀게 하지 않는다.
   for (const m of b.members) {
     const t = m.id ? S.readTask(root, m.id) : null;
-    // light 칸의 미커밋분은 그 칸에 먼저 커밋한다(accept 와 같이) — 묶음에는 커밋된 것만 들어간다
-    if (t && t.mode === 'light') {
+    if (t) {
       const P = S.taskPathsFor(root, t);
       if (fs.existsSync(P.wt) && G.isWorktreeRoot(P.wt, t.branch)) {
-        try { const files = I.commitLeftovers(t, P.wt, `uncommitted work before batch ${bid}`); if (files.length) { m.committed = files.slice(0, 50); S.writeTask(root, t); S.log(root, t.id, { event: 'leftovers_committed', phase: 'batch', batch: bid, files: files.slice(0, 200) }); } }
-        catch (e) { m.leftover_error = String(e.message).slice(0, 200); }
+        const why = (!o.force && liveSessionIn(root, P.wt)) || laneUnsafe(t, P.wt);
+        if (why) { m.status = 'skipped'; m.why = why; continue; }
+        // light 칸의 미커밋분은 그 칸에 먼저 커밋한다(accept 와 같이) — 묶음에는 커밋된 것만 들어간다
+        if (t.mode === 'light') {
+          try { const files = I.commitLeftovers(t, P.wt, `uncommitted work before batch ${bid}`); if (files.length) { m.committed = files.slice(0, 50); S.writeTask(root, t); S.log(root, t.id, { event: 'leftovers_committed', phase: 'batch', batch: bid, files: files.slice(0, 200) }); } }
+          catch (e) { m.leftover_error = String(e.message).slice(0, 200); }
+        }
       }
     }
     const ref = t ? t.branch : m.branch, before = G.headSha(wt);
+    // 묶은 때의 구성원 끝 — batch accept 가 그 뒤에 더한 커밋(들어가지 않는다)을 알아본다
+    m.tip = G.headSha(root, ref);
     if (G.isAncestor(wt, ref, 'HEAD')) { m.status = 'skipped'; m.why = `already in ${target}`; continue; }
     const msg = `harness batch ${bid}: merge ${m.id || ref}${m.goal ? ` — ${clip(m.goal, 72)}` : ''}`;
     const r = G.git(wt, [...G.identityArgs(wt), 'merge', '--no-ff', '--no-edit', '--no-verify', '-m', msg, ref], { allowFail: true, retryLock: true });
@@ -146,7 +197,17 @@ async function build(root, b, o, log) {
   const merged = b.members.filter(m => m.status === 'merged');
   if (merged.length) b.plan_drop_commit = dropPlanFolders(root, b, wt) || undefined;
   // 2. 대상의 검사를 한 번 — 실패한 검사는 한 번 더(불안정) · 검사 줄은 일반 순서(priority 1)
-  if (!merged.length) { b.status = 'empty'; b.verdict = null; saveBatch(root, b); return result(root, b); }
+  //   [2026-10-29 감사] 빈 묶음이 작업 폴더와 브랜치를 남기고 다음 할 일을 알리지 않았다 — 바로 치운다.
+  if (!merged.length) {
+    b.status = 'empty'; b.verdict = null;
+    const rm = removeBatchWorktree(root, b, true);
+    const d = rm.ok ? G.git(root, ['branch', '-D', b.branch], { allowFail: true, retryLock: true }) : { ok: false };
+    b.cleaned = rm.ok && d.ok;
+    if (!b.cleaned) b.worktree_kept = rm.ok ? clip(d.err, 200) : rm.why;
+    saveBatch(root, b); return result(root, b);
+  }
+  // 검사한 묶음 브랜치 끝 — batch accept 는 그 뒤에 더한 커밋을 이 판정으로 들이지 않는다(다시 batch)
+  b.checked_tip = G.headSha(wt);
   const co = G.checkoutOf(root, target), proj = co ? co.path : root;
   const found = K.discover(wt, o.checks, proj);
   const m0 = K.yamlNumber(proj, 'check_timeout_min') || K.yamlNumber(wt, 'check_timeout_min');
@@ -156,6 +217,7 @@ async function build(root, b, o, log) {
   const serialRoot = typeof K.serialChecksOn === 'function' && !K.serialChecksOn(root) ? null : root;
   const runOn = (dir, cmds) => K.runJudged(dir, cmds, { timeoutMs, rerun, serialRoot, priority: 1 });
   b.commands = found.commands.map(K.display);
+  b.checks_source = found.source;
   if (!found.commands.length) { b.verdict = 'pass'; b.no_checks = true; }
   else {
     log(`[pilot] batch ${bid} — ${merged.length}개를 합쳤다 · 검사: ${b.commands.join(' ; ')}`);
@@ -164,8 +226,10 @@ async function build(root, b, o, log) {
     if (rj.flaky && rj.flaky.length) b.flaky = rj.flaky;
     if (j.ok) b.verdict = 'pass';
     else if (I.isIndeterminate(j)) b.verdict = 'indeterminate';   // 대상 끝을 재도 가릴 수 없다(부하 · 상한) — 시간을 더 쓰지 않는다
+    // [2026-10-29 감사] 사용자가 준 검사는 그 기능을 묘사한다 — 원래부터 실패여도 not-worse 로 넘기지 않는다(accept 와 같다 · 대상 끝은 재지 않는다)
+    else if (found.source === 'user') b.verdict = 'fail';
     else {
-      const base = await targetBaseline(root, b, found.commands, include, runOn, log);
+      const base = await targetBaseline(root, b, found.commands, include, runOn, log, timeoutMs);
       // 캐시된 기준선이 멈춘 테스트를 떼어 낸 명령이면 같은 명령으로 다시 잰다(판정은 명령마다 짝지어 비교한다)
       if (base && Array.isArray(base.commands) && JSON.stringify(base.commands) !== JSON.stringify(found.commands)) j = (await runOn(wt, base.commands)).judged;
       if (base) b.baseline = { ok: base.ok, pass: base.pass, fail: base.fail, cached: !!base.cached };
@@ -175,6 +239,18 @@ async function build(root, b, o, log) {
     b.checks = K.brief(j);
     b.failed_tests = ((j.failed_tests) || []).slice(0, 50);
     if (b.verdict !== 'pass') b.failing = j.results.filter(r => !r.ok).map(r => r.command);
+  }
+  // 3. 린트 — accept 와 같이 묶음이 바꾼 파일에서({files}) 또는 저장소 전체에서 한 번. 실패면 판정은 fail.
+  //   [2026-10-29 감사] batch 는 lint_command 를 돌리지 않아 accept 가 린트로 거절한 변경이 묶음으로는 사용자 브랜치에 들어갔다.
+  const lintCmd = K.yamlString(proj, 'lint_command') || K.yamlString(wt, 'lint_command');
+  if (lintCmd) {
+    const changed = G.diffNames(wt, b.target_commit, 'HEAD').filter(f => !f.startsWith('.harness/') && fs.existsSync(path.join(wt, f)));
+    const argv = K.lintArgv(lintCmd, /{files}/.test(lintCmd) ? changed : []);
+    if (argv) {
+      const lr = await K.runCheck(wt, argv, { timeoutMs });
+      b.lint = { command: lr.command || argv.join(' '), ok: !!lr.ok, exit_code: lr.exit_code, first: lr.ok ? null : clip(K.firstAssertion(lr), 200) };
+      if (!lr.ok && b.verdict !== 'fail') { b.verdict = 'fail'; b.failing = [...(b.failing || []), b.lint.command]; }
+    } else b.lint = { command: lintCmd, ok: true, skipped: 'no changed files' };
   }
   b.status = 'ready';
   saveBatch(root, b);
@@ -207,6 +283,12 @@ function format(b) {
     if ((b.failing || []).length) L.push(`  실패한 검사: ${b.failing.join(' ; ')}`);
     if ((b.failed_tests || []).length) L.push(`  실패한 시험: ${b.failed_tests.slice(0, 10).join(', ')}${b.failed_tests.length > 10 ? ` … (+${b.failed_tests.length - 10})` : ''}`);
     if (b.baseline_error) L.push(`  대상 끝을 재지 못했다: ${b.baseline_error}`);
+    if (b.checks_source === 'user' && b.verdict === 'fail') L.push('  사용자가 준 검사(--check)다 — 원래부터 실패여도 "나빠지지 않음" 으로 넘기지 않는다(accept 와 같다)');
+  }
+  if (b.lint) L.push(`린트: ${b.lint.command} — ${b.lint.skipped ? '바뀐 파일 없음(건너뜀)' : b.lint.ok ? '통과' : `실패(exit ${b.lint.exit_code})${b.lint.first ? `: ${b.lint.first}` : ''}`}`);
+  if (b.status === 'empty') {
+    L.push(b.cleaned ? '묶음 작업 폴더와 브랜치는 지웠다.' : `묶음 작업 폴더 · 브랜치를 지우지 못했다(${b.worktree_kept || '?'}) — ${cli} batch drop ${b.id}`);
+    L.push(`다음: 건너뛴 이유(위)를 고친 뒤 다시 묶는다(${cli} batch <id>…) — 사용자 브랜치는 그대로다.`);
   }
   if (b.status === 'ready') {
     L.push(OK_VERDICTS.has(b.verdict) ? `다음: 받아들이려면(사용자가 말한 뒤) ${cli} batch accept ${b.id} · 버리려면 ${cli} batch drop ${b.id}`
@@ -221,6 +303,13 @@ function format(b) {
 // 묶음 작업 폴더를 치운다 — 하네스의 것이라 검사 산출물(추적 안 된 · 무시된 파일)은 버린다. 추적 파일이 고쳐져 있으면(사람이 손댐) force 일 때만.
 function removeBatchWorktree(root, b, force) {
   if (!fs.existsSync(b.worktree)) { G.git(root, ['worktree', 'prune'], { allowFail: true }); return { ok: true }; }
+  // 등록이 사라진 폴더 — 그 안에서 git 을 부르면 위의 메인 저장소를 본다(메인의 미커밋 파일을 묶음의 변경으로 잘못 보고 drop 이 영영 거부됐다).
+  //   하네스의 검사 폴더이고 커밋은 묶음 브랜치에 있다 — 폴더를 치운다.
+  if (!G.worktreeRegistered(root, b.worktree)) {
+    G.git(root, ['worktree', 'prune'], { allowFail: true });
+    try { fs.rmSync(b.worktree, { recursive: true, force: true, maxRetries: 5, retryDelay: 300 }); } catch (e) { return { ok: false, why: clip(e.message, 200) }; }
+    return fs.existsSync(b.worktree) ? { ok: false, why: `could not remove the leftover folder ${b.worktree}` } : { ok: true };
+  }
   const edited = G.dirtyFiles(b.worktree).filter(e => e.code !== '??').map(e => e.path);
   if (edited.length && !force) return { ok: false, why: `tracked files were changed in the batch worktree: ${edited.slice(0, 5).join(', ')}` };
   try { G.dropSubmoduleClones(root, b.worktree, { force: true }); } catch { /* 없음 */ }
@@ -249,6 +338,27 @@ function acceptLocked(root, b, o) {
   if (b.status !== 'ready' || !merged.length) return refuse(`nothing to accept (status ${b.status}, ${merged.length} merged)`, `받아들일 것이 없다(상태 ${b.status} · 합친 것 ${merged.length}개)`);
   if (!OK_VERDICTS.has(b.verdict) && !o.force) return refuse(`verdict is ${b.verdict} — only pass / not-worse batches are accepted; pass --force to merge anyway`, `판정이 ${VERDICT_KO[b.verdict] || b.verdict} — 통과 · 나빠지지 않음만 받아들인다. 그래도 합치려면 --force`);
   if (!G.branchExists(root, b.branch)) return refuse(`the batch branch ${b.branch} is gone`, `묶음 브랜치 ${b.branch} 가 없다`);
+  // [2026-10-29 감사] 판정은 검사한 그 끝에만 해당한다 — 그 뒤 묶음 브랜치에 더한 커밋이 같은 pass 로 사용자 브랜치에 들어갔다.
+  const bt = G.headSha(root, b.branch);
+  if (b.checked_tip && bt !== b.checked_tip) return refuse(`the batch branch ${b.branch} moved after it was checked (${String(b.checked_tip).slice(0, 10)} → ${String(bt).slice(0, 10)}) — run batch again so the checks see it`,
+    `묶음 브랜치 ${b.branch} 가 검사 뒤에 움직였다(${String(b.checked_tip).slice(0, 10)} → ${String(bt).slice(0, 10)}) — batch 를 다시 하세요`);
+  // [2026-10-29 감사] 구성원 작업의 지금 상태를 다시 본다 — 묶은 뒤 cancel 한 구성원이 병합되고 accepted 로 되살아났다 ·
+  //   묶은 뒤 칸에 더한 커밋은 병합되지 않는데 작업은 accepted 가 되고 worktree 가 지워져 다시 들일 길이 막혔다.
+  for (const mm of merged) {
+    if (!mm.id) continue;
+    const t = S.readTask(root, mm.id);
+    if (!eligible(t)) return refuse(`member ${mm.id} is now ${t ? t.status : 'gone'} — run batch again without it`, `구성원 ${mm.id} 가 지금 ${t ? t.status : '없음'} 이다 — 그것을 빼고 batch 를 다시 하세요`);
+    const now = G.headSha(root, t.branch);
+    if (mm.tip && now !== mm.tip) return refuse(`lane ${mm.id} has new commits since it was batched (${String(mm.tip).slice(0, 10)} → ${String(now).slice(0, 10)}) — run batch again so they are checked and merged`,
+      `칸 ${mm.id} 에 묶은 뒤의 커밋이 있다(${String(mm.tip).slice(0, 10)} → ${String(now).slice(0, 10)}) — 검사 · 병합되도록 batch 를 다시 하세요`);
+    const P = S.taskPathsFor(root, t);
+    const live = !o.force && fs.existsSync(P.wt) && liveSessionIn(root, P.wt);
+    if (live) return refuse(`member ${mm.id}: ${live}`, `구성원 ${mm.id} 의 worktree 에서 산 세션이 일하고 있다 — 끝난 뒤 다시 하거나(그 세션을 끝내고) --force`);
+    if (t.mode === 'light' && fs.existsSync(P.wt) && G.worktreeRegistered(root, P.wt)) {
+      const dirty = G.dirtyFiles(P.wt).map(e => e.path).filter(f => !f.startsWith('.harness/'));
+      if (dirty.length) return refuse(`lane ${mm.id} has uncommitted changes since it was batched: ${dirty.slice(0, 5).join(', ')} — commit them and run batch again`, `칸 ${mm.id} 에 묶은 뒤의 미커밋 변경이 있다: ${dirty.slice(0, 5).join(', ')} — 커밋하고 batch 를 다시 하세요`);
+    }
+  }
   const tip = G.headSha(root, b.target);
   if (tip !== b.target_commit) return refuse(`${b.target} moved since the batch was built (${String(b.target_commit).slice(0, 10)} → ${String(tip).slice(0, 10)}) — run batch again so the checks see the new ${b.target}`,
     `묶은 뒤 ${b.target} 가 움직였다(${String(b.target_commit).slice(0, 10)} → ${String(tip).slice(0, 10)}) — 검사가 새 ${b.target} 를 보도록 batch 를 다시 하세요`);
@@ -329,4 +439,4 @@ function drop(o) {
   });
 }
 
-module.exports = { create, accept, status, drop, format, readBatch, listBatches, pickMembers, BID_RE };
+module.exports = { create, accept, status, drop, format, readBatch, listBatches, pickMembers, removeBatchWorktree, BID_RE };

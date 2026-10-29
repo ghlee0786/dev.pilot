@@ -98,6 +98,32 @@ const cli = (args, env) => new Promise(res => { const c = spawn(process.execPath
     R.check('[UP-09] auto_update: off 면 확인하지 않는다', !AU.maybe(repo2, { spawn: spy, now: 1000 + 60 * 3600 * 1000 }) && spawned.length === 2);
     const plain = path.join(base, 'plain'); fs.mkdirSync(plain); git(plain, 'init', '-q');
     R.check('[UP-10] 하네스가 설치되지 않은 곳(원본 · 저장소만)은 확인하지 않는다', !AU.maybe(plain, { spawn: spy, now: 1 }) && !AU.maybe(path.resolve(__dirname, '..', '..'), { spawn: spy, now: 1 }) && spawned.length === 2);
+
+    // ── [2026-10-29 감사] v7: 'running' 작업이 없어도 accept · batch 의 잠금이 살아 있으면 자동 갱신은 미룬다 · 끝나지 않은 v6 작업은 자동으로 이행하지 않는다 ──
+    {
+      const repo4 = path.join(base, 'busy'); fs.mkdirSync(repo4); git(repo4, 'init', '-q', '-b', 'main'); git(repo4, 'config', 'user.name', 't'); git(repo4, 'config', 'user.email', 't@example.invalid');
+      fs.writeFileSync(path.join(repo4, 'README.md'), '# b\n'); git(repo4, 'add', '-A'); git(repo4, 'commit', '-qm', 'i');
+      spawnSync(process.execPath, [CLI, 'install', '--root', repo4], { encoding: 'utf8', windowsHide: true, env });
+      const ver = () => fs.readFileSync(path.join(repo4, 'harness', 'VERSION'), 'utf8').trim();
+      const h = S.acquire(repo4, 'merge');
+      const t0 = Date.now();
+      const a1 = await cli(['update', '--auto', '--root', repo4], env);
+      h.release();
+      const st = AU.readState(repo4);
+      R.check('[UP-12] 병합 잠금이 살아 있으면(accept 도중) 자동 갱신은 조용히 미룬다(exit 0 · 그대로) · 1시간 뒤 다시 보게 확인 시각을 당긴다',
+        a1.code === 0 && ver() === 'dev' && /미룸/.test(a1.out) && /merge/.test(a1.out) && st.checked_at && Math.abs(st.checked_at - (t0 - AU.DAY_MS + AU.RETRY_MS)) < 120000, `${a1.code} ${a1.out.slice(0, 300)} ${JSON.stringify(st)}`);
+      const id6 = 't-20261026-095354-6951', wt6 = path.join(repo4, '.harness-worktrees', id6), td6 = path.join(repo4, '.git', 'harness', 'tasks', id6);
+      fs.mkdirSync(wt6, { recursive: true }); fs.mkdirSync(td6, { recursive: true });
+      fs.writeFileSync(path.join(td6, 'task.json'), JSON.stringify({ id: id6, status: 'interrupted', mode: 'thin', goal: 'v6 goal', branch: `harness/${id6}`, worktree: wt6, session_id: 'sess-v6' }));
+      const old = new Date(Date.now() - 2 * 86400000); fs.utimesSync(path.join(td6, 'task.json'), old, old);
+      const a2 = await cli(['update', '--auto', '--root', repo4], env);
+      const mig = path.join(repo4, '.git', 'harness', 'v7-migration.md');
+      R.check('[UP-13] 끝나지 않은 v6 작업이 있으면 자동 갱신은 이행하지 않고 미룬다(GitHub 의 Pre-release 표시에 기대지 않는다)', a2.code === 0 && ver() === 'dev' && /v6/.test(a2.out) && !fs.existsSync(mig), a2.out.slice(0, 300));
+      const a3 = await cli(['update', '--root', repo4], env);
+      R.check('[UP-14] 손으로 update(--migrate 없음)는 거부하며 --migrate 를 알린다', a3.code !== 0 && ver() === 'dev' && /--migrate/.test(a3.out), a3.out.slice(0, 400));
+      const a4 = await cli(['update', '--migrate', '--root', repo4], env);
+      R.check('[UP-15] update --migrate: 이어 가는 법(start --from · claude --resume)을 적고 설치한다', a4.code === 0 && ver() === '9.9.9' && fs.existsSync(mig) && /start --from t-20261026-095354-6951/.test(fs.readFileSync(mig, 'utf8')) && /claude --resume sess-v6/.test(fs.readFileSync(mig, 'utf8')), a4.out.slice(-400));
+    }
     srv.close();
   } catch (e) { R.check('예외 없이 끝난다', false, String(e && e.stack || e).slice(0, 800)); }
   finally { try { fs.rmSync(base, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }); } catch { /* 정리 실패는 결과와 무관 */ } }

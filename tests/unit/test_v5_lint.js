@@ -84,19 +84,29 @@ const laneWork = (root, file, text) => {
     R.check('[SC-02] serial_checks: 없으면 켬(기본) · true 면 켬(start 가 작업에 기록) · off 면 꺼짐 — accept 의 serialRootOf 도 지금 값을 따른다',
       JSON.stringify(sc) === '[true,true,false,true,true,null]', JSON.stringify(sc));
 
-    // LT-10 — [자동 이슈 #38] 전체 린트가 옛 빚으로 막은 뒤 사용자가 lint_command 를 {files} 로 바꾸면 accept 가 지금 값을 따른다 · --force 는 린트를 건너뛴다
-    const r9 = repo('node lint.js', { 'old.js': 'console.log("legacy")\n' });
-    const g9 = laneWork(r9, 'x.js', 'module.exports=2;\n');
+    // LT-10 — [자동 이슈 #38] accept 는 프로젝트 블록의 지금 lint_command 를 따른다 · --force 는 린트를 건너뛴다
+    //   [2026-10-29 감사 G2 #20] 예전 이 시험은 "옛 빚(old.js)으로 저장소 전체 린트가 막는다" 를 전제로 했다 — v7 은 린트 기준선을 재지 않아
+    //   작업 전부터 빨간 전체 린트가 모든 accept 를 막았다. 이제 전체 린트는 대상 끝에서도 실패하면 막지 않는다(LT-12). 여기서는 레인이 깨뜨린 경우로 잰다.
+    const r9 = repo('node lint.js', { 'ok.js': 'process.exit(0)\n' });
+    const g9 = laneWork(r9, 'x.js', 'console.log(2);\n');
     const a9 = await I.accept({ root: r9, id: g9.id, log: () => {} });
-    write(path.join(r9, 'AGENTS.md'), yamlBlock(['test_command: "node check.js"', 'lint_command: "node lint.js {files}"'])); git(r9, 'commit', '-qam', 'lint only changed files');
+    write(path.join(r9, 'AGENTS.md'), yamlBlock(['test_command: "node check.js"', 'lint_command: "node ok.js"'])); git(r9, 'commit', '-qam', 'another lint');
     const a9b = await I.accept({ root: r9, id: g9.id, log: () => {} });
-    const r9f = repo('node lint.js', { 'old.js': 'console.log("legacy")\n' });
-    const g9f = laneWork(r9f, 'x.js', 'module.exports=2;\n');
+    const r9f = repo('node lint.js');
+    const g9f = laneWork(r9f, 'x.js', 'console.log(2);\n');
     const a9f = await I.accept({ root: r9f, id: g9f.id, log: () => {}, force: true });
-    R.check('[LT-10] (#38) accept 는 바뀐 lint_command({files})를 따른다 — 처음엔 옛 빚으로 거절({files} 안내) · 바꾼 뒤 합친다 · --force 는 린트를 건너뛴다(기록)',
+    R.check('[LT-10] (#38) 레인이 저장소 전체 린트를 깨뜨리면 거절({files} 안내) · lint_command 를 바꾸면 accept 가 지금 값을 따른다 · --force 는 린트를 건너뛴다(기록)',
       a9.refused === true && /lint fails/.test(a9.reason) && /\{files\}/.test(a9.reason) && a9b.status === 'accepted' && a9f.status === 'accepted'
         && S.readLog(r9, g9.id).some(e => e.event === 'lint_command_changed') && S.readLog(r9f, g9f.id).some(e => e.event === 'lint' && e.skipped === 'force'),
       JSON.stringify({ a: [a9.status, String(a9.reason).slice(0, 160)], b: [a9b.status, String(a9b.reason).slice(0, 100)], f: [a9f.status, String(a9f.reason).slice(0, 100)] }));
+
+    // LT-12 — [2026-10-29 감사 G2 #20] 작업 전부터 빨간 저장소 전체 린트(옛 빚 old.js)는 accept 를 막지 않는다 — 대상 끝에서도 실패하면 보고만
+    const r12 = repo('node lint.js', { 'old.js': 'console.log("legacy")\n' });
+    const g12 = laneWork(r12, 'y.js', 'module.exports=3;\n');
+    const a12 = await I.accept({ root: r12, id: g12.id, log: () => {} });
+    R.check('[LT-12] (#20) 작업 전부터 실패하던 저장소 전체 린트는 막지 않는다 · 기록 · 보고에 남긴다',
+      a12.status === 'accepted' && S.readLog(r12, g12.id).some(e => e.event === 'lint' && e.pre_existing === true) && /lint/.test(a12.report || ''),
+      JSON.stringify({ st: a12.status, reason: a12.reason, report: a12.report }));
 
     // LT-11 — {files} 린트: 작업이 바꾼 파일이 린트를 어기면 accept 거절(main 그대로) → 고치면 합친다 · 저장소의 옛 빚(old.js)은 보지 않는다
     const r11 = repo('node lint.js {files}', { 'old.js': 'console.log("legacy")\n' });

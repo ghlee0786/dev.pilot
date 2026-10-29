@@ -1,8 +1,10 @@
 'use strict';
 // update — 배포된 최신 릴리스(GitHub Releases)로 이 저장소의 하네스를 갈아 끼운다(CD 의 받는 쪽).
 //   [2026-10-13 사용자 결정] 하네스를 dev.harness 에 올리고 CI/CD 로 배포한다.
-//   흐름: releases/latest 조회 → 지금 판(harness/VERSION)과 비교 → harness-<판>.tar.gz 를 임시 폴더에 받아 풀기 →
-//         그 사본의 `install --root <저장소>` 로 설치(실행 중인 작업이 있으면 install 이 거부한다 — 작업 도중 갈아 끼우지 않는다).
+//   흐름: releases/latest 조회 → 지금 판(harness/VERSION)과 비교 → 릴리스의 *.tar.gz(pilot-<판>.tar.gz)를 임시 폴더에 받아 풀기 →
+//         그 사본의 `install --root <저장소>` 로 설치(하네스가 일하는 중이거나 끝나지 않은 v6 작업이 있으면 install 이 거부한다 — 맥락을 잃지 않게).
+//   --migrate(손으로만): 끝나지 않은 v6 작업의 이어 가는 법을 적고 설치한다. 자동 갱신은 절대 이행하지 않고 1시간 뒤로 미룬다.
+//   [2026-10-29 감사] 판을 붙잡는 장치가 GitHub 의 Pre-release 표시 하나뿐이었다 — 표시에 기대지 않고 저장소 쪽(작업 상태)에서 막는다.
 //   --dry-run 은 비교만. 내려받기 · 풀기는 인증 없이(공개 저장소). tar 는 Windows(bsdtar) · POSIX 모두 있다.
 const fs = require('node:fs'), path = require('node:path'), os = require('node:os');
 const { spawnSync } = require('node:child_process');
@@ -38,7 +40,7 @@ async function download(url, file) {
   } finally { clearTimeout(t); }
 }
 
-// o = { root, check, repo } → { ok, current, latest, updated, report }
+// o = { root, check, repo, auto, migrate } → { ok, current, latest, updated, report }
 async function update(o) {
   const root = path.resolve(o.root || process.cwd());
   const repo = repoOf(o);
@@ -49,13 +51,18 @@ async function update(o) {
   const base = { ok: true, repo, current, latest };
   if (!newer(latest, current)) return { ...base, updated: false, report: `하네스가 최신이다 — 지금 ${current} · 최신 ${latest} (${repo})` };
   if (o.check) return { ...base, updated: false, available: true, report: `새 판이 있다 — 지금 ${current} → ${latest}. 설치: node harness/cli.js update` };
-  if (!asset) return { ...base, ok: false, updated: false, report: `릴리스 ${latest} 에 harness-*.tar.gz 가 없다 — 설치하지 않았다` };
-  // 자동 갱신(--auto): 실행 중인 작업이 있으면 조용히 건너뛴다(다음 확인 때 다시) — 작업 도중 하네스를 바꾸지 않는다.
-  const S = require('./state'), AU = require('./autoupdate');
+  if (!asset) return { ...base, ok: false, updated: false, report: `릴리스 ${latest} 에 .tar.gz 묶음이 없다 — 설치하지 않았다` };
+  // 자동 갱신(--auto): 하네스가 일하는 중이거나 끝나지 않은 v6 작업이 있으면 조용히 미룬다 — 작업 도중 · 이행 없이 하네스를 바꾸지 않는다.
   //   [2026-10-15 실측] 미룬 갱신이 하루 뒤에야 다시 시도돼 옛 판이 계속 쓰였다 — 1시간 뒤 다시 보게 확인 시각을 당겨 둔다.
-  if (o.auto && S.listTasks(root).some(t => t.status === 'running' && S.ownerAlive(t.owner))) {
-    AU.writeState(root, { ...AU.readState(root), checked_at: Date.now() - AU.DAY_MS + AU.RETRY_MS });
-    return { ...base, updated: false, skipped: 'running', report: `자동 갱신 미룸 — 실행 중인 작업이 있다(${current} → ${latest}) · 1시간 뒤 다시 본다` };
+  //   [2026-10-29 감사] v7 레인은 'running' 이 아니어서 이 미룸이 늘 비어 있었다 — install 과 같은 판정(busy)을 쓴다.
+  const AU = require('./autoupdate');
+  if (o.auto) {
+    const b = require('./install').busy(root);
+    const why = [...b.live, ...(b.v6.length ? [`끝나지 않은 v6 작업 ${b.v6.length}개(이행은 손으로: update --migrate)`] : [])];
+    if (why.length) {
+      AU.defer(root);
+      return { ...base, updated: false, skipped: 'busy', report: `자동 갱신 미룸(${current} → ${latest}) — ${why.slice(0, 3).join(' · ')} · 1시간 뒤 다시 본다` };
+    }
   }
   const before = o.auto ? AU.dirty(root) : null;
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'harness-update-'));
@@ -67,9 +74,12 @@ async function update(o) {
     if (x.status !== 0) throw Object.assign(new Error(`tar failed: ${String(x.stderr).trim().slice(0, 200)}`), { code: 'UPDATE_EXTRACT' });
     const cli = [path.join(tmp, 'harness', 'cli.js'), ...fs.readdirSync(tmp).map(d => path.join(tmp, d, 'harness', 'cli.js'))].find(f => fs.existsSync(f));
     if (!cli) throw Object.assign(new Error('the release archive has no harness/cli.js'), { code: 'UPDATE_EXTRACT' });
-    const ins = spawnSync(process.execPath, [cli, 'install', '--root', root], { encoding: 'utf8', windowsHide: true, timeout: 300000 });
+    const ins = spawnSync(process.execPath, [cli, 'install', '--root', root, ...(o.migrate && !o.auto ? ['--migrate'] : [])], { encoding: 'utf8', windowsHide: true, timeout: 300000 });
     const out = `${ins.stdout || ''}${ins.stderr || ''}`.trim();
-    if (ins.status !== 0) return { ...base, ok: false, updated: false, report: `설치하지 않았다(${latest}): ${out.slice(0, 600)}` };
+    if (ins.status !== 0) {
+      if (o.auto) AU.defer(root);   // 설치가 거부했다(그사이 일이 시작됨 등) — 하루가 아니라 1시간 뒤 다시
+      return { ...base, ok: false, updated: false, report: `설치하지 않았다(${latest}): ${out.slice(0, 600)}` };
+    }
     // 자동 갱신: 하네스 파일을 git 이 추적하는 저장소면 갱신이 바꾼 것만 따로 커밋(사용자의 미커밋 변경은 넣지 않는다) · 결과를 기록한다.
     let commit = null;
     if (o.auto) {

@@ -9,7 +9,7 @@
 //   PreToolUse(Write · Edit …): 다른 산 세션이 기록한 파일이 지금 미커밋이면 permissionDecision 'ask'. 아니면 출력 없음.
 //   산 세션 = 이 세션이 아님 · Claude 세션은 `claude agents --json` 목록에 있다(C.platformAgents · 30초 캐시) —
 //     목록을 못 얻었거나 Codex 세션이면 ended_at 없음 · last_seen 30분 안. 무인 작업자의 worktree 에서는 아무것도 하지 않는다.
-//   알림에는 플랫폼 이름(예: workspace-cpp-34)과 busy/idle 을 싣는다.
+//   알림에는 플랫폼 이름(예: proj-34)과 busy/idle 을 싣는다.
 //   내부 오류는 열어 둔다(허용) — 대신 hook-errors.log 에 남긴다.
 const fs = require('node:fs');
 const C = require('./_common');
@@ -20,6 +20,27 @@ const MAX_DUPS = 3;
 const FINAL = new Set(['accepted', 'cancelled']);
 
 const clip = (s, n) => { const t = String(s || '').replace(/\s+/g, ' ').trim(); return t.length > n ? t.slice(0, n - 1) + '…' : t; };
+// 첫 요청에 든 비밀(토큰 · 키 · 비밀번호)을 가린다 — 기록하는 쪽에서. [2026-10-29 감사] 첫 요청이 그대로 세션 파일에 저장되고
+//   다른 세션의 문맥 · status 에 실렸다(요청에 넣은 토큰 · 비밀번호가 다른 세션의 대화 기록으로 옮겨 갔다).
+const SECRET = '<secret>';
+const SECRET_RES = [
+  /\b(?:sk|pk|rk)-(?:proj-|live-|test-|ant-)?[A-Za-z0-9_-]{10,}/g,               // OpenAI · Anthropic · Stripe 꼴
+  /\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{10,}|\bgithub_pat_[A-Za-z0-9_]{10,}/g,   // GitHub
+  /\bglpat-[A-Za-z0-9_-]{10,}|\bxox[abprs]-[A-Za-z0-9-]{10,}/g,                    // GitLab · Slack
+  /\bAKIA[0-9A-Z]{16}\b|\bAIza[0-9A-Za-z_-]{20,}/g,                                 // AWS 액세스 키 · Google API 키
+  /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g,                 // JWT
+];
+function maskSecrets(text) {
+  let s = String(text || '');
+  for (const re of SECRET_RES) s = s.replace(re, SECRET);
+  s = s.replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/g, `$1 ${SECRET}`);
+  s = s.replace(/(\b[a-z][a-z0-9+.-]*:\/\/[^\s:/@]+:)[^\s@/]+@/gi, `$1${SECRET}@`);                       // scheme://user:pass@
+  // NAME=값 · NAME: 값 (이름이 key · token · secret · password · pwd · pass 로 끝나는 것 — keyboard: 는 아니다)
+  s = s.replace(/\b([A-Za-z0-9_.-]*(?:key|token|secret|passw(?:or)?d|pwd|pass)s?)(\s*[=:]\s*)(?!<secret>)("[^"]*"|'[^']*'|\S+)/gi, `$1$2${SECRET}`);
+  // 비밀번호는 … · 토큰: … — 조사(은 · 는 · 이 · 가)나 : · = 뒤의 비밀 꼴 낱말(한글이 없고 숫자 · 기호가 든 4자 이상 — "토큰이 만료" 는 그대로)
+  s = s.replace(/(비밀번호|비번|패스워드|암호|토큰|비밀\s?키|API\s?키|액세스\s?키)(\s*(?:은|는|이|가|:|=)\s*)(?!<secret>)(?=[^\s가-힣]*[0-9!@#$%^&*_+=-])([^\s가-힣]{4,})/gi, `$1$2${SECRET}`);
+  return s;
+}
 const minutesAgo = (iso, now) => { const t = Date.parse(iso || ''); return t ? Math.max(0, Math.round((now - t) / 60000)) : null; };
 const isLive = (s, now, agents) => C.sessionLive(s, agents, now);
 // 플랫폼 목록 — 후보 세션이 있을 때만 한 번 묻는다(캐시 30초). 못 얻으면 null(last_seen 어림).
@@ -102,7 +123,7 @@ function touch(info, sid, runtime, cwd, ev, prompt, now) {
   C.updateSession(info.common, sid, runtime, s => {
     s.cwd = cwd; s.root = info.root; s.branch = branch; s.last_seen = new Date(now).toISOString();
     delete s.ended_at;                                     // 다시 말을 걸었다 — 이어 간 세션
-    if (ev === 'UserPromptSubmit' && !s.goal && String(prompt || '').trim()) { s.goal = clip(prompt, GOAL_MAX); first = true; }
+    if (ev === 'UserPromptSubmit' && !s.goal && String(prompt || '').trim()) { s.goal = clip(maskSecrets(prompt), GOAL_MAX); first = true; }
     me = s;
     return s;
   });
@@ -190,4 +211,4 @@ function main() {
 }
 
 if (require.main === module) { main(); process.exitCode = 0; }
-module.exports = { decide, isLive, laneEnvLines, shQuote, LIVE_MS };
+module.exports = { decide, isLive, laneEnvLines, shQuote, maskSecrets, LIVE_MS };

@@ -141,7 +141,8 @@ function newTask(fields) {
 function pidAlive(pid) {
   const n = Number(pid);
   if (!Number.isInteger(n) || n <= 0) return false;
-  try { process.kill(n, 0); } catch (e) { return e.code === 'EPERM'; }
+  // [2026-10-29 감사] Windows 는 끝났지만 누가 핸들을 쥔 프로세스에도 EPERM 을 낸다 — 3일 묵은 작업이 '실행 중' 으로 보였다. 목록에 없으면 끝난 것이다.
+  try { process.kill(n, 0); } catch (e) { return e.code === 'EPERM' && !(IS_WIN && procStartMs(n) === 'none'); }
   // Linux: 끝났지만 부모가 거두지 않은 프로세스(좀비)도 kill(0) 에는 살아 있다 — /proc 의 상태가 Z 면 끝난 것이다.
   if (process.platform === 'linux') { try { if (/^\d+ \(.*\) Z /s.test(fs.readFileSync(`/proc/${n}/stat`, 'utf8'))) return false; } catch { /* /proc 없음 — kill(0) 을 믿는다 */ } }
   // macOS 등(/proc 없음) — ps 의 상태가 Z(좀비)면 끝난 것이다. [2026-10-13 CI 실측] stop 이 "could not stop" 으로 실패했다.
@@ -150,16 +151,59 @@ function pidAlive(pid) {
   }
   return true;
 }
+// 프로세스 시작 시각(ms) · 'none'(그 pid 의 프로세스가 없다) · null(알 수 없다). 같은 pid 는 잠깐 기억한다(폴링 루프가 매번 셸을 띄우지 않게).
+//   Windows 는 PowerShell(약 0.5초) · Linux 는 /proc · macOS 등은 ps 의 경과 시간.
+const START_CACHE = new Map(), START_TTL_MS = 60000;
+function procStartMs(pid) {
+  const hit = START_CACHE.get(pid);
+  if (hit && Date.now() - hit.at < START_TTL_MS) return hit.v;
+  let v = null;
+  try {
+    if (IS_WIN) {
+      const ps = `$p=Get-Process -Id ${pid} -ErrorAction SilentlyContinue; if(-not $p){'none'} else { try { [DateTimeOffset]::new($p.StartTime).ToUnixTimeMilliseconds() } catch { '?' } }`;
+      const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps], { encoding: 'utf8', windowsHide: true, timeout: 15000 });
+      const out = String(r.stdout || '').trim();
+      v = r.status !== 0 ? null : out === 'none' ? 'none' : /^\d+$/.test(out) ? Number(out) : null;
+    } else if (process.platform === 'linux') {
+      let stat; try { stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8'); } catch { stat = null; }
+      if (stat === null) v = 'none';
+      else {
+        const ticks = Number(stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19]);   // 22번째 칸(starttime) — 이름의 공백 · 괄호를 건너뛴다
+        const btime = Number((/^btime (\d+)$/m.exec(fs.readFileSync('/proc/stat', 'utf8')) || [])[1]);
+        if (ticks >= 0 && btime) v = btime * 1000 + ticks * 10;   // CLK_TCK 100
+      }
+    } else {
+      const r = spawnSync('ps', ['-o', 'etime=', '-p', String(pid)], { encoding: 'utf8', timeout: 5000 });
+      const m = /^\s*(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)\s*$/.exec(String(r.stdout || ''));
+      if (r.status === 1 && !String(r.stdout || '').trim()) v = 'none';
+      else if (m) v = Date.now() - ((Number(m[1] || 0) * 86400) + (Number(m[2] || 0) * 3600) + (Number(m[3]) * 60) + Number(m[4])) * 1000;
+    }
+  } catch { v = null; }
+  START_CACHE.set(pid, { v, at: Date.now() });
+  return v;
+}
+// 이 프로세스의 시작 시각 — 주인 기록(잠금 · 번호표)에 함께 적어 pid 재사용을 알아본다.
+const PROC_STARTED_AT = new Date(Date.now() - Math.round(process.uptime() * 1000)).toISOString();
 // 주인이 살아 있는가 — 같은 호스트면 pid 로, 다른 호스트면 판단할 수 없으니 살아 있다고 본다(오래된 at 은 예외).
-const FOREIGN_STALE_MS = 24 * 3600 * 1000;
+//   [2026-10-29 감사] 같은 호스트에서도 pid 만 보면, 강제 종료된 accept 의 pid 를 다른 프로세스가 다시 받았을 때 checks 줄이 영영 막혔다.
+//   기록에 시작 시각(started_at)이 있으면 그 pid 의 지금 프로세스 시작 시각과 맞춰 본다(다르면 다른 프로세스 — 죽은 주인).
+//   시작 시각이 없는 옛 기록은 신호(heartbeat_at · at)가 24시간 넘게 멈췄으면 죽은 것으로 본다.
+const FOREIGN_STALE_MS = 24 * 3600 * 1000, START_SLACK_MS = 10000;
 const isSelf = owner => !!owner && owner.pid === process.pid && (!owner.host || owner.host === HOST);
 function ownerAlive(owner) {
   if (!owner || owner.pid == null) return false;
-  if (owner.host && owner.host !== HOST) {
-    const at = Date.parse(owner.heartbeat_at || owner.at || '');
-    return !(at && Date.now() - at > FOREIGN_STALE_MS);
+  const at = Date.parse(owner.heartbeat_at || owner.at || '');
+  if (owner.host && owner.host !== HOST) return !(at && Date.now() - at > FOREIGN_STALE_MS);
+  if (isSelf(owner)) return true;
+  if (!pidAlive(owner.pid)) return false;
+  const started = Date.parse(owner.started_at || '');
+  if (started) {
+    const now = procStartMs(Number(owner.pid));
+    if (now === 'none') return false;
+    if (typeof now === 'number') return Math.abs(now - started) <= START_SLACK_MS;
+    return !(at && Date.now() - at > FOREIGN_STALE_MS);   // 시작 시각을 알 수 없다 — 신호 나이로
   }
-  return pidAlive(owner.pid);
+  return !(at && Date.now() - at > FOREIGN_STALE_MS);
 }
 
 // ── 잠금 ───────────────────────────────────────────────────────────────
@@ -223,7 +267,7 @@ function acquire(root, name, opts) {
     try { fs.mkdirSync(dir); made = true; }
     catch (e) { if (e.code !== 'EEXIST' && e.code !== 'EPERM') throw e; }
     if (made) {
-      const owner = { pid: process.pid, host: HOST, at: nowIso(), token: crypto.randomBytes(6).toString('hex'), name, ...(o.meta || {}) };
+      const owner = { pid: process.pid, host: HOST, at: nowIso(), started_at: PROC_STARTED_AT, token: crypto.randomBytes(6).toString('hex'), name, ...(o.meta || {}) };
       try { writeJsonAtomic(path.join(dir, 'owner.json'), owner, { noMkdir: true }); }
       catch (e) {
         if (e.code === 'ENOENT') continue;   // owner.json 을 쓰기 전에 폴더가 사라졌다(빼앗김) — 처음부터 다시
@@ -325,7 +369,7 @@ async function acquireQueued(root, name, opts) {
   const dir = queueDir(root, name);
   fs.mkdirSync(dir, { recursive: true });
   const file = path.join(dir, `${priority}-${pad(Date.now(), 15)}-${pad(process.pid, 10)}-${pad(++TICKET_SEQ, 6)}.json`);
-  const ticket = { pid: process.pid, host: HOST, at: nowIso(), priority, label: o.label == null ? null : String(o.label) };
+  const ticket = { pid: process.pid, host: HOST, at: nowIso(), started_at: PROC_STARTED_AT, priority, label: o.label == null ? null : String(o.label) };
   hookExit();
   TICKETS.set(file, null);
   writeJsonAtomic(file, ticket);
@@ -395,6 +439,6 @@ function readSessions(root) {
 module.exports = { retargetWorktree, taskPathsFor, listBrokenTasks,
   HOST, IS_WIN, sleepSync, nowIso, repoRoot, mainRoot, commonDir, paths, taskPaths, newId, validId, ID_RE,
   readJson, writeJsonAtomic, appendJsonl, readTask, writeTask, log, readLog, listTasks, newTask,
-  pidAlive, ownerAlive, isSelf, lockDir, lockOwner, takeOver, acquire, acquireQueued, queueOf, withLock, withLockSync, listLocks, removeDeadLocks, lockStale, staleInfo, lockLive,
+  pidAlive, procStartMs, ownerAlive, isSelf, PROC_STARTED_AT, lockDir, lockOwner, takeOver, acquire, acquireQueued, queueOf, withLock, withLockSync, listLocks, removeDeadLocks, lockStale, staleInfo, lockLive,
   readSessions,
 };

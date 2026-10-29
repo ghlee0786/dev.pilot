@@ -45,11 +45,18 @@ const readJson = f => { try { return JSON.parse(fs.readFileSync(f, 'utf8').repla
 const dirsIn = d => { try { return fs.readdirSync(d, { withFileTypes: true }).filter(e => e.isDirectory()).map(e => e.name); } catch { return []; } };
 const samePath = (a, b) => { const n = p => path.resolve(String(p)).replace(/\\/g, '/').replace(/\/+$/, ''); return process.platform === 'win32' ? n(a).toLowerCase() === n(b).toLowerCase() : n(a) === n(b); };
 
-// MCP 항목 하나 — 명령이 래퍼 스크립트(.cmd · .bat · .ps1 · .sh)면 그 안에서 실제 서버를 본다(64KB 까지)
-function mcpEntry(name, v, scope) {
+// MCP 항목 하나 — 명령이 래퍼 스크립트(.cmd · .bat · .ps1 · .sh)면 그 안에서 실제 서버를 본다(64KB 까지).
+//   detail(명령 · 인자 · url · 래퍼 본문)은 판별(present · WARNINGS)에만 쓰고 결과에 싣지 않는다 — 토큰 · 비밀번호 · 접속 문자열이 들어 있다(2026-10-29 감사).
+//   저장소의 .mcp.json(project)이 가리키는 래퍼는 저장소 안의 것만 읽는다 — 저장소가 사용자 PowerShell 프로필 같은 바깥 파일을 끌어오지 못하게.
+function mcpEntry(name, v, scope, root) {
   const parts = [v && v.command, ...((v && v.args) || []), v && v.url].filter(x => typeof x === 'string');
   let detail = parts.join(' ');
-  for (const p of parts) if (/\.(cmd|bat|ps1|sh)$/i.test(p)) { try { if (fs.statSync(p).size < 65536) detail += ' ' + fs.readFileSync(p, 'utf8'); } catch { /* 없으면 명령만 */ } }
+  for (const p of parts) {
+    if (!/\.(cmd|bat|ps1|sh)$/i.test(p)) continue;
+    const rel = path.relative(root, path.resolve(root, p));
+    if (scope === 'project' && (rel.split(path.sep)[0] === '..' || path.isAbsolute(rel))) continue;
+    try { if (fs.statSync(path.resolve(root || '.', p)).size < 65536) detail += ' ' + fs.readFileSync(path.resolve(root || '.', p), 'utf8'); } catch { /* 없으면 명령만 */ }
+  }
   return { name, scope, detail };
 }
 function inventory(root, o) {
@@ -58,9 +65,9 @@ function inventory(root, o) {
   const ip = readJson(path.join(home, '.claude', 'plugins', 'installed_plugins.json'));
   for (const k of Object.keys((ip && ip.plugins) || {})) inv.plugins.push({ name: k });
   const cj = readJson(path.join(home, '.claude.json')) || {};
-  for (const [k, v] of Object.entries(cj.mcpServers || {})) inv.mcp.push(mcpEntry(k, v, 'user'));
-  for (const [p, v] of Object.entries(cj.projects || {})) if (samePath(p, root)) for (const [k, s] of Object.entries((v && v.mcpServers) || {})) inv.mcp.push(mcpEntry(k, s, 'local'));
-  for (const [k, v] of Object.entries((readJson(path.join(root, '.mcp.json')) || {}).mcpServers || {})) inv.mcp.push(mcpEntry(k, v, 'project'));
+  for (const [k, v] of Object.entries(cj.mcpServers || {})) inv.mcp.push(mcpEntry(k, v, 'user', root));
+  for (const [p, v] of Object.entries(cj.projects || {})) if (samePath(p, root)) for (const [k, s] of Object.entries((v && v.mcpServers) || {})) inv.mcp.push(mcpEntry(k, s, 'local', root));
+  for (const [k, v] of Object.entries((readJson(path.join(root, '.mcp.json')) || {}).mcpServers || {})) inv.mcp.push(mcpEntry(k, v, 'project', root));
   try {   // Codex: [mcp_servers.<이름>] 머리줄만(하위 표 [mcp_servers.x.env] 는 같은 이름)
     const toml = fs.readFileSync(path.join(process.env.CODEX_HOME || path.join(home, '.codex'), 'config.toml'), 'utf8');
     const seen = new Set();
@@ -105,7 +112,8 @@ function check(o) {
   const fits = e => (e.stacks.includes('*') || e.stacks.some(x => st.includes(x))) && (!e.when || st.includes(e.when));
   const relevant = CATALOG.filter(fits);
   const age = Math.floor((((o && o.now) || Date.now()) - Date.parse(REVIEWED_AT)) / 86400000);
-  return { root, stacks: st, inventory: inv,
+  // 결과(--json 으로 그대로 나간다)에는 이름과 범위만
+  return { root, stacks: st, inventory: { skills: inv.skills, plugins: inv.plugins, mcp: inv.mcp.map(m => ({ name: m.name, scope: m.scope })) },
     installed: relevant.filter(e => present(e, inv)).map(e => e.id),
     missing: relevant.filter(e => !present(e, inv)).map(({ has, ...e }) => e),
     warnings: inv.mcp.flatMap(m => WARNINGS.filter(w => w.test(m)).map(w => ({ id: w.id, mcp: m.name, text: w.text(m) }))),

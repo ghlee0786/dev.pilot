@@ -14,12 +14,32 @@ function bugsDir(root) { return path.join(require('./state').paths(root).harness
 const esc = s => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 // 가리기 — 하네스 파일 경로(harness/lib · hooks · cli.js)만 남기고 나머지 경로 · 따옴표 안 · 메일 · 사용자 이름 · 호스트를 지운다.
+//   [2026-10-29 감사] 공개 저장소에 사람 검토 없이 올라간다 — 토큰 · 비밀번호 · 키 · 접속 문자열 · URL · IP · 상대 경로도 가린다.
+const SECRET = '<secret>';
+const SECRET_KEY = '(?:[A-Za-z_][\\w.-]*?)?(?:token|secret|passw(?:or)?d|pwd|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|credential|auth)[\\w.-]*';
 function sanitize(text) {
   let s = String(text || '');
   const keepHarness = p => { const m = /(?:^|[\\/])(harness[\\/](?:lib|hooks)[\\/][\w.-]+\.js|harness[\\/]cli\.js)(:\d+(?::\d+)?)?/i.exec(p); return m ? m[1].replace(/\\/g, '/') + (m[2] || '') : '<path>'; };
-  s = s.replace(/'[^'\n]*'|"[^"\n]*"/g, q => (/harness[\\/](lib|hooks|cli)/i.test(q) ? q[0] + keepHarness(q.slice(1, -1)) + q[0] : `${q[0]}…${q[0]}`));
+  // 비밀처럼 보이는 값 — 따옴표 · 경로 규칙보다 먼저(값이 따옴표 안이어도)
+  s = s.replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{6,}/gi, `$1 ${SECRET}`);
+  s = s.replace(/\b(?:gh[pousr]_[A-Za-z0-9]{6,}|github_pat_[A-Za-z0-9_]{6,}|sk-[A-Za-z0-9_-]{6,}|[sr]k_(?:live|test)_[A-Za-z0-9]{6,}|xox[abprs]-[A-Za-z0-9-]{6,}|glpat-[A-Za-z0-9_-]{6,}|npm_[A-Za-z0-9]{6,}|AIza[0-9A-Za-z_-]{20,}|(?:AKIA|ASIA)[0-9A-Z]{12,})/g, SECRET);
+  s = s.replace(/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*/g, SECRET);                          // JWT
+  s = s.replace(new RegExp(`\\b(${SECRET_KEY})(\\s*[:=]\\s*)("[^"\\n]*"|'[^'\\n]*'|[^\\s;,&]+)`, 'gi'), `$1$2${SECRET}`);   // KEY=VALUE · KEY: VALUE
+  s = s.replace(/\b(Server|Data Source|Host|Address|Addr|User ?Id|Uid|User|Username|Database|Initial Catalog)\s*=\s*[^;\n]+/gi, `$1=${SECRET}`);   // 접속 문자열 조각
+  s = s.replace(/(\s--?(?:password|passwd|pass|token|api-key|apikey|secret|access-key)(?:=|\s+))\S+/gi, `$1${SECRET}`);
+  s = s.replace(/(\blogin\b[^\n]*?\s-p)\s*\S+/gi, `$1 ${SECRET}`);                                               // docker login -p …
+  s = s.replace(/(\s-u)\s+[^\s:]+:\S+/g, `$1 ${SECRET}`);                                                       // curl -u user:pass
+  s = s.replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s'"<>()]+/gi, '<url>');                                             // URL(자격 증명 · 내부 호스트 · 쿼리 토큰)
+  s = s.replace(/\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?\b/g, '<ip>');
+  s = s.replace(/'[^'\n]*'|"[^"\n]*"/g, q => (/harness[\\/](lib|hooks|cli)/i.test(q) ? q[0] + keepHarness(q.slice(1, -1)) + q[0] : q.includes(SECRET) ? q : `${q[0]}…${q[0]}`));
   s = s.replace(/(?:[A-Za-z]:[\\/]|\\\\)[^\s'"()<>|]+/g, keepHarness);          // Windows 절대 경로 · UNC
   s = s.replace(/(?<![\w.:])\/(?:[^\s'"()<>|/]+\/)+[^\s'"()<>|]*/g, keepHarness);   // POSIX 절대 경로
+  // 상대 경로(./ · ../ 로 시작 · 구분자 둘 이상 · 확장자 있는 파일) — 하네스 파일만 남긴다
+  s = s.replace(/(?<![\w<>@])(?:\.{1,2}[\\/])?(?:[\w@+.-]+[\\/])+[\w@+.-]*/g, p => {
+    if (/^<|^(?:N\/A|and\/or|\d+\/\d+)$/i.test(p)) return p;
+    const seps = (p.match(/[\\/]/g) || []).length;
+    return /^\.{1,2}[\\/]/.test(p) || seps >= 2 || /\.[A-Za-z]\w{0,5}$/.test(p) ? keepHarness(p) : p;
+  });
   s = s.replace(/[\w.+-]+@[\w-]+(\.[\w-]+)+/g, '<email>');
   // 사용자 이름 · 호스트 — 짧은 이름(예: 'gh')도 가리되 단어로 떨어진 것만(github · high 같은 낱말은 그대로).
   for (const [v, mask] of [[os.userInfo().username, '<user>'], [os.hostname(), '<host>']]) if (v && v.length >= 2) s = s.replace(new RegExp(`(?<![\\w.-])${esc(v)}(?![\\w-])`, 'gi'), mask);
@@ -91,7 +111,7 @@ function draft(e, o) {
   const repo = (o && o.repo) || process.env.HARNESS_BUG_REPO || DEFAULT_REPO;
   const v = e.versions || versions();
   const title = `[auto] ${e.kind}${e.code ? ` ${e.code}` : ''}: ${String(e.message).slice(0, 90)} [${e.sig}]`;
-  const body = ['하네스가 자동으로 만든 결함 보고입니다(내용은 가렸습니다 — 프로젝트 경로 · 작업 내용 · 코드는 없습니다).', '',
+  const body = ['하네스가 자동으로 만든 결함 보고입니다. 올리기 전에 자동으로 가렸습니다: 경로 · URL · IP · 메일 · 사용자/호스트 이름 · 저장소 이름 · 토큰 · 비밀번호 · 키 · 접속 문자열. 가리기는 패턴으로 하므로 빠진 것이 보이면 알려 주세요.', '',
     `- 서명: \`${e.sig}\` · 종류: ${e.kind}${e.code ? ` · 코드: ${e.code}` : ''} · 횟수: ${e.count || 1}`,
     `- 하네스: ${v.harness} · Node ${v.node} · git ${v.git || '?'} · OS ${v.os}`, '',
     ...(e.detail != null ? [`**${e.kind === 'improve' ? '더 나은 방향' : e.kind === 'intent' ? '의도와 다르게 동작함' : '하네스 동작 이상'}**`, '', e.detail]
@@ -205,7 +225,16 @@ function projectWords(root) {
   try { for (const k of ['user.name', 'user.email']) { const v = spawnSync('git', ['config', k], { cwd: root, encoding: 'utf8', windowsHide: true }).stdout.trim(); if (v) words.add(v); } } catch { /* 없음 */ }
   return [...words].filter(w => w && w.length >= 3 && !/^(harness|dev\.harness|origin|github\.com|gitea)$/i.test(w));
 }
-function maskProject(text, root) { let s = sanitize(text); for (const w of projectWords(root)) s = s.replace(new RegExp(esc(w), 'gi'), '<project>'); return s; }
+//   [2026-10-29 감사] 철자가 다른 같은 이름(acme-billing → AcmeBilling · acme_billing · AcmeBillingService)도 — 글자 · 숫자만 남겨 비교한다.
+const squash = w => String(w).toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
+function maskProject(text, root) {
+  let s = sanitize(text);
+  const words = projectWords(root);
+  for (const w of words) s = s.replace(new RegExp(esc(w), 'gi'), '<project>');
+  const keys = [...new Set(words.map(squash))].filter(k => k.length >= 5);   // 짧은 이름(app · test)은 낱말을 지나치게 가린다
+  if (keys.length) s = s.replace(/[\p{L}\p{N}][\p{L}\p{N}_.-]*/gu, tok => (keys.some(k => squash(tok).includes(k)) ? '<project>' : tok));
+  return s;
+}
 function note(root, kind, title, body) {
   const k = /^(intent|improve|bug)$/.test(kind) ? kind : 'bug';
   const t = maskProject(String(title || '').split(/\r?\n/)[0], root).slice(0, 120);

@@ -76,7 +76,13 @@ try {
   // [v7 Light] 블록에서 go · factory · doc · note · stop · attach · worker_allow 를 뺐다 — 레인(start) · accept · batch · 백그라운드 세션(claude --bg)
   R.check('[install] 관리 블록 ≤ 40줄 · 핵심 규칙(start · --from · accept · batch · claude --bg · 자기 파일만 커밋 · 막히면 보고)', blk.split('\n').length <= 40 && /node harness\/cli\.js start "/.test(blk) && /start --from <id>/.test(blk) && /accept <id>/.test(blk) && /batch accept <bid>/.test(blk)
     && /claude --bg/.test(blk) && /자기가 고친 파일만/.test(blk) && /이유 · 시도한 것 · 필요한 것/.test(blk), String(blk.split('\n').length));
-  const goneFromBlock = [/cli\.js go\b/, /\bgo "/, /`go\b/, /factory/, /doc new/, /cli\.js note/, /cli\.js stop/, /stop <id>/, /--attach/, /worker_allow/, /BLOCKED\.md/, /\bresume\b/, /cleanup-legacy/].filter(re => re.test(blk));
+  // [2026-10-29 감사] claude --bg 결과는 batch --branch → batch accept(accept 는 작업 id 만) · 목표는 어디서나 같은 방법(짧으면 따옴표 · 길면 --goal-file) ·
+  //   보고 자동 발행은 사용자가 동의한 예외라고 적는다 · 공개 템플릿에 특정 사용자의 언어를 박지 않는다
+  const skillTxt = read(path.join(SOURCE, 'skill', 'SKILL.md'));
+  R.check('[install] 블록 · SKILL: 백그라운드 세션의 브랜치는 batch --branch <브랜치> → batch accept <bid> · 목표는 짧으면 따옴표 · 길면 --goal-file · 보고 자동 발행은 동의한 예외 · "이 사용자는 한국어" 없음',
+    [blk, skillTxt].every(t => /claude --bg -w/.test(t) && /batch --branch <브랜치>/.test(t) && /accept 는 작업 id 만/.test(t) && /start "<짧은 요청>"/.test(t) && /--goal-file/.test(t) && /동의/.test(t) && /bug_report: off/.test(t))
+      && !/이 사용자는 한국어/.test(blk) && /reply_language/.test(blk) && /예외는 아래 "하네스 보고" 하나뿐/.test(blk) && !/그 브랜치를 accept/.test(blk + skillTxt));
+  const goneFromBlock =[/cli\.js go\b/, /\bgo "/, /`go\b/, /factory/, /doc new/, /cli\.js note/, /cli\.js stop/, /stop <id>/, /--attach/, /worker_allow/, /BLOCKED\.md/, /\bresume\b/, /cleanup-legacy/].filter(re => re.test(blk));
   R.check('[install] 관리 블록에 v7 에서 뺀 명령(go · resume · factory · doc · note · stop · attach · worker_allow · BLOCKED.md · cleanup-legacy)이 없다', !goneFromBlock.length, goneFromBlock.map(String).join(' '));
 
   const claude = read(path.join(t1, 'CLAUDE.md'));
@@ -292,9 +298,67 @@ try {
   fs.writeFileSync(path.join(t10, 'harness', 'cli.js'), cliBefore + '\n// local marker\n');
   const r10 = install({ target: t10, source: SOURCE });
   R.check('[RUN] 주인이 살아 있는 실행 중 작업이 있으면 harness/ 를 갈아 끼우지 않는다(ok:false · 이유에 작업 id)', r10.ok === false && /t-20260930-000000-abcd/.test(r10.report) && read(path.join(t10, 'harness', 'cli.js')).endsWith('// local marker\n'), r10.report);
+  // 사양 변경(2026-10-29): 주인이 죽어도 기록이 20분 안에 바뀌었으면 일하는 중으로 본다 — 조용한 지 30분 된 기록으로
   taskJson({ pid: 999999, host: os.hostname(), heartbeat_at: new Date().toISOString() });
+  const ago = d => new Date(Date.now() - d);
+  const r10q = install({ target: t10, source: SOURCE });
+  R.check('[RUN] 주인이 죽었어도 작업 기록이 20분 안에 바뀌었으면 갈아 끼우지 않는다', r10q.ok === false && /20분 안에/.test(r10q.report) && read(path.join(t10, 'harness', 'cli.js')).endsWith('// local marker\n'), r10q.report);
+  fs.utimesSync(path.join(taskDir, 'task.json'), ago(30 * 60000), ago(30 * 60000));
   const r10b = install({ target: t10, source: SOURCE });
-  R.check('[RUN] 주인이 죽은 작업은 막지 않는다', r10b.ok !== false && read(path.join(t10, 'harness', 'cli.js')) === cliBefore, r10b.report);
+  R.check('[RUN] 주인이 죽고 조용한 작업은 막지 않는다', r10b.ok !== false && read(path.join(t10, 'harness', 'cli.js')) === cliBefore, r10b.report);
+
+  // ── [2026-10-29 감사] v7 에서는 'running' 작업이 생기지 않는다 — accept · batch 의 잠금 · 레인 세션의 기록(transcript)으로 일하는 중을 본다 ──
+  {
+    const S = require('../../harness/lib/state.js');
+    const t13 = mkRepo('busy-v7');
+    install({ target: t13, source: SOURCE });
+    const lanePath = path.join(t13, 'harness', 'lib', 'lane.js'), laneSrc = read(lanePath);
+    fs.writeFileSync(lanePath, laneSrc + '// OLD VERSION MARK\n');
+    const changedBack = () => !read(lanePath).includes('OLD VERSION MARK');
+    for (const name of ['merge', 'checks', 'task-t-20261029-000000-abcd', 'batch-b-1']) {
+      const h = S.acquire(t13, name);
+      const r = install({ target: t13, source: SOURCE });
+      h.release();
+      R.check(`[BUSY] 잠금 ${name} 이 살아 있으면(accept · batch 도중) 엔진 파일을 갈아 끼우지 않는다`, r.ok === false && r.report.includes(name) && !changedBack(), r.report);
+    }
+    // 레인 세션의 transcript — ~/.claude/projects/<영문자 · 숫자 밖은 '-'>/<세션>.jsonl
+    const lid = 't-20261029-010000-beef', ltd = path.join(t13, '.git', 'harness', 'tasks', lid), lwt = path.join(t13, '.harness-worktrees', lid);
+    fs.mkdirSync(ltd, { recursive: true }); fs.mkdirSync(lwt, { recursive: true });
+    fs.writeFileSync(path.join(ltd, 'task.json'), JSON.stringify({ id: lid, mode: 'light', status: 'open', owner: null, branch: `harness/${lid}`, worktree: lwt }));
+    fs.utimesSync(path.join(ltd, 'task.json'), ago(60 * 60000), ago(60 * 60000));
+    const I = require('../../harness/lib/install.js');
+    R.check('[BUSY] 세션 기록 폴더 이름: 영문자 · 숫자가 아닌 글자는 모두 -', I.mangle('C:\\a_b\\c.d e') === 'C--a-b-c-d-e');
+    const tdir = path.join(home, '.claude', 'projects', I.mangle(fs.realpathSync.native(lwt)));
+    fs.mkdirSync(tdir, { recursive: true }); fs.writeFileSync(path.join(tdir, 'sess-1.jsonl'), '{}\n');
+    const rt = install({ target: t13, source: SOURCE });
+    R.check('[BUSY] 레인 세션이 20분 안에 기록했으면 갈아 끼우지 않는다(세션 id 를 알린다)', rt.ok === false && /sess-1/.test(rt.report) && !changedBack(), rt.report);
+    fs.utimesSync(path.join(tdir, 'sess-1.jsonl'), ago(40 * 60000), ago(40 * 60000));
+    const rq = install({ target: t13, source: SOURCE });
+    R.check('[BUSY] 모두 조용하면(열린 v7 레인이 있어도) 설치한다', rq.ok === true && changedBack(), rq.report);
+    fs.rmSync(path.join(home, '.claude'), { recursive: true, force: true });
+
+    // 끝나지 않은 v6 작업 — --migrate 없이는 거부 · --migrate 면 이어 가는 법을 먼저 적고 설치
+    fs.writeFileSync(lanePath, laneSrc + '// OLD VERSION MARK\n');
+    const v6 = [['t-20261026-095354-6951', 'interrupted', 'thin', 'sess-aaa'], ['t-20261026-095404-1449', 'running', undefined, null], ['t-20261026-095412-79a8', 'blocked', 'full', null], ['t-20261026-095500-0000', 'done', 'thin', null]];
+    for (const [id, status, mode, sid] of v6) {
+      const d = path.join(t13, '.git', 'harness', 'tasks', id), wt = path.join(t13, '.harness-worktrees', id);
+      fs.mkdirSync(d, { recursive: true }); fs.mkdirSync(wt, { recursive: true });
+      fs.writeFileSync(path.join(d, 'task.json'), JSON.stringify({ id, status, ...(mode ? { mode } : {}), goal: `goal of ${id}\nsecond line`, branch: `harness/${id}`, worktree: wt, session_id: sid, owner: { pid: 999999, host: os.hostname(), heartbeat_at: ago(3 * 86400000).toISOString() } }));
+      fs.utimesSync(path.join(d, 'task.json'), ago(3 * 86400000), ago(3 * 86400000));
+    }
+    const sdir = path.join(home, '.claude', 'projects', I.mangle(fs.realpathSync.native(path.join(t13, '.harness-worktrees', 't-20261026-095404-1449'))));
+    fs.mkdirSync(sdir, { recursive: true }); fs.writeFileSync(path.join(sdir, 'sess-bbb.jsonl'), '{}\n'); fs.utimesSync(path.join(sdir, 'sess-bbb.jsonl'), ago(2 * 86400000), ago(2 * 86400000));
+    const mig = path.join(t13, '.git', 'harness', 'v7-migration.md');
+    const r6 = install({ target: t13, source: SOURCE });
+    R.check('[V6] 끝나지 않은 v6 작업(worktree 가 남은 interrupted · running · blocked)이 있으면 --migrate 없이는 갈아 끼우지 않는다 · 끝난 작업(done)은 세지 않는다',
+      r6.ok === false && /--migrate/.test(r6.report) && /3개/.test(r6.report) && !/095500/.test(r6.report) && !changedBack() && !fs.existsSync(mig), r6.report);
+    const r6m = install({ target: t13, source: SOURCE, migrate: true });
+    const mt = fs.existsSync(mig) ? read(mig) : '';
+    R.check('[V6] --migrate: v7-migration.md 에 작업마다 id · 상태 · 목표 첫 줄 · 브랜치 · worktree · 세션 id(기록 또는 최근 transcript) · start --from · claude --resume 을 적고 설치한다 · 같은 목록을 보인다',
+      r6m.ok === true && changedBack() && ['t-20261026-095354-6951', 'interrupted', 'goal of t-20261026-095354-6951', 'harness/t-20261026-095354-6951', 'sess-aaa', 'sess-bbb', 'start --from t-20261026-095412-79a8', 'claude --resume sess-aaa'].every(x => mt.includes(x))
+        && !mt.includes('second line') && !mt.includes('095500') && /sess-aaa/.test(r6m.report) && /v7-migration\.md/.test(r6m.report), mt.slice(0, 600) + ' | ' + r6m.report.slice(0, 300));
+    fs.rmSync(path.join(home, '.claude'), { recursive: true, force: true });
+  }
 
   // ── 예전 템플릿의 CLAUDE.md: 하네스가 넣었던 줄만 새 문구로 · 사용자 줄과 줄바꿈(CRLF)은 그대로 · 두 번째 설치는 무변경
   //   [2026-10-20 사용자 보고] "서브에이전트는 적게" 지침 때문에 독립적인 시험 · 검토 11개가 하나씩 차례로 돌았다
@@ -355,6 +419,137 @@ try {
     R.check('[stale] 빈 폴더로 남은 harness/lib/gone/ 도 지운다 · 사용자 파일이 있는 harness/lib/ 와 harness/ 는 남는다',
       !fs.existsSync(path.join(t12, 'harness', 'lib', 'gone')) && fs.existsSync(path.join(t12, 'harness', 'lib')) && fs.existsSync(path.join(t12, 'harness')));
     R.check('[stale] 그 뒤 재설치는 바꿀 것이 없다', install({ target: t12, source: SOURCE }).changed.length === 0);
+  }
+
+  // ── [2026-10-29 감사] 설치 기록이 없음 · 깨짐 · created:false 뿐(harness/ 를 커밋한 저장소를 clone) — v6 모듈을 지우고 uninstall 이 흔적을 남기지 않는다 ──
+  {
+    const I = require('../../harness/lib/install.js');
+    const V6 = ['loop.js', 'factory.js', 'runner-claude.js', 'verify.js', 'transcribe_fw.py'];
+    for (const kind of ['missing', 'corrupt', 'allFalse']) {
+      const r = mkRepo(`v6-${kind}`);
+      install({ target: r, source: SOURCE });
+      for (const f of V6) write(path.join(r, 'harness', 'lib', f), `// v6 ${f}\n`);
+      write(path.join(r, 'harness', 'lib', 'my_notes.js'), '// user file\n');
+      const mf = path.join(r, '.git', 'harness', 'install.json');
+      // 옛 판의 훅 모양(SessionStart 없음) — 재설치가 settings.json 을 다시 써야 allow 를 누구 것으로 적는지가 드러난다
+      const sf = path.join(r, '.claude', 'settings.json'), so = readJson(sf); delete so.hooks.SessionStart; fs.writeFileSync(sf, JSON.stringify(so, null, 2) + '\n');
+      if (kind === 'missing') fs.unlinkSync(mf);
+      else if (kind === 'corrupt') fs.writeFileSync(mf, '{"files": ');
+      else { const m = readJson(mf); for (const k of Object.keys(m.files)) m.files[k] = { created: false }; fs.writeFileSync(mf, JSON.stringify(m)); }
+      const ri = install({ target: r, source: SOURCE });
+      const left = V6.filter(f => fs.existsSync(path.join(r, 'harness', 'lib', f)));
+      R.check(`[V6-files/${kind}] 기록이 ${kind} 여도 우리 사본(harness/)의 v6 모듈은 지운다 · 사용자 파일은 그대로`, ri.ok === true && !left.length && read(path.join(r, 'harness', 'lib', 'my_notes.js')) === '// user file\n', JSON.stringify({ left, report: ri.report }));
+      fs.unlinkSync(path.join(r, 'harness', 'lib', 'my_notes.js'));
+      I.uninstall({ target: r });
+      const st = path.join(r, '.claude', 'settings.json');
+      const allowLeft = fs.existsSync(st) ? (readJson(st).permissions || {}).allow || [] : [];
+      R.check(`[V6-files/${kind}] 그 뒤 uninstall: harness/ 사본(마커 포함) · 우리 allow 가 남지 않는다`, !fs.existsSync(path.join(r, 'harness', 'lib', 'install.js')) && !fs.existsSync(path.join(r, 'harness', '.harness-version')) && !allowLeft.some(x => /git add|harness\/cli\.js report/.test(x)),
+        JSON.stringify({ allowLeft, harness: fs.existsSync(path.join(r, 'harness')) ? fs.readdirSync(path.join(r, 'harness')) : null }));
+    }
+    // v6 모듈 지우기는 우리 사본 안에서만 — 마커 없는 남의 harness/ 를 --force 로 덮을 때는 지우지 않는다
+    const rf = mkRepo('v6-foreign');
+    write(path.join(rf, 'harness', 'lib', 'loop.js'), '// someone else\n');
+    install({ target: rf, source: SOURCE, force: true });
+    R.check('[V6-files] 남의 harness/(마커 없음)를 --force 로 덮을 때는 v6 이름의 파일도 지우지 않는다', read(path.join(rf, 'harness', 'lib', 'loop.js')) === '// someone else\n');
+  }
+
+  // ── [2026-10-29 감사] Windows: 새 판에서 하네스 파일 이름의 대소문자만 바뀌면 새 파일까지 지웠다 ──
+  {
+    const copyTree = (s, d) => { fs.mkdirSync(d, { recursive: true }); for (const e of fs.readdirSync(s, { withFileTypes: true })) { const a = path.join(s, e.name), b = path.join(d, e.name); if (e.isDirectory()) copyTree(a, b); else fs.copyFileSync(a, b); } };
+    const src = path.join(base, 'case-source', 'harness');
+    copyTree(SOURCE, src);
+    write(path.join(src, 'lib', 'CaseTest.js'), '// v1\n');
+    const rc = mkRepo('case-rename');
+    install({ target: rc, source: src });
+    fs.renameSync(path.join(src, 'lib', 'CaseTest.js'), path.join(src, 'lib', 'casetest.js'));
+    write(path.join(src, 'lib', 'casetest.js'), '// v2\n');
+    const r2 = install({ target: rc, source: src });
+    const names = fs.readdirSync(path.join(rc, 'harness', 'lib')).filter(n => /^casetest\.js$/i.test(n));
+    const m = readJson(path.join(rc, '.git', 'harness', 'install.json')).files;
+    R.check('[CASE] 대소문자만 바뀐 하네스 파일 — 새 이름 · 새 내용으로 남고 설치 기록은 created:true 하나', r2.ok === true && JSON.stringify(names) === '["casetest.js"]' && read(path.join(rc, 'harness', 'lib', 'casetest.js')) === '// v2\n'
+      && m['harness/lib/casetest.js'] && m['harness/lib/casetest.js'].created === true && !m['harness/lib/CaseTest.js'], JSON.stringify({ names, rec: m['harness/lib/casetest.js'], old: m['harness/lib/CaseTest.js'], changed: r2.changed.filter(k => /casetest/i.test(k)) }));
+    R.check('[CASE] 그 뒤 재설치는 바꿀 것이 없다', install({ target: rc, source: src }).changed.length === 0);
+  }
+
+  // ── [2026-10-29 감사] AGENTS.md 관리 블록의 끝 표지가 없으면 — 블록을 더 붙이지 않고 · 사용자 글을 지우지 않는다(install 두 번 · uninstall) ──
+  {
+    const ra = mkRepo('agents-noend');
+    const A0 = '# Rules\n\n<!-- harness:begin -->\n(old block, END line lost)\n\n## 내 규칙\nUSER-RULE-1\nUSER-RULE-2\n';
+    write(path.join(ra, 'AGENTS.md'), A0);
+    const x1 = install({ target: ra, source: SOURCE }), x2 = install({ target: ra, source: SOURCE });
+    R.check('[AGENTS-END] 끝 표지 없는 블록: 두 번 설치해도 AGENTS.md 는 그대로(블록을 더 붙이지 않음) · 건너뜀으로 알린다', read(path.join(ra, 'AGENTS.md')) === A0 && x1.skipped.some(s => s.path === 'AGENTS.md' && /끝 표지/.test(s.reason)) && x2.skipped.some(s => s.path === 'AGENTS.md'), read(path.join(ra, 'AGENTS.md')));
+    uninstall({ target: ra });
+    R.check('[AGENTS-END] uninstall 도 사용자 글을 지우지 않는다', read(path.join(ra, 'AGENTS.md')) === A0, read(path.join(ra, 'AGENTS.md')));
+    // 앞 판이 이미 블록을 하나 더 붙여 둔 모양(고아 시작 표지 + 새 블록) — 고아와 새 끝 사이의 사용자 글을 지우지 않는다
+    const A1 = A0 + '\n<!-- harness:begin -->\nNEW\n<!-- harness:end -->\n';
+    write(path.join(ra, 'AGENTS.md'), A1);
+    install({ target: ra, source: SOURCE }); uninstall({ target: ra });
+    R.check('[AGENTS-END] 고아 시작 표지 + 뒤의 온전한 블록: install · uninstall 모두 USER-RULE 을 지우지 않는다', read(path.join(ra, 'AGENTS.md')).includes('USER-RULE-2'), read(path.join(ra, 'AGENTS.md')));
+  }
+
+  // ── [2026-10-29 감사] CLAUDE.md 에 옛 템플릿 줄이 있고 @AGENTS.md 가 없으면 — 첫 설치가 둘 다 하고(멱등) uninstall 이 @AGENTS.md 를 걷는다 ──
+  {
+    for (const old of ['- 별도의 검증 단계나 검증용 서브에이전트를 두지 않는다 — 저장소 테스트 명령의 종료 코드가 판정이다.', '- 서브에이전트는 정말 독립적인 큰 일에만, 적게 쓴다.']) {
+      const rcl = mkRepo(`claude-legacy-noimport-${old.length}`);
+      write(path.join(rcl, 'CLAUDE.md'), `# P\n\n${old}\nmine\n`);
+      install({ target: rcl, source: SOURCE });
+      const c1 = read(path.join(rcl, 'CLAUDE.md'));
+      const again = install({ target: rcl, source: SOURCE });
+      uninstall({ target: rcl });
+      const c3 = read(path.join(rcl, 'CLAUDE.md'));
+      R.check(`[CLAUDE-IMPORT] 옛 줄 + @AGENTS.md 없음: 첫 설치가 옛 줄을 바꾸고 @AGENTS.md 도 넣는다 · 두 번째 설치는 무변경 · uninstall 뒤 @AGENTS.md 없음 (${old.slice(2, 14)})`,
+        /^@AGENTS\.md$/m.test(c1) && !c1.includes(old) && again.changed.length === 0 && !/@AGENTS\.md/.test(c3) && c3.includes('mine'), JSON.stringify({ c1, again: again.changed, c3 }));
+    }
+  }
+
+  // ── VS Code 설정 — worktree 폴더를 훑지 않게(사용자 값은 그대로 · 더한 것만 걷는다) ──
+  {
+    const rv = mkRepo('vscode');
+    const fresh = mkRepo('vscode-fresh');
+    const f0 = snap(fresh);
+    install({ target: fresh, source: SOURCE });
+    const vf = readJson(path.join(fresh, '.vscode', 'settings.json'));
+    R.check('[VSCODE] 없으면 만든다: 감시 · 검색 제외 · git worktree 찾기 끔 · 저장소 훑기 제외(기본값 node_modules 유지) · C/C++ · Python(Pylance 기본값 유지)',
+      vf['files.watcherExclude']['**/.harness-worktrees/**'] === true && vf['files.watcherExclude']['**/.claude/worktrees/**'] === true && vf['search.exclude']['**/.harness-worktrees/**'] === true && vf['search.exclude']['**/.claude/worktrees/**'] === true
+        && vf['git.detectWorktrees'] === false && JSON.stringify(vf['git.repositoryScanIgnoredFolders']) === '["node_modules",".harness-worktrees"]' && vf['C_Cpp.files.exclude']['**/.harness-worktrees'] === true
+        && vf['python.analysis.exclude'].includes('**/.harness-worktrees/**') && vf['python.analysis.exclude'].includes('**/node_modules'), JSON.stringify(vf));
+    R.check('[VSCODE] 두 번째 설치는 무변경', install({ target: fresh, source: SOURCE }).changed.length === 0);
+    uninstall({ target: fresh });
+    R.check('[VSCODE] uninstall: 만든 파일 · .vscode/ 가 사라져 설치 전과 같다', diffKeys(f0, snap(fresh)).length === 0, JSON.stringify(diffKeys(f0, snap(fresh))));
+    // 사용자가 정한 값(끔 · 다른 꼴 · 일부 항목)은 그대로 · 없는 것만 더한다 · CRLF · BOM · 4칸 들여쓰기 유지 · uninstall 은 바이트 그대로
+    const user = { 'editor.tabSize': 4, 'git.detectWorktrees': true, 'files.watcherExclude': { '**/.harness-worktrees/**': false, '**/dist/**': true }, 'search.exclude': 'oops', 'git.repositoryScanIgnoredFolders': ['vendor'] };
+    const V0 = '﻿' + JSON.stringify(user, null, 4).replace(/\n/g, '\r\n') + '\r\n';
+    write(path.join(rv, '.vscode', 'settings.json'), V0);
+    install({ target: rv, source: SOURCE });
+    const t = read(path.join(rv, '.vscode', 'settings.json')), v = JSON.parse(t.replace(/^﻿/, ''));
+    const rec = readJson(path.join(rv, '.git', 'harness', 'install.json')).files['.vscode/settings.json'];
+    R.check('[VSCODE] 사용자 값은 그대로(detectWorktrees true · 감시 제외 false · search.exclude 문자열) · 없는 것만(.claude/worktrees · vendor 뒤 .harness-worktrees · C/C++ · Python) · 기록에 더한 것만',
+      v['git.detectWorktrees'] === true && v['files.watcherExclude']['**/.harness-worktrees/**'] === false && v['files.watcherExclude']['**/.claude/worktrees/**'] === true && v['search.exclude'] === 'oops'
+        && JSON.stringify(v['git.repositoryScanIgnoredFolders']) === '["vendor",".harness-worktrees"]' && v['C_Cpp.files.exclude'] && v['editor.tabSize'] === 4
+        && rec && !rec.vscode_added.some(a => a.key === 'git.detectWorktrees' || a.key === 'search.exclude' || (a.key === 'files.watcherExclude' && a.sub === '**/.harness-worktrees/**')), JSON.stringify({ v, added: rec && rec.vscode_added }));
+    R.check('[VSCODE] CRLF · BOM · 4칸 들여쓰기 유지', t.charCodeAt(0) === 0xFEFF && !/[^\r]\n/.test(t) && t.includes('\r\n    "editor.tabSize"'), JSON.stringify(t.slice(0, 80)));
+    uninstall({ target: rv });
+    R.check('[VSCODE] uninstall: 원래 파일 바이트 그대로', read(path.join(rv, '.vscode', 'settings.json')) === V0, JSON.stringify(read(path.join(rv, '.vscode', 'settings.json')).slice(0, 200)));
+    // 주석 · 끝 쉼표(JSONC) — 건드리지 않고 알린다
+    const rj = mkRepo('vscode-jsonc');
+    const J0 = '{\n  // my settings\n  "editor.tabSize": 2,\n}\n';
+    write(path.join(rj, '.vscode', 'settings.json'), J0);
+    const xj = install({ target: rj, source: SOURCE });
+    R.check('[VSCODE] JSONC(주석 · 끝 쉼표)는 그대로 두고 건너뜀 · 손으로 더할 키를 알린다', read(path.join(rj, '.vscode', 'settings.json')) === J0 && xj.skipped.some(s => s.path === '.vscode/settings.json') && xj.notes.some(n => /files\.watcherExclude/.test(n) && /harness-worktrees/.test(n)), JSON.stringify({ skipped: xj.skipped, notes: xj.notes.slice(-1) }));
+  }
+
+  // ── v6 의 프로젝트 블록 키(v7 이 읽지 않음)는 알린다 ──
+  {
+    const rk = mkRepo('v6-keys');
+    write(path.join(rk, 'CLAUDE.md'), '# P\n\n```yaml\ntest_command: "npm test"\nmodel: opus\nverify_effort: high\n```\n');
+    const xk = install({ target: rk, source: SOURCE });
+    R.check('[V6-KEYS] v7 이 읽지 않는 키(model · verify_effort)를 알린다 · 읽는 키(test_command)는 말하지 않는다', xk.notes.some(n => /model · verify_effort/.test(n) && /읽지 않는다/.test(n) && !/test_command/.test(n)), JSON.stringify(xk.notes));
+  }
+
+  // ── Codex 훅: guard 매처가 MCP 도구도 본다(Claude 쪽과 같이) ──
+  {
+    const m = new RegExp(`^(?:${require('../../harness/lib/install.js').codexHooks('/x').PreToolUse[0].matcher})$`);
+    R.check('[CODEX-MCP] Codex guard 매처: 셸 도구와 mcp__ 도구(git · GitHub 쓰기)', ['Bash', 'shell', 'exec_command', 'mcp__git__git_commit', 'mcp__github__push_files'].every(x => m.test(x)) && !m.test('apply_patch'));
   }
 
   R.check('[격리] 전역 CODEX_HOME/hooks.json 은 바이트 그대로 · 다른 파일 없음', read(path.join(codexHome, 'hooks.json')) === GLOBAL_HOOKS && fs.readdirSync(codexHome).length === 1);

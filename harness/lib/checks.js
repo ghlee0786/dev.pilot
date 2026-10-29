@@ -3,7 +3,7 @@
 const fs = require('node:fs'), path = require('node:path');
 const { spawn, spawnSync } = require('node:child_process');
 
-const CHECK_TIMEOUT_MS = 15 * 60 * 1000, CAP = 256 * 1024;
+const CHECK_TIMEOUT_MS = 15 * 60 * 1000, CAP = 256 * 1024, MAX_TIMER_MS = 2 ** 31 - 1;
 const IS_WIN = process.platform === 'win32';
 
 // ── 명령 문자열 → argv ────────────────────────────────────────────────
@@ -36,8 +36,13 @@ function yamlTestCommandOf(text) {
   if (text == null) return null;
   const m = /^\s*test_command:\s*(.+?)\s*$/m.exec(text);
   if (!m) return null;
-  let v = m[1].replace(/\s+#.*$/, '').trim();
-  if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) v = v.slice(1, -1);
+  let v = m[1].trim();
+  // [2026-10-29 감사 G2 #22] 따옴표 바깥만 떼어 "node -e \"x\"" 의 \" 가 그대로 남아 명령이 깨졌다 — YAML 문자열로 푼다(yamlString 처럼).
+  //   큰따옴표: JSON 이스케이프(\" · \\) · 작은따옴표: '' → '. 따옴표 밖의 # 은 주석.
+  const dq = /^"((?:[^"\\]|\\.)*)"(?:\s+#.*)?$/.exec(v), sq = /^'((?:[^']|'')*)'(?:\s+#.*)?$/.exec(v);
+  if (dq) { try { v = JSON.parse(`"${dq[1]}"`); } catch { v = dq[1]; } }
+  else if (sq) v = sq[1].replace(/''/g, "'");
+  else v = v.replace(/\s+#.*$/, '').trim();
   return v && !/^(none|null|~|없음)$/i.test(v) ? v : null;
 }
 // 프로젝트 블록(AGENTS.md · CLAUDE.md 의 yaml)의 숫자 값 — 예: check_timeout_min: 45
@@ -65,7 +70,7 @@ function yamlString(root, name) {
   return null;
 }
 // 프로젝트 블록의 문자열 목록 — 흐름형 `name: ["a", 'b', c]` 또는 블록형 `name:` 다음 줄들의 `- a`. 없으면 null.
-//   예: worker_allow: ["Bash(docker build:*)"]. 따옴표 안의 쉼표·괄호는 값의 일부다.
+//   예: owns: ["src/a, b/*", 'docs/(x)']. 따옴표 안의 쉼표·괄호는 값의 일부다.
 function yamlListOf(text, name) {
   if (text == null) return null;
   const esc = String(name).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -124,7 +129,7 @@ function discover(root, userChecks, projectRoot) {
   return { source: 'none', commands: [] };
 }
 
-// 워커가 실행해도 되는 프로그램: 검사 명령의 argv[0] + 저장소 종류.
+// 검사 명령의 프로그램 이름(argv[0] · 셸 문자열이면 첫 단어) — 경로와 확장자(.exe · .cmd · .bat)를 뗀다.
 function programName(argv) {
   const first = isShellString(argv) ? splitCommand(argv[0].split(SHELL_OPS)[0])[0] : argv[0];
   if (!first) return null;
@@ -143,7 +148,7 @@ function lintArgv(cmd, files) {
   if (!(files || []).length) return null;
   return [c.replace(/{files}/g, files.map(shq).join(' '))];
 }
-// [자동 이슈 #38] 작업에 기록된 린트를 프로젝트 블록의 지금 lint_command 에 맞춘다(resume · accept) — 작업 뒤 {files} 로 바꿔도
+// [자동 이슈 #38] 작업에 기록된 린트를 프로젝트 블록의 지금 lint_command 에 맞춘다(accept) — 작업 뒤 {files} 로 바꿔도
 //   시작 때 값으로 계속 거절했다. dirs 순서대로 처음 찾은 값을 쓴다. 바뀌었으면 { from, to }, 그대로면 null.
 function syncLint(task, dirs) {
   let now = null;
@@ -179,10 +184,12 @@ function commandsForJudge(root, checks) {
 }
 
 // ── 요약 파싱 ─────────────────────────────────────────────────────────
+const ANSI = /\x1b\[[0-9;?]*[A-Za-z]/g;
 function lastNum(s, re) { let m, v = null; const g = new RegExp(re.source, 'gim'); while ((m = g.exec(s))) v = Number(m[1]); return v; }
-// node:test(tap `# pass` · spec `ℹ pass`) · `결과: N PASS / M FAIL` · pytest `== 2 failed, 3 passed in 0.1s ==` · dotnet `Failed: 1, Passed: 3` · jest/vitest `Tests: 1 failed, 3 passed`.
+// node:test(tap `# pass` · spec `ℹ pass`) · `결과: N PASS / M FAIL` · pytest `== 2 failed, 3 passed in 0.1s ==` · dotnet `Failed: 1, Passed: 3` · jest `Tests: 1 failed, 3 passed` · vitest `Tests  1 failed | 3 passed (4)`.
+//   [2026-10-29 감사 G2 #16] FORCE_COLOR · pytest --color=yes 의 색 코드 때문에 요약을 못 읽어 원래 빨간 저장소의 accept 가 모두 "나빠짐" 이 됐다 — 색을 먼저 벗긴다.
 function parseSummary(text) {
-  const s = String(text || '');
+  const s = String(text || '').replace(ANSI, '');
   const p = lastNum(s, /^[ \t]*(?:#|ℹ)[ \t]*pass[ \t]+(\d+)[ \t]*\r?$/), f = lastNum(s, /^[ \t]*(?:#|ℹ)[ \t]*fail[ \t]+(\d+)[ \t]*\r?$/);
   if (p != null || f != null) return { found: true, pass: p || 0, fail: f || 0 };
   const kr = [...s.matchAll(/결과:\s*(\d+)\s*PASS\s*\/\s*(\d+)\s*FAIL/g)].pop();
@@ -197,7 +204,7 @@ function parseSummary(text) {
   if (dn.length) return { found: true, pass: dn.reduce((a, m) => a + Number(m[2]), 0), fail: dn.reduce((a, m) => a + Number(m[1]), 0) };
   const mtp = [...s.matchAll(/^\s*Test summary: total: \d+, failed: (\d+), succeeded: (\d+)/gm)].pop();   // dotnet 10 Microsoft.Testing.Platform
   if (mtp) return { found: true, pass: Number(mtp[2]), fail: Number(mtp[1]) };
-  const js = [...s.matchAll(/^\s*Tests:\s+(.*)$/gm)].pop();
+  const js = [...s.matchAll(/^\s*Tests(?::\s+|\s{2,})(.*)$/gm)].pop();   // vitest 는 콜론 없이 "      Tests  1 failed | 1 passed (2)"(G2 #18) — "Test Files" 줄은 아니다
   if (js && /\b(passed|failed)\b/.test(js[1])) { const n = w => { const m = new RegExp(`(\\d+) ${w}`).exec(js[1]); return m ? Number(m[1]) : 0; }; return { found: true, pass: n('passed'), fail: n('failed') }; }
   const lg = require('./langs').parseSummary(s);   // cargo · go · ctest · maven(언어 팩)
   if (lg) return lg;
@@ -253,7 +260,8 @@ function runCheck(cwd, argv, o) {
     };
     try { child = spawn(spec.cmd, spec.args, { cwd, env: { ...childEnv(opt.bin), ...require('./proc').isolationEnv(cwd) }, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, shell: spec.shell, detached: !IS_WIN }); }
     catch (e) { return finish(null, e.message); }
-    timer = setTimeout(() => stop('timeout'), timeoutMs);
+    // [2026-10-29 다른 세션 실측] Node 타이머는 2^31-1ms(약 24.8일)를 넘으면 1ms 로 바뀐다 — 상한을 크게 풀면(check_timeout_min 100000) 검사가 곧바로 "시간 초과" 로 끝났다. 한도로 자른다.
+    timer = setTimeout(() => stop('timeout'), Math.min(timeoutMs, MAX_TIMER_MS));
     arm();
     child.stdout.on('data', push); child.stderr.on('data', push);
     child.on('error', e => finish(null, e.message));
@@ -303,7 +311,9 @@ async function runJudged(cwd, commands, o) {
 //   [2026-10-20 실측 · 음성 비서 Python 저장소] 오디오 장치를 기다리는 테스트 하나가 2% 지점에서 영원히 멈춰, 전체 pytest 가 매번 15분 상한에 걸렸다 —
 //   찾은 검사는 버려져 검사 없이 돌았고, 사용자가 준 검사였다면 작업이 끝날 수 없었다. 뺀 테스트는 보고서에 남긴다(조용히 빼지 않는다).
 //   → { argv, excluded: [테스트], result } · 떼어 낼 수 없으면 null
+//   o.serialRoot: 검사 줄(checks)을 서서 돈다(G2 #9 — 기준선의 떼어 내기가 다른 검사와 겹쳤다).
 async function isolateHangs(cwd, argv, o) {
+  if (o && o.serialRoot) return inQueue(o, q => isolateHangs(cwd, argv, q));
   const hang = (o && o.hang) || require('./langs').hangFor(argv);   // o.hang: 테스트가 끼우는 가짜 러너
   if (!hang) return null;
   let cur = argv.slice();
@@ -320,10 +330,10 @@ async function isolateHangs(cwd, argv, o) {
 }
 // ── 실패한 테스트 이름 ────────────────────────────────────────────────
 // [2026-10-25 C++ 저장소 실측] 실패 출력의 앞 1,500자가 vcpkg 잡음뿐이라 어느 테스트가 실패했는지 보고에 없었다 — 러너별 실패 줄에서 이름만 뽑는다.
-//   ctest(FAILED 목록 · ***Failed 줄) · GoogleTest · pytest · dotnet test · node(tap · spec ✖) · 이 저장소의 ❌ · jest ✕ · go. 중복 제거 · 최대 50개.
-const ANSI = /\x1b\[[0-9;?]*[A-Za-z]/g;
+//   ctest(FAILED 목록 · ***Failed 줄) · GoogleTest · pytest · dotnet test · node(tap · spec ✖) · 이 저장소의 ❌ · jest ✕(Windows 는 ×) · vitest × · go. 중복 제거 · 최대 50개.
+//   [2026-10-29 감사 G2 #19] pytest 파라미터 id 에 공백이 있으면(test_p[a b]) 이름이 잘렸다 — 요약 줄의 " - 메시지" · 결과 단어 앞까지를 이름으로.
 const FAILED_MAX = 50;
-const dropMs = s => s.replace(/\s*\(\d+(?:\.\d+)?\s*m?s\)\s*$/, '').trim();
+const dropMs = s => s.replace(/\s*\(\d+(?:\.\d+)?\s*m?s\)\s*$/, '').replace(/\s+\d+(?:\.\d+)?\s*m?s$/, '').trim();   // jest "(3 ms)" · vitest "3ms"
 function failedTests(text) {
   const out = [], seen = new Set();
   const add = n => { n = String(n || '').trim().slice(0, 200); if (n && !seen.has(n) && out.length < FAILED_MAX) { seen.add(n); out.push(n); } };
@@ -334,12 +344,12 @@ function failedTests(text) {
     if (ctestList) { if ((m = /^\s*\d+\s+-\s+(.+?)\s+\([^()]*\)\s*$/.exec(line))) { add(m[1]); continue; } ctestList = false; }
     if ((m = /\bTest\s+#\d+:\s+(\S+?)\s*\.*\s*\*{3}(?:Failed|Timeout|Exception|Not Run)/.exec(line))) add(m[1]);
     else if ((m = /^\s*\[\s+FAILED\s+\]\s+(\S+)/.exec(line))) { const n = m[1].replace(/,$/, ''); if (/^[A-Za-z_]/.test(n) && n.includes('.')) add(n); }
-    else if ((m = /^(?:FAILED|ERROR)\s+(\S+::\S+)/.exec(line)) || (m = /^(\S+::\S+)\s+(?:FAILED|ERROR)\b/.exec(line))) add(m[1]);
+    else if ((m = /^(?:FAILED|ERROR)\s+(\S+::.+?)(?:\s+-\s.*)?\s*$/.exec(line)) || (m = /^(\S+::.+?)\s+(?:FAILED|ERROR)\b/.exec(line))) add(m[1]);
     else if ((m = /^\s*(?:Failed|실패)\s+(\S.*?)\s+\[[^\]]*\]\s*$/.exec(line))) add(m[1]);
     else if ((m = /^\s*not ok \d+\s*-?\s*(.+?)\s*$/.exec(line))) { if (!/#\s*(TODO|SKIP)\b/i.test(m[1])) add(m[1].replace(/\s+#.*$/, '')); }
     else if ((m = /^\s*✖\s+(.+?)\s*$/.exec(line))) { if (!/^failing tests:?$/i.test(m[1])) add(dropMs(m[1])); }
     else if ((m = /^\s*❌\s+(.+?)\s*$/.exec(line))) add(m[1].split(' — ')[0].split(/\s{2,}/)[0]);
-    else if ((m = /^\s*✕\s+(.+?)\s*$/.exec(line))) add(dropMs(m[1]));
+    else if ((m = /^\s*[✕×]\s+(.+?)\s*$/.exec(line))) add(dropMs(m[1]));
     else if ((m = /^\s*--- FAIL:\s+(\S+)/.exec(line))) add(m[1]);
   }
   return out;
@@ -370,11 +380,21 @@ function worseThan(r, b) {
   if (exitBad(r) && !exitBad(b)) return true;
   return r.fail > b.fail || r.pass < b.pass || (r.pass + r.fail) < (b.pass + b.fail);
 }
+// [2026-10-29 감사 G2 #3] 실패 수만 비교해 레인이 Y 를 고치고 X 를 깨뜨리면(수는 같다) not_worse 로 합쳐졌다 — 양쪽에 실패한 시험 이름이 있으면
+//   기준선에 없던 이름이 새로 실패했는지도 본다. 한쪽에 이름이 없거나 목록이 상한(50)에 닿아 잘렸으면 이름으로 판정하지 않는다(수로만).
+function newlyFailing(current, baseline) {
+  const c = current.failed_tests || [], b = (baseline && baseline.failed_tests) || [];
+  if (!c.length || !b.length || c.length >= FAILED_MAX || b.length >= FAILED_MAX) return [];
+  const had = new Set(b);
+  return c.filter(n => !had.has(n));
+}
 function judge(current, baseline, opts) {
   if (current.ok) return { verdict: 'pass', why: 'all checks pass' };
   const allow = !opts || opts.notWorse !== false;
   if (allow && baseline && !baseline.ok && baseline.results && baseline.results.length === current.results.length) {
     const worse = current.results.some((r, i) => worseThan(r, baseline.results[i]));
+    const fresh = worse ? [] : newlyFailing(current, baseline);
+    if (fresh.length) return { verdict: 'fail', why: `${current.fail} failing — newly failing since before the task: ${fresh.slice(0, 10).join(', ')}`, newly_failing: fresh };
     if (!worse) return { verdict: 'not_worse', why: `baseline was red — the checks were already failing before the task (baseline ${baseline.pass} pass / ${baseline.fail} fail); now ${current.pass} pass / ${current.fail} fail — not worse, but the checks do not prove this work` };
   }
   return { verdict: 'fail', why: `${current.fail} failing` };
@@ -418,5 +438,5 @@ function failureExcerpt(judged) {
 }
 
 module.exports = { lintArgv, syncLint, yamlNumber, yamlString, yamlList, yamlListOf, spawnSpec, CHECK_TIMEOUT_MS, splitCommand, display, isShellString, discover, repoKinds, programName, parseSummary,
-  runCheck, runAll, runJudged, serialChecksOn, failedTests, isolateHangs, STALL_MS, summarize, brief, judge, worseThan, signature, firstAssertion, failureExcerpt, clip, killTree, childEnv,
+  runCheck, runAll, runJudged, inQueue, serialChecksOn, failedTests, isolateHangs, STALL_MS, summarize, brief, judge, worseThan, signature, firstAssertion, failureExcerpt, clip, killTree, childEnv,
   definitions, commandsForJudge, isNpmTest, npmTestScript, yamlTestCommandOf };

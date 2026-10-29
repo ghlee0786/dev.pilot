@@ -28,11 +28,13 @@ const PACKS = [
     hang: {
       applies: argv => (/(^|[\\/])py\.?test(\.exe)?$/i.test(argv[0]) || (/(^|[\\/])(python[\d.]*|py)(\.exe)?$/i.test(argv[0]) && argv[1] === '-m' && argv[2] === 'pytest'))
         && !argv.some(a => /^(-n|--numprocesses|--dist)(=|$)|^-n\d/.test(a)),
+      //   [2026-10-29 감사 G2 #17] -q 의 끝 줄은 파일 이름 없이 "." 뿐이라 짚지 못했다 · -q 위에 -v 를 더하면 서로 지워 기본 출력이 된다 —
+      //   진행 점 줄이면 -q 를 빼고 -v 로. 공백이 든 파라미터 id(test_p[a b])도 이름 그대로. (addopts 의 -q 는 argv 에 없어 여기서 알 수 없다.)
       next: (argv, output) => {
         const lines = String(output || '').split(/\r?\n/).map(l => l.replace(/\s+$/, '')).filter(Boolean), last = lines[lines.length - 1] || '';
-        const id = /^(\S+\.py::\S+)$/.exec(last);
-        if (id) return { argv: [...argv, '--deselect', id[1]], exclude: id[1] };
-        if (/^\S+\.py [.FEsxX]*$/.test(last) && !argv.some(a => /^(-v+|--verbose)$/.test(a))) return { argv: [...argv, '-v'] };
+        const id = /^(\S+\.py::.+)$/.exec(last);
+        if (id && !/\s(PASSED|FAILED|SKIPPED|ERROR|XFAIL|XPASS)(\s+\[\s*\d+%\])?$/.test(last)) return { argv: [...argv, '--deselect', id[1]], exclude: id[1] };
+        if (/^(\S+\.py )?[.FEsxX]+(\s+\[\s*\d+%\])?$|^\S+\.py ?$/.test(last) && !argv.some(a => /^(-v+|--verbose)$/.test(a))) return { argv: [...argv.filter(a => !/^(-q+|--quiet)$/.test(a)), '-v'] };
         return null;
       } } },
   { id: 'dotnet',
@@ -75,7 +77,9 @@ function testCommand(root) {
 // 이 검사 명령(argv)의 멈춘 테스트를 떼어 낼 줄 아는 팩 — 셸 문자열(argv 길이 1 · 공백)은 고칠 수 없으니 없음
 const hangFor = argv => (Array.isArray(argv) && argv.length && !(argv.length === 1 && /\s/.test(argv[0])) ? (PACKS.find(p => p.hang && p.hang.applies(argv)) || {}).hang || null : null);
 
-// 테스트 요약 — 하네스 공용 형식 다음으로 언어별 러너(cargo · go · ctest · maven/surefire)
+// 테스트 요약 — 하네스 공용 형식 다음으로 언어별 러너(cargo · go · ctest · maven/surefire · GoogleTest 실행 파일)
+//   [2026-10-29 감사 G2 #14 · #18] go 의 "FAIL pkg [build failed]"(시간 표기 없음)를 세지 않아 컴파일 안 되는 패키지가 not_worse 로 합쳐졌다 ·
+//   gtest 실행 파일을 직접 준 검사는 요약을 못 읽어 빨간 기준선에서 not_worse 가 나올 수 없었다.
 function parseSummary(s) {
   const cargo = [...s.matchAll(/test result: \w+\. (\d+) passed; (\d+) failed/g)];
   if (cargo.length) return { found: true, pass: cargo.reduce((a, m) => a + Number(m[1]), 0), fail: cargo.reduce((a, m) => a + Number(m[2]), 0) };
@@ -83,7 +87,9 @@ function parseSummary(s) {
   if (ctest) return { found: true, pass: Number(ctest[3]) - Number(ctest[2]), fail: Number(ctest[2]) };
   const mvn = [...s.matchAll(/Tests run: (\d+), Failures: (\d+), Errors: (\d+), Skipped: (\d+)\s*$/gm)].pop();
   if (mvn) { const run = Number(mvn[1]), f = Number(mvn[2]) + Number(mvn[3]); return { found: true, pass: run - f - Number(mvn[4]), fail: f }; }
-  const goOk = [...s.matchAll(/^ok\s+\S+/gm)].length, goFail = [...s.matchAll(/^(FAIL\s+\S+\s+[\d.]+s|--- FAIL:)/gm)].length;
+  const gtP = [...s.matchAll(/^\[\s+PASSED\s+\]\s+(\d+)\s+tests?\b/gm)], gtF = [...s.matchAll(/^\[\s+FAILED\s+\]\s+(\d+)\s+tests?,\s+listed below/gm)];
+  if (gtP.length || gtF.length) return { found: true, pass: gtP.reduce((a, m) => a + Number(m[1]), 0), fail: gtF.reduce((a, m) => a + Number(m[1]), 0) };
+  const goOk = [...s.matchAll(/^ok\s+\S+/gm)].length, goFail = [...s.matchAll(/^(FAIL\s+\S+\s+([\d.]+s|\[(build|setup) failed\])|--- FAIL:)/gm)].length;
   if (goOk || goFail) return { found: true, pass: goOk, fail: goFail };
   return null;
 }

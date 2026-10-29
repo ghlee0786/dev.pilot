@@ -283,10 +283,16 @@ function removeWorktree(root, wt, o) {
 }
 
 // Windows: 긴 경로(MAX_PATH 초과) · 읽기 전용이 섞인 폴더를 rd /s /q "\\?\…" 로 지운다 → 지웠으면 true. 내용이 브랜치에 있는(깨끗했던) worktree 에만 쓴다.
+//   [감사 2026-10-29] cmd 는 따옴표 밖 '&' 를 명령 구분자로 읽는다 — 'm&s' 같은 경로가 잘려 형제 폴더 'm' 을 지웠다. 경로를 따옴표로 감싸
+//   그대로 넘기고, 따옴표 안에서도 펼쳐지는 '%' 가 든 경로는 cmd 대신 fs.rmSync(Node 가 긴 경로 · 읽기 전용을 다룬다)로 지운다.
 function rdTree(dir, o) {
   if (!fs.existsSync(dir)) return true;
   if (process.platform !== 'win32') return false;
-  try { ((o && o.rd) || (p => spawnSync('cmd.exe', ['/d', '/c', 'rd', '/s', '/q', `\\\\?\\${path.resolve(p)}`], { windowsHide: true, timeout: 120000 })))(dir); } catch { /* 남으면 아래 */ }
+  const full = path.resolve(dir);
+  const rd = (o && o.rd) || (p => /[%"]/.test(p)
+    ? fs.rmSync(p, { recursive: true, force: true, maxRetries: 3, retryDelay: 200 })
+    : spawnSync('cmd.exe', ['/d', '/s', '/c', `"rd /s /q "\\\\?\\${p}""`], { windowsHide: true, windowsVerbatimArguments: true, timeout: 120000 }));
+  try { rd(full); } catch { /* 남으면 아래 */ }
   return !fs.existsSync(dir);
 }
 // 비어 있는(하위 폴더도 비어 있는) 폴더만 지운다 → 지웠으면 true. 파일이 하나라도 있으면 건드리지 않는다.
@@ -412,8 +418,11 @@ function procsIn(dir) {
   const hit = text => { const t = text.toLowerCase(); return variants.some(v => { for (let i = t.indexOf(v); i >= 0; i = t.indexOf(v, i + 1)) { const c = t[i + v.length]; if (c === undefined || /[\\/"'\s]/.test(c)) return true; } return false; }); };
   return rows.filter(x => x.pid && !self.has(x.pid) && hit(x.text)).map(({ pid, name }) => ({ pid, name }));
 }
+// 사용자가 연 편집기 · 탐색기 · 터미널 · 에이전트 세션 — 폴더를 붙잡아도 끝내지 않는다. [감사 2026-10-29] 트리째(/T /F) 끝내면
+//   그 창의 저장 안 된 편집 · 확장 호스트 안의 세션 · 터미널까지 잃는다. 못 비운 자리는 useAltWorktree 가 옆 경로로 간다.
+const USER_APPS = /^(code|code - insiders|cursor|windsurf|devenv|rider64|rider|idea64|idea|pycharm64|webstorm64|clion64|goland64|explorer|finder|windowsterminal|wt|openconsole|conhost|powershell|pwsh|cmd|bash|zsh|sh|claude|codex)(\.exe)?$/i;
 function killProcsIn(dir) {
-  const found = procsIn(dir);
+  const found = procsIn(dir).filter(p => !USER_APPS.test(p.name || ''));
   for (const p of found) require('./proc').killTree(p.pid);
   return found;
 }

@@ -164,9 +164,14 @@ const parents = (cwd, ref) => git(cwd, ['rev-list', '--parents', '-n', '1', ref]
     const headM = git(Pm.wt, ['rev-parse', 'HEAD']), mainM = git(M.dir, ['rev-parse', 'main']);
     const am = await I.accept({ ...quiet, root: M.dir, id: lm.id });
     R.check('[LA-20] (#61) 커밋 안 된 추적 파일 삭제 25개 → 커밋하지 않고 거부(되살리는 법 안내) · 칸 브랜치 · main 그대로',
-      am.status !== 'accepted' && /missing 25 tracked file/.test(am.reason || '') && /checkout HEAD -- \./.test(am.reason || '') && git(Pm.wt, ['rev-parse', 'HEAD']) === headM && git(M.dir, ['rev-parse', 'main']) === mainM,
+      am.status !== 'accepted' && /missing 25 tracked file/.test(am.reason || '') && /restore --source=HEAD --staged --worktree -- many\//.test(am.reason || '') && git(Pm.wt, ['rev-parse', 'HEAD']) === headM && git(M.dir, ['rev-parse', 'main']) === mainM,
       `${am.status} ${am.reason}`);
-    git(Pm.wt, ['checkout', '-q', 'HEAD', '--', '.']);
+    // [2026-10-29 감사 G2 #6] 안내한 복구 명령은 guard 가 막지 않아야 한다(예전 안내 `checkout HEAD -- .` 은 "작업 트리 전체" 로 막혔다)
+    const hint = (/\((git -C .*?)\)/.exec(am.reason || '') || [])[1] || '';
+    const GD = require('../../harness/hooks/guard');
+    const blocked = hint ? GD.decide({ hook_event_name: 'PreToolUse', session_id: 'g', cwd: M.dir, tool_name: 'Bash', tool_input: { command: hint } }, 'claude') : 'no hint';
+    R.check('[LA-20b] (#6) 대량 삭제 거부의 복구 안내는 guard 가 막지 않는 명령이다(사라진 경로만 되살린다)', !!hint && !blocked, JSON.stringify({ hint, blocked }));
+    git(Pm.wt, hint ? hint.replace(/^git -C "[^"]+" /, '').split(/\s+/) : ['checkout', '-q', 'HEAD', '--', '.']);   // 안내대로 되살린다
     const am2 = await I.accept({ ...quiet, root: M.dir, id: lm.id });
     R.check('[LA-20] 되살린 뒤 다시 accept 하면 받아들인다', am2.status === 'accepted', `${am2.status} ${am2.reason}`);
 

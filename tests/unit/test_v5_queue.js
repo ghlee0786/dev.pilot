@@ -125,6 +125,35 @@ const child = (repo, env) => {
     if (after) after.release();
     await pa;
     R.check('[Q-09] 풀면 남는 것이 없다', tickets(repo3).length === 0 && !fs.existsSync(S.lockDir(repo3, 'checks')));
+
+    // ── [2026-10-29 감사] 강제 종료된 accept 의 번호표 · 잠금 + 그 pid 를 다른(산) 프로세스가 다시 받음 — 줄이 영영 막히면 안 된다 ──
+    {
+      const repo4 = mkRepo('q4');
+      const spawnedAt = Date.now();
+      const other = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { stdio: 'ignore', windowsHide: true }); kids.push(other);
+      await wait(300);
+      const old = Date.now() - 3 * 86400000, oldIso = new Date(old).toISOString();
+      fs.mkdirSync(qdir(repo4), { recursive: true });
+      fs.writeFileSync(path.join(qdir(repo4), `1-${String(old).padStart(15, '0')}-${String(other.pid).padStart(10, '0')}-000001.json`), JSON.stringify({ pid: other.pid, host: os.hostname(), at: oldIso, started_at: oldIso, priority: 1, label: 'accept t-old' }));
+      fs.mkdirSync(S.lockDir(repo4, 'checks'), { recursive: true });
+      fs.writeFileSync(path.join(S.lockDir(repo4, 'checks'), 'owner.json'), JSON.stringify({ pid: other.pid, host: os.hostname(), at: oldIso, started_at: oldIso, token: 'deadbeef' }));
+      // 시작 시각 기록이 없는 옛 판의 잠금도 — 신호가 사흘 멈췄으면 죽은 것
+      fs.mkdirSync(S.lockDir(repo4, 'merge'), { recursive: true });
+      fs.writeFileSync(path.join(S.lockDir(repo4, 'merge'), 'owner.json'), JSON.stringify({ pid: other.pid, host: os.hostname(), at: oldIso, token: 'oldmerge' }));
+      const removed4 = S.removeDeadLocks(repo4);
+      const t0 = Date.now();
+      let got4 = null; const p4 = S.acquireQueued(repo4, 'checks', { priority: 0, pollMs: 50 }).then(h => { got4 = h; });
+      await until(() => got4, 8000, 'acquire past the reused-pid ghost');
+      const ms = Date.now() - t0, aliveStill = other.exitCode == null;
+      R.check('[Q-10] 재사용된 pid 의 유령 잠금 · 번호표(사흘 전 · 시작 시각 다름) — 산 무관 프로세스가 있어도 곧바로 치우고 잡는다 · 옛 기록(시작 시각 없음)도 신호 나이로',
+        !!got4 && aliveStill && ms < 6000 && removed4.includes('checks') && removed4.includes('merge') && !S.queueOf(repo4, 'checks').some(x => x.label === 'accept t-old'),
+        JSON.stringify({ got: !!got4, ms, aliveStill, removed4, q: S.queueOf(repo4, 'checks') }));
+      if (!got4) { if (process.platform === 'win32') spawnSync('taskkill', ['/PID', String(other.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true }); else other.kill('SIGKILL'); }
+      await p4;
+      got4.release();
+      R.check('[Q-10] 새 잠금 · 번호표 기록에는 이 프로세스의 시작 시각(started_at)이 있다 — 산 주인은 그대로 산 것',
+        (() => { const h = S.acquire(repo4, 'x'); const ok = !!S.lockOwner(repo4, 'x').started_at && S.ownerAlive(S.lockOwner(repo4, 'x')) && S.ownerAlive({ pid: other.pid, host: os.hostname(), at: new Date().toISOString(), started_at: new Date(spawnedAt).toISOString() }); h.release(); return ok; })());
+    }
   } catch (e) { R.check('예외 없이 끝난다', false, String(e && e.stack || e).slice(0, 800)); }
   finally {
     for (const k of kids) { try { if (k.exitCode == null) { if (process.platform === 'win32') spawnSync('taskkill', ['/PID', String(k.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true }); else k.kill('SIGKILL'); } } catch { /* 끝남 */ } }

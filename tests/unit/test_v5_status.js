@@ -56,10 +56,11 @@ delete process.env.HARNESS_AGENTS_CMD; delete process.env.HARNESS_AGENTS;
     R.check('[SS-01] 작업 목록: 상태 · 브랜치 · 바뀐 파일 수(.harness 제외) · 비용', ta && ta.status === 'open' && ta.mode === 'light' && ta.branch === `harness/${a.id}` && ta.files_changed === 2 && ta.cost_usd === 0.2 && ta.branch_exists, JSON.stringify(ta));
     const txt = St.formatStatus(s1);
     R.check('[SS-01] 사람용 출력에 겹침 경고', /overlaps/.test(txt) && txt.includes(`! shared.txt — `), txt);
-    R.check('[SS-09] 사람용 출력에 작업 전체의 누적 비용', /spent across 3 tasks: \$0\.60/.test(txt), txt.split('\n').filter(l => /spent/.test(l)).join(' | '));
+    // [2026-10-29 감사] 레인에는 모델 비용을 쓰는 하네스 프로세스가 없다 — 작업마다의 $0.00 · 누적 비용 줄은 레인에 보이지 않는다
+    R.check('[SS-09] 레인(light)에는 비용 칸 · 누적 비용 줄이 없다', !/\$\d/.test(txt) && !/spent/.test(txt), txt.split('\n').filter(l => /\$|spent/.test(l)).join(' | '));
     write(path.join(repo, 'AGENTS.md'), '```yaml\nreply_language: "Korean"\n```\n');
     const txtKo = St.formatStatus(St.status({ root: repo }));
-    R.check('[SS-10] 저장소의 작업 언어가 Korean 이면 status 도 한국어', /^저장소: /m.test(txtKo) && /작업 \(3\)/.test(txtKo) && /누적 비용: 작업 3개 · \$0\.60/.test(txtKo) && /겹침/.test(txtKo), txtKo);
+    R.check('[SS-10] 저장소의 작업 언어가 Korean 이면 status 도 한국어(레인에는 비용 줄 없음)', /^저장소: /m.test(txtKo) && /작업 \(3\)/.test(txtKo) && !/누적 비용/.test(txtKo) && !/\$\d/.test(txtKo) && /겹침/.test(txtKo), txtKo);
     fs.rmSync(path.join(repo, 'AGENTS.md'));
 
     // ── 주인 생존 ─────────────────────────────────────────────────────
@@ -159,6 +160,17 @@ delete process.env.HARNESS_AGENTS_CMD; delete process.env.HARNESS_AGENTS;
         !fs.existsSync(tpb.wt) && !fs.existsSync(`${tpb.wt}-2`) && fs.readdirSync(tpb.dir).some(n => n.startsWith('leftover-')), JSON.stringify({ removed: g12.removed, kept: g12.kept }));
     }
 
+    // ── [2026-10-29 설치 전 점검] 끝나지 않은 v6 작업(주인이 죽은 running · failed …)은 이어 갈 작업이다 — gc 가 worktree · 자원을 건드리지 않는다 ──
+    {
+      const v = await goEdit(repo, { 'v6.txt': 'v6\n' }, 'v6 task');
+      const tv = S.readTask(repo, v.id); delete tv.mode; tv.status = 'failed'; tv.owner = { pid: deadPid(), host: os.hostname() }; S.writeTask(repo, tv);
+      const wv = S.taskPaths(repo, v.id).wt;
+      const g13 = St.gc({ root: repo });
+      const tv2 = S.readTask(repo, v.id);
+      R.check('[SS-17] gc: 끝나지 않은 v6 작업의 깨끗한 worktree 는 남긴다(이유에 start --from) · 자원 회수도 하지 않는다',
+        fs.existsSync(wv) && g13.kept.some(k => k.id === v.id && /start --from/.test(k.why)) && !(tv2.resources && tv2.resources.release_at), JSON.stringify({ kept: g13.kept.filter(k => k.id === v.id), res: tv2.resources }));
+    }
+
     // ── [2026-10-15 자동 이슈 #6] 세션이 끊긴 뒤 task.json 이 공백만 남아 status 에서 작업이 조용히 사라졌다 ──
     const tf = S.taskPaths(repo, c.id).taskFile;
     const tc6 = S.readTask(repo, c.id); tc6.reason = 'second write'; S.writeTask(repo, tc6);   // 앞선 판이 .bak 에 남는다
@@ -210,6 +222,42 @@ delete process.env.HARNESS_AGENTS_CMD; delete process.env.HARNESS_AGENTS;
       const cliB = spawnSync(process.execPath, [CLI, 'status', '--json', '--root', br], { encoding: 'utf8', windowsHide: true, timeout: 30000 });
       let jb = null; try { jb = JSON.parse(cliB.stdout); } catch { /* 없음 */ }
       R.check('[SS-13] CLI status --json 에 board(더한 필드) · 기존 필드 그대로', cliB.status === 0 && jb && jb.board && Array.isArray(jb.board.sessions) && Array.isArray(jb.board.lanes) && Array.isArray(jb.tasks) && jb.uncommitted && jb.tasks.some(t => t.id === did && t.stale === true && t.mode === null) && jb.tasks.some(t => t.id === lid && t.mode === 'light'), `${cliB.status} ${cliB.stderr.slice(-300)}`);
+    }
+
+    // ── [2026-10-29 감사] 끝난 작업마다 git 을 띄우지 않는다 · 끝난 작업은 최근 것만 · v7 이전 작업의 비용만 보인다 ─
+    {
+      const mr = path.join(base, 'many');
+      fs.mkdirSync(mr);
+      git(mr, ['init', '-q', '-b', 'main']); git(mr, ['config', 'user.name', 't']); git(mr, ['config', 'user.email', 't@example.invalid']); git(mr, ['config', 'commit.gpgsign', 'false']);
+      write(path.join(mr, 'a.txt'), 'a\n'); git(mr, ['add', '-A']); git(mr, ['commit', '-qm', 'init']);
+      Ln.start({ ...quiet, root: mr, goal: 'one lane' });
+      for (let i = 0; i < 40; i++) { const id = `t-20261001-1000${String(i).padStart(2, '0')}-a${String(i).padStart(3, '0')}`; S.writeTask(mr, { ...S.newTask({ id, goal: `old ${i}`, status: 'accepted' }), branch: `harness/${id}`, updated_at: new Date(Date.now() - i * 60000).toISOString() }); }
+      const v6id = 't-20261001-090000-beef';
+      S.writeTask(mr, { ...S.newTask({ id: v6id, goal: 'v6 worker', status: 'done', mode: 'thin' }), branch: `harness/${v6id}`, spent: { cost_usd: 1.5 } });
+      const G = require('../../harness/lib/git'), orig = G.branchExists;
+      let calls = 0; G.branchExists = (...a) => { calls++; return orig(...a); };
+      let sm; try { sm = St.status({ root: mr }); } finally { G.branchExists = orig; }
+      const finishedShown = sm.tasks.filter(t => t.status === 'accepted').length, tm = St.formatStatus(sm);
+      R.check('[SS-14] status 는 작업마다 브랜치 확인 프로세스를 띄우지 않는다(작업 42개에 branchExists ≤ 2회)', calls <= 2, `branchExists ${calls}회`);
+      R.check('[SS-14] 끝난(accepted) 작업은 최근 10개만 · 나머지는 수로 알린다', finishedShown === 10 && sm.finished_hidden === 30 && /30 more finished/.test(tm), `${finishedShown} ${sm.finished_hidden}`);
+      R.check('[SS-16] v7 이전 작업이 기록한 비용(>0)만 보인다 — 레인 줄에는 $ 가 없다', /beef  done.*\$1\.50/.test(tm) && /spent by pre-v7 unattended tasks: \$1\.50/.test(tm) && !tm.split('\n').some(l => /one lane/.test(l) && /\$/.test(l)), tm.split('\n').filter(l => /\$/.test(l)).join(' | '));
+    }
+
+    // ── [감사] 옆 경로(<id>-2 · task.worktree_alt)에서 일하는 열린 레인은 gc 가 지우지 않는다 ─
+    {
+      const ar = path.join(base, 'altrepo');
+      fs.mkdirSync(ar);
+      git(ar, ['init', '-q', '-b', 'main']); git(ar, ['config', 'user.name', 't']); git(ar, ['config', 'user.email', 't@example.invalid']); git(ar, ['config', 'commit.gpgsign', 'false']);
+      write(path.join(ar, 'a.txt'), 'a\n'); git(ar, ['add', '-A']); git(ar, ['commit', '-qm', 'init']);
+      const la = Ln.start({ ...quiet, root: ar, goal: 'alt lane' });
+      const alt = `${la.worktree}-2`;
+      git(ar, ['worktree', 'move', la.worktree, alt]);
+      const ta = S.readTask(ar, la.id); ta.worktree_alt = alt; S.writeTask(ar, ta);
+      write(path.join(alt, 'w.txt'), 'w\n'); git(alt, ['add', '--', 'w.txt']); git(alt, ['commit', '-qm', 'w', '--', 'w.txt']);
+      const ga = St.gc({ root: ar });
+      const sa = St.status({ root: ar });
+      R.check('[SS-15] gc: 옆 경로에서 일하는 열린 레인의 worktree 는 남긴다(열린 레인) · status 는 옆 경로를 보인다', fs.existsSync(alt) && !ga.removed.some(x => x.worktree === alt) && ga.kept.some(k => k.id === la.id && k.worktree === alt)
+        && sa.board.lanes.some(l => l.id === la.id && l.worktree === alt), JSON.stringify({ removed: ga.removed, kept: ga.kept, lanes: sa.board.lanes }));
     }
   } catch (e) { R.check('예외 없이 끝난다', false, String(e && e.stack || e).slice(0, 800)); }
   finally { try { fs.rmSync(base, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }); } catch { /* 임시 디렉터리 정리 실패는 결과와 무관 */ } }

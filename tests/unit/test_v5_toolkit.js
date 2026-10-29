@@ -74,6 +74,27 @@ try {
   const cli = spawnSync(process.execPath, [path.join(__dirname, '..', '..', 'harness', 'cli.js'), 'toolkit', '--root', rq, '--json'], { encoding: 'utf8', windowsHide: true, env: { ...process.env, HARNESS_TOOLKIT_HOME: h0 }, timeout: 60000 });
   let j = null; try { j = JSON.parse(cli.stdout); } catch { /* 아래에서 실패 */ }
   R.check('[TK-08] CLI toolkit --json: exit 0 · 스택 · 없는 것', cli.status === 0 && j && j.stacks.includes('qt') && j.missing.some(e => e.id === 'clangd-lsp'), `${cli.status} ${cli.stdout.slice(0, 300)} ${cli.stderr.slice(0, 300)}`);
+
+  // [2026-10-29 감사] --json 이 MCP 의 args · url · 래퍼 본문(토큰 · 비밀번호 · 접속 문자열)과 저장소 밖 파일 내용을 그대로 냈다 — 이름과 범위만
+  {
+    const hs = path.join(base, 'home-secret'), outside = path.join(base, 'outside');
+    const wrap = path.join(hs, 'gh-mcp.cmd'), dbps = path.join(hs, 'db.ps1'), priv = path.join(outside, 'private-notes.ps1');
+    write(wrap, '@echo off\r\nset GITHUB_PERSONAL_ACCESS_TOKEN=SECRETWRAP1\r\nnpx -y @modelcontextprotocol/server-github\r\n');
+    write(dbps, '$env:DATABASE_URL="postgres://admin:SECRETPW2@db.internal:5432/prod"\n');
+    write(priv, 'AWS_SECRET_ACCESS_KEY=SECRETOUTSIDE3\n');
+    write(path.join(hs, '.claude.json'), JSON.stringify({ mcpServers: { github: { command: wrap }, db: { command: 'powershell', args: ['-File', dbps] }, brave: { command: 'npx', args: ['--api-key', 'SECRETARG4'], env: { BRAVE_API_KEY: 'SECRETENV5' } }, remote: { url: 'https://mcp.example.com/sse?token=SECRETURL6', headers: { Authorization: 'Bearer SECRETHDR7' } } },
+      projects: { [rq.replace(/\\/g, '/')]: { mcpServers: { local1: { command: 'x', args: ['--password=SECRETLOCAL8'] } } } } }));
+    const rs = repo('secret-repo', { '.mcp.json': JSON.stringify({ mcpServers: { evil: { command: 'pwsh', args: [priv] } } }), 'CMakeLists.txt': 'project(x)\n' });
+    const run = r => spawnSync(process.execPath, [path.join(__dirname, '..', '..', 'harness', 'cli.js'), 'toolkit', '--root', r, '--json'], { encoding: 'utf8', windowsHide: true, env: { ...process.env, HARNESS_TOOLKIT_HOME: hs, CODEX_HOME: path.join(base, 'codex0') }, timeout: 60000 });
+    const o1 = run(rq), o2 = run(rs), all = o1.stdout + o2.stdout;
+    const leaked = ['SECRETWRAP1', 'SECRETPW2', 'SECRETOUTSIDE3', 'SECRETARG4', 'SECRETENV5', 'SECRETURL6', 'SECRETHDR7', 'SECRETLOCAL8', 'db.internal', 'mcp.example.com'].filter(x => all.includes(x));
+    let j1 = null; try { j1 = JSON.parse(o1.stdout); } catch { /* 아래에서 실패 */ }
+    R.check('[TK-09] toolkit --json: MCP 는 이름 · 범위만(args · url · env · 래퍼 본문 · 저장소 밖 파일이 나오지 않는다) · 래퍼 안의 보관된 서버 경고는 그대로',
+      o1.status === 0 && o2.status === 0 && !leaked.length && j1 && j1.inventory.mcp.every(m => JSON.stringify(Object.keys(m).sort()) === '["name","scope"]') && j1.warnings.some(w => w.id === 'github-archived' && w.mcp === 'github'),
+      JSON.stringify({ leaked, mcp: j1 && j1.inventory.mcp, warnings: j1 && j1.warnings }));
+    const inv = T.inventory(rs, { home: hs });
+    R.check('[TK-09] 저장소 .mcp.json 이 가리키는 저장소 밖 래퍼는 읽지 않는다(판별용으로도)', !JSON.stringify(inv).includes('SECRETOUTSIDE3'), JSON.stringify(inv.mcp.filter(m => m.name === 'evil')));
+  }
 } catch (e) { R.check('예외 없이 끝난다', false, String(e && e.stack || e).slice(0, 800)); }
 finally {
   for (const [k, v] of Object.entries(saved)) { if (v == null) delete process.env[k]; else process.env[k] = v; }

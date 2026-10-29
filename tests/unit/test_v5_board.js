@@ -17,6 +17,7 @@ const ENV = { ...process.env, HOME: home, USERPROFILE: home, CODEX_HOME: path.jo
 for (const k of ['CLAUDE_PROJECT_DIR', 'HARNESS_HOOK_RUNTIME', 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'CLAUDE_ENV_FILE', 'HARNESS_TMP_BASE', 'HARNESS_TASK_ID', 'HARNESS_AGENTS_CMD', 'HARNESS_AGENTS']) delete ENV[k];
 // 진짜 `claude agents --json` 은 부르지 않는다 — 기본은 없는 파일(= 플랫폼 목록을 못 얻음 → last_seen 어림). 목록 시험은 따로 준다.
 ENV.HARNESS_AGENTS_JSON = path.join(base, 'no-agents.json');
+ENV.HARNESS_PORTS_FILE = path.join(base, 'ports.json');   // 포트 장부(PC 에 하나)도 임시로
 ENV.HARNESS_TOOLKIT_HINT = 'off';   // 세션 시작의 도구 점검 한 줄은 test_v5_toolkit 이 본다(사용자 HOME 의 MCP 설정을 읽지 않게)
 
 function hook(name, payload, extraEnv, args) {
@@ -155,6 +156,29 @@ try {
   R.check('[board/worker] 무인 작업자 worktree 에서는 아무것도 하지 않는다(세션 파일 · 환경 파일 · 출력 없음)', isAllow(w1) && readSession(repo, 'wwww-worker') === null && fs.readFileSync(envFile2, 'utf8') === '', w1.stdout);
   const BD = require(path.join(HOOKS, 'board.js'));
   R.check('[board] 환경 값은 작은따옴표로 안전하게', BD.shQuote("C:\\a b\\it's") === "'C:\\a b\\it'\\''s'" && BD.shQuote('$HOME `x`') === "'$HOME `x`'");
+  // [2026-10-29 감사] 끝난(accepted) 레인의 남은 worktree 에서 세션을 열면 board 가 그 작업에 포트 구역을 새로 잡았다
+  {
+    const aid = 't-20261025-140002-5e6f', awt = path.join(repo, '.harness-worktrees', aid);
+    git(repo, 'worktree', 'add', '-q', '-b', `harness/${aid}`, awt);
+    write(path.join(tasksDir, aid, 'task.json'), JSON.stringify({ id: aid, status: 'accepted', mode: 'light', owner: null, goal: 'done lane', branch: `harness/${aid}` }));
+    const envA = path.join(base, 'claude-env-accepted.sh'); write(envA, '');
+    const sa = hook('board', { hook_event_name: 'SessionStart', session_id: 'acce0000-X', cwd: awt, source: 'startup' }, { CLAUDE_ENV_FILE: envA });
+    let led = {}; try { led = JSON.parse(fs.readFileSync(ENV.HARNESS_PORTS_FILE, 'utf8')); } catch { /* 없음 */ }
+    const ta = fs.readFileSync(envA, 'utf8');
+    R.check('[board/lane] 끝난(accepted) 레인의 SessionStart 는 포트 구역을 잡지 않는다(HARNESS_PORT_BASE 없음 · 장부에 없음)', sa.status === 0 && ta.includes(`HARNESS_TASK_ID='${aid}'`) && !/HARNESS_PORT_BASE/.test(ta) && !led[aid], ta + JSON.stringify(led));
+    const so = fs.readFileSync(envFile, 'utf8');
+    R.check('[board/lane] 열린 레인의 SessionStart 는 포트 구역을 싣는다', /export HARNESS_PORT_BASE='\d+'/.test(so) && !!led[lid], so);
+  }
+  // [2026-10-29 감사] 첫 요청의 비밀(토큰 · 키 · 비밀번호)은 세션 파일 · 다른 세션의 문맥에 싣지 않는다
+  {
+    const sec = mkRepo('secrets', { 'a.txt': 'a\n' });
+    ups(sec, 'ssss1111-S', '배포 스크립트 고쳐줘. 토큰은 ghp_FAKEPROMPTTOKEN0123456789 이고 DB 비번은 FakePw!23 야 · export OPENAI_API_KEY=sk-proj-AbCdEf0123456789');
+    const peer = ups(sec, 'tttt2222-T', '다른 일');
+    const saved = (readSession(sec, 'ssss1111-S') || {}).goal || '', seen = ctx(peer);
+    const leaks = s => /ghp_FAKE|FakePw!23|sk-proj-AbCd/.test(s);
+    R.check('[board] 첫 요청의 토큰 · 비밀번호 · 키는 가려서 저장하고 다른 세션 문맥에도 가린 채 싣는다', saved && !leaks(saved) && /<secret>/.test(saved) && /배포 스크립트/.test(saved) && /ssss1111/.test(seen) && !leaks(seen), `${saved} | ${seen}`);
+    R.check('[board] 비밀이 아닌 낱말은 가리지 않는다(토큰 만료 · keyboard:)', BD.maskSecrets('로그인 토큰이 만료되면 · 토큰 만료 처리 · keyboard: layout') === '로그인 토큰이 만료되면 · 토큰 만료 처리 · keyboard: layout');
+  }
 
   // ── 플랫폼 목록(claude agents --json): 산 세션의 첫 근거 · 이름 · busy/idle ──
   {

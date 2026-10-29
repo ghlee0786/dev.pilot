@@ -101,6 +101,34 @@ const GO = ['=== RUN   TestParse', '--- FAIL: TestParse (0.00s)', '=== RUN   Tes
     R.check('[CR-02] 중복 제거 · 최대 50개', mg.length === 50 && new Set(mg).size === 50 && mg[0] === 'TestN0' && mg[49] === 'TestN49', mg.length);
     R.check('[CR-02] 빈 입력 · null 은 빈 목록', eq(K.failedTests(''), []) && eq(K.failedTests(null), []));
 
+    // ── [2026-10-29 감사 G2] 요약 · 이름 · 판정의 구멍 ──
+    // 출력 하나로 판정 객체를 만든다(실제 runCheck 의 모양)
+    const judged = (out, exit) => { const s = K.parseSummary(out); const ok = exit === 0 && !(s.found && s.fail > 0); return K.summarize([{ command: 'c', argv: ['c'], exit_code: exit, timed_out: false, found: s.found, pass: s.found ? s.pass : (ok ? 1 : 0), fail: s.found ? s.fail : (ok ? 0 : 1), ok, output: out, ms: 1 }]); };
+    // CR-10 (#16) ANSI 색이 있어도 요약을 읽는다 — 같은 빨강은 not_worse
+    const nodeColor = '\x1b[34mℹ tests 2\x1b[39m\n\x1b[34mℹ pass 1\x1b[39m\n\x1b[34mℹ fail 1\x1b[39m\n';
+    const pyColor = '\x1b[31mFAILED\x1b[0m test_a.py::test_b - assert 0\n\x1b[31m========================= \x1b[31m\x1b[1m1 failed\x1b[0m, \x1b[32m1 passed\x1b[0m\x1b[31m in 0.05s\x1b[0m\x1b[31m ==========================\x1b[0m\n';
+    const pn = K.parseSummary(nodeColor), pp = K.parseSummary(pyColor);
+    R.check('[CR-10] (#16) parseSummary 는 ANSI 색을 벗긴다(node spec · pytest --color=yes) · 같은 빨간 결과는 not_worse',
+      eq(pn, { found: true, pass: 1, fail: 1 }) && eq(pp, { found: true, pass: 1, fail: 1 }) && K.judge(judged(pyColor, 1), K.brief(judged(pyColor, 1))).verdict === 'not_worse', JSON.stringify([pn, pp]));
+    // CR-11 (#18) vitest · GoogleTest 요약
+    const vt = K.parseSummary(' Test Files  1 failed (1)\n      Tests  1 failed | 1 passed (2)\n   Start at  10:00:00\n'), gt = K.parseSummary('[==========] 3 tests from 1 test suite ran. (2 ms total)\n[  PASSED  ] 2 tests.\n[  FAILED  ] 1 test, listed below:\n[  FAILED  ] Foo.Bar\n');
+    R.check('[CR-11] (#18) vitest(Tests  1 failed | 1 passed) · GoogleTest([  PASSED  ] 2 tests · [  FAILED  ] 1 test) 요약을 읽는다', eq(vt, { found: true, pass: 1, fail: 1 }) && eq(gt, { found: true, pass: 2, fail: 1 }), JSON.stringify([vt, gt]));
+    // CR-12 (#19 · #18) Windows jest · vitest 의 × · 공백이 든 pytest 파라미터 id
+    const ft = [K.failedTests('    × breaks (3 ms)\nTests:       1 failed, 1 passed, 2 total'), K.failedTests('   × src/a.test.ts > suite > fails 3ms'), K.failedTests('FAILED tests/t.py::test_p[a b] - assert 0'), K.failedTests('tests/t.py::test_q[x y] FAILED                [ 50%]')];
+    R.check('[CR-12] (#19) failedTests — × 표시(Windows jest · vitest) · 공백이 든 pytest id 를 자르지 않는다', eq(ft, [['breaks'], ['src/a.test.ts > suite > fails'], ['tests/t.py::test_p[a b]'], ['tests/t.py::test_q[x y]']]), JSON.stringify(ft));
+    // CR-13 (#14) Go: 새 패키지의 빌드 실패([build failed])도 실패로 센다 → 나빠짐
+    const goBase = '--- FAIL: TestA (0.00s)\nFAIL\tex/a\t0.01s\nok  \tex/b\t0.01s\n', goCur = goBase + '# ex/c\nc/c.go:3:2: undefined: nope\nFAIL\tex/c [build failed]\n';
+    R.check('[CR-13] (#14) go — FAIL pkg [build failed] 를 센다 · 빨간 기준선에서 빌드가 깨진 패키지가 생기면 fail', K.parseSummary(goCur).fail === K.parseSummary(goBase).fail + 1 && K.judge(judged(goCur, 1), K.brief(judged(goBase, 1))).verdict === 'fail',
+      JSON.stringify([K.parseSummary(goBase), K.parseSummary(goCur)]));
+    // CR-14 (#3) 실패 수가 같아도 다른 시험이 새로 실패하면 나빠짐 · 이름이 한쪽에만 없으면 수로 판정 · 같은 시험이 그대로 실패하면 not_worse
+    const tapB = 'ok 1 - X\nnot ok 2 - Y\nok 3 - Z\n# pass 2\n# fail 1\n', tapC = 'not ok 1 - X\nok 2 - Y\nok 3 - Z\n# pass 2\n# fail 1\n';
+    const v1 = K.judge(judged(tapC, 1), K.brief(judged(tapB, 1))), v2 = K.judge(judged(tapB, 1), K.brief(judged(tapB, 1))), v3 = K.judge(judged(tapC, 1), K.brief(judged('# pass 2\n# fail 1\n', 1)));
+    R.check('[CR-14] (#3) judge — 기준선에서 통과하던 시험이 새로 실패하면 fail(수는 같아도) · 그 이름을 이유에 · 같은 실패는 not_worse · 기준선에 이름이 없으면 수로',
+      v1.verdict === 'fail' && /X/.test(v1.why) && v2.verdict === 'not_worse' && v3.verdict === 'not_worse', JSON.stringify([v1, v2.verdict, v3.verdict]));
+    // CR-15 (#22) YAML 큰따옴표 문자열의 이스케이프(\") · 작은따옴표의 '' 를 푼다
+    const y1 = K.yamlTestCommandOf('test_command: "node -e \\"process.exit(0)\\""\r\n'), y2 = K.yamlTestCommandOf("test_command: 'echo ''hi'''\n"), y3 = K.yamlTestCommandOf('test_command: "npm test"  # 주석\n');
+    R.check('[CR-15] (#22) test_command 의 YAML 이스케이프를 푼다', y1 === 'node -e "process.exit(0)"' && y2 === "echo 'hi'" && y3 === 'npm test', JSON.stringify([y1, y2, y3]));
+
     // ── summarize · brief · indeterminate ──
     const r = (o) => ({ command: 'c', argv: ['c'], exit_code: 1, timed_out: false, found: false, pass: 0, fail: 1, ok: false, output: '', ms: 1, ...o });
     const sAll = K.summarize([r({ command: 'a', output: GO }), r({ command: 'b', output: '--- FAIL: TestParse (0s)\n--- FAIL: TestOther (0s)' }), r({ command: 'ok', ok: true, exit_code: 0, pass: 1, fail: 0, output: '--- FAIL: NotCounted' })]);

@@ -13,12 +13,6 @@ const C = require('./_common');
 
 const MAX_BLOCKS = 1;
 
-function firstLine(text) {
-  const line = String(text || '').split(/\r?\n/).map(s => s.trim()).find(Boolean) || '';
-  const clean = line.replace(/^[#>*\-\s`]+/, '').replace(/\s+/g, ' ').trim();
-  return clean.length > 72 ? clean.slice(0, 69) + '...' : clean;
-}
-
 // [2026-09-29 실측] 마지막 말을 메시지로 쓰면 "커밋이 승인 대기로 막혀…" 같은 불평이 이력에 남았다 — 파일 목록으로 쓴다.
 function filesSummary(files) {
   const head = files.slice(0, 3).join(', ');
@@ -37,6 +31,9 @@ function blockReason(mine, secrets) {
 //   감시 · 하네스 작업)을 하나도 띄우지 않았으면 한 번만 되돌려 보낸다. 질문으로 끝난 답 · 이미 되돌려 보낸 뒤(stop_hook_active)는 그냥 둔다.
 const PROMISE = /(바로 이어서|이어서 (진행|하겠|할게|작업)|곧 (시작|진행)하|계속 진행하겠|다음 단계(를|는)? ?(바로|곧|이어서)|지금 (시작|진행)하겠|\b(I'll|I will) (now )?(continue|proceed|start|kick off) (with|on|the)\b|\bwill (continue|proceed) (now|next|right away)\b)/i;
 const CONTINUES = new Set(['ScheduleWakeup', 'Monitor', 'CronCreate', 'Workflow']);
+// v7 의 이어 가는 길 — 백그라운드 세션(claude --bg) · 레인(start) · 묶어 합치기(batch). [2026-10-29 감사] 뺀 명령(go · resume · factory · --detach)만 쳐서
+//   안내대로 claude --bg 를 띄운 차례를 "아무것도 띄우지 않았다" 로 되돌려 보냈다.
+const LAUNCH = /(?:^\s*|[;&|(]\s*)(?:\S*[\\/])?claude(?:\.exe)?\s+(?:[^\n|;&]*\s)?--bg\b|\bcli\.js\s+(?:start|batch)\b/m;
 function lastTurn(transcriptPath) {
   const fs = require('node:fs');
   let text = ''; try { const st = fs.statSync(transcriptPath); const fd = fs.openSync(transcriptPath, 'r'); const n = Math.min(st.size, 400000); const b = Buffer.alloc(n); fs.readSync(fd, b, 0, n, st.size - n); fs.closeSync(fd); text = b.toString('utf8'); } catch { return null; }
@@ -51,7 +48,7 @@ function lastTurn(transcriptPath) {
       if (x.type === 'text' && x.text) finalText = x.text;
       if (x.type === 'tool_use') {
         const inp = x.input || {};
-        if (CONTINUES.has(x.name) || inp.run_in_background === true || /\bcli\.js\s+(go|resume|factory)\b|--detach\b/.test(String(inp.command || ''))) launched = true;
+        if (CONTINUES.has(x.name) || inp.run_in_background === true || LAUNCH.test(String(inp.command || ''))) launched = true;
       }
     }
   }
@@ -134,4 +131,4 @@ function main() {
 }
 
 if (require.main === module) { main(); process.exitCode = 0; }
-module.exports = { firstLine, blockReason, filesSummary, promiseWithoutAction, lastTurn };
+module.exports = { blockReason, filesSummary, promiseWithoutAction, lastTurn };

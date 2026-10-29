@@ -71,6 +71,75 @@ const cfg = d => { git(d, 'config', 'user.name', 't'); git(d, 'config', 'user.em
     const gone = [['resume', /use start --from <id>/], ['stop', /pilot stop: removed in v7/], ['factory', /use several lanes \(start\) \+ batch/], ['cleanup-legacy', /use gc/], ['metrics', /pilot metrics: removed in v7/]]
       .map(([cmd, re]) => { const r = removedCli(cmd, 't-20261001-000000-abcd'); return [cmd, r.status === 2 && re.test(r.stderr), r.status]; });
     R.check('[RM-02] resume · stop · factory · cleanup-legacy · metrics 도 exit 2 · 뺐다는 말과(있으면) 대체 명령', gone.every(x => x[1]), JSON.stringify(gone));
+
+    // ── [2026-10-29 감사] start --owns 는 아무것도 막지 않았다(기록만) — 사용법에서 빼고 받지 않는다 ──
+    const { parse, USAGE } = require(CLI);
+    let ownsErr = null; try { parse(['start', 'x', '--owns', 'src/**']); } catch (e) { ownsErr = e; }
+    const ownsCli = removedCli('start', 'lane A', '--owns', 'src/**');
+    R.check('[RM-03] --owns: USAGE 에 없고 · parse 가 unknown option 으로 거부 · CLI 는 exit 2 · 레인을 만들지 않는다',
+      !/--owns/.test(USAGE) && ownsErr && /unknown option: --owns/.test(ownsErr.message) && ownsCli.status === 2 && !fs.existsSync(path.join(a, '.harness-worktrees')), `${ownsErr && ownsErr.message} ${ownsCli.status}`);
+    R.check('[RM-04] USAGE: 백그라운드 세션의 길(claude --bg -w → batch --branch → batch accept) · 목표 넘기는 법 · --check-timeout-min · --migrate · --repo',
+      /claude --bg -w <name>/.test(USAGE) && /batch --branch <its branch> → batch accept <bid>/.test(USAGE) && /"<short goal>"/.test(USAGE) && /--goal-file/.test(USAGE) && /--check-timeout-min <n>/.test(USAGE) && /--migrate/.test(USAGE) && /--repo <owner\/name>/.test(USAGE) && parse(['install', '--migrate']).migrate === true, USAGE);
+
+    // ── [2026-10-29] cancel · check 는 레인에서 산 세션이 일하면 거부한다(integrate) — CLI 가 --force 를 넘긴다(accept 처럼) ──
+    {
+      const IP = require.resolve('../../harness/lib/integrate');
+      const savedMod = require.cache[IP];
+      const seen = [];
+      require.cache[IP] = { id: IP, filename: IP, loaded: true, exports: { cancel: async o => { seen.push(['cancel', o.force, o.skipChecks]); return { id: o.id, status: 'cancelled' }; }, check: async o => { seen.push(['check', o.force]); return { id: o.id, status: 'checked' }; } } };
+      const { main } = require(CLI), io = { out: () => {}, err: () => {} }, tid = 't-20261029-000000-abcd';
+      try {
+        await main(['cancel', tid, '--force', '--root', a], io); await main(['check', tid, '--force', '--root', a], io);
+        await main(['cancel', tid, '--root', a], io); await main(['check', tid, '--root', a], io);
+      } finally { if (savedMod) require.cache[IP] = savedMod; else delete require.cache[IP]; }
+      // batch 묶기 · batch accept 도 --force 를 넘긴다(산 세션이 일하는 레인은 force 없이 묶지 않는다 — batch 가 판단)
+      const BP = require.resolve('../../harness/lib/batch'), savedB = require.cache[BP], bseen = [];
+      require.cache[BP] = { id: BP, filename: BP, loaded: true, exports: { create: async o => { bseen.push(['create', o.force]); return { verdict: 'pass', report: 'ok' }; }, accept: async o => { bseen.push(['accept', o.force]); return { report: 'ok' }; } } };
+      try { await main(['batch', tid, '--force', '--root', a], io); await main(['batch', '--all', '--root', a], io); await main(['batch', 'accept', 'b-1', '--force', '--root', a], io); }
+      finally { if (savedB) require.cache[BP] = savedB; else delete require.cache[BP]; }
+      R.check('[RM-06] batch(묶기) · batch accept 는 --force 를 넘긴다(없으면 false) · USAGE 에 적는다', JSON.stringify(bseen) === JSON.stringify([['create', true], ['create', false], ['accept', true]]) && /\[--check "<cmd>"\]\.\.\. \[--force\]/.test(USAGE), JSON.stringify(bseen));
+      R.check('[RM-05] cancel · check 는 --force 를 integrate 로 넘긴다(없으면 false) · USAGE 에 적는다', JSON.stringify(seen) === JSON.stringify([['cancel', true, false], ['check', true], ['cancel', false, false], ['check', false]])
+        && /check <id> \[--force\]/.test(USAGE) && /cancel <id> \[--skip-checks\] \[--force\]/.test(USAGE), JSON.stringify(seen));
+    }
+
+    // ── [2026-10-29 사용자 요청] 모든 명령의 예기치 못한 예외를 결함으로 기록하고 · 끝에 쌓인 보고를 올린다(start · batch · status · gc · toolkit 도) ──
+    {
+      const stub = (rel, exp) => { const p = require.resolve(rel); const saved = require.cache[p]; require.cache[p] = { id: p, filename: p, loaded: true, exports: exp }; return () => { if (saved) require.cache[p] = saved; else delete require.cache[p]; }; };
+      const Bg = require('../../harness/lib/bugreport'), origAuto = Bg.autoReport, posts = [];
+      Bg.autoReport = async r => { posts.push(r); return { posted: [] }; };
+      const restore = [stub('../../harness/lib/lane', { start: () => { const x = null; return x.boom; } }),
+        stub('../../harness/lib/status', { status: () => { throw new RangeError('status exploded'); }, gc: () => { throw Object.assign(new Error('held'), { code: 'LOCK_HELD' }); } })];
+      const { main } = require(CLI), errs = [], io = { out: () => {}, err: s => errs.push(s) };
+      const rb = path.join(base, 'bugs-repo'); git(base, 'init', '-q', '-b', 'main', rb);
+      const bugs = () => { try { return fs.readdirSync(path.join(rb, '.git', 'harness', 'bugs')).filter(n => /^[0-9a-f]{12}\.json$/.test(n)).map(n => JSON.parse(fs.readFileSync(path.join(rb, '.git', 'harness', 'bugs', n), 'utf8'))); } catch { return []; } };
+      let codes;
+      try {
+        codes = [await main(['start', 'some goal', '--root', rb], io), await main(['status', '--root', rb], io), await main(['gc', '--root', rb], io), await main(['start', 'x', '--goal-file', 'g.txt', '--root', rb], io)];
+      } finally { for (const f of restore) f(); Bg.autoReport = origAuto; }
+      const b = bugs();
+      R.check('[BG-01] start · status 의 예기치 못한 예외 → .git/harness/bugs 에 결함 기록 · report-bug 안내 · 운영 오류(LOCK_HELD · USAGE)는 기록하지 않는다 · 명령마다 끝에 보고 발행을 시도한다',
+        JSON.stringify(codes) === '[1,1,1,2]' && b.length === 2 && b.some(e => e.code === null && /TypeError|null/.test(e.message + JSON.stringify(e.frames))) && b.some(e => /status exploded/.test(e.message))
+          && errs.filter(s => /하네스 결함으로 보입니다.*\n?.*report-bug/.test(s)).length === 2 && posts.length === 4, JSON.stringify({ codes, bugs: b.map(e => [e.kind, e.code, e.message]), posts: posts.length, errs: errs.map(s => s.slice(0, 120)) }));
+    }
+
+    // ── [2026-10-29 감사] Stop 의 "이어서 하겠다" 감지 — v7 의 이어 가는 길(claude --bg · start · batch)을 띄운 차례는 통과 · 뺀 명령(go · resume · factory)은 띄운 것이 아니다 ──
+    {
+      const SP = require(path.resolve(__dirname, '..', '..', 'harness', 'hooks', 'stop.js'));
+      const tr = (name, cmd) => {
+        const f = path.join(base, `tr-${name}.jsonl`);
+        const rows = [{ type: 'user', message: { role: 'user', content: '계속해' } },
+          { type: 'assistant', message: { role: 'assistant', content: [{ type: 'tool_use', name: 'Bash', input: { command: cmd } }] } },
+          { type: 'user', message: { role: 'user', content: [{ type: 'tool_result', content: 'ok' }] } },
+          { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: '백그라운드 세션을 띄웠습니다. 다음 단계는 바로 이어서 진행하겠습니다.' }] } }];
+        fs.writeFileSync(f, rows.map(r => JSON.stringify(r)).join('\n') + '\n'); return f;
+      };
+      const res = [['bg', 'claude --bg "로그인 기능 만들기"'], ['bgw', 'claude --bg -w login "x"; echo done'], ['start', 'node harness/cli.js start --goal-file g.txt'], ['batch', 'node harness/cli.js batch --branch worktree-login'],
+        ['go', 'node harness/cli.js go "x"'], ['resume', 'node harness/cli.js resume t-20261001-000000-abcd'], ['plain', 'npm test'], ['echo', 'echo "claude 는 --bg 로"']]
+        .map(([n, c]) => [n, !!SP.promiseWithoutAction({ transcript_path: tr(n, c) })]);
+      const blocked = Object.fromEntries(res);
+      R.check('[SP-01] claude --bg · start · batch 를 띄운 차례는 통과 · 뺀 go · resume · 아무것도 아닌 명령은 되돌려 보냄 · SP 내보내기에 쓰이지 않는 firstLine 없음',
+        !blocked.bg && !blocked.bgw && !blocked.start && !blocked.batch && blocked.go && blocked.resume && blocked.plain && blocked.echo && SP.firstLine === undefined, JSON.stringify(blocked));
+    }
   } catch (e) { R.check('예외 없이 끝난다', false, String(e && e.stack || e).slice(0, 800)); }
   finally { try { fs.rmSync(base, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }); } catch { /* 무시 */ } }
   R.done();
