@@ -310,6 +310,29 @@ const parents = (cwd, ref) => git(cwd, ['rev-list', '--parents', '-n', '1', ref]
     fs.mkdirSync(path.join(r17, 'nested'), { recursive: true });
     let thrown = null; try { G.commitAll(path.join(r17, 'nested'), 'x'); } catch (e) { thrown = e; }
     R.check('[IN-18] commitAll 은 worktree 루트가 아닌 폴더에서 NOT_WORKTREE_ROOT 로 거부한다', thrown && thrown.code === 'NOT_WORKTREE_ROOT' && git(r17, ['rev-parse', 'HEAD']) === main17, thrown ? thrown.message : 'no throw');
+    // [자동 이슈 #61] accept 를 worktree 를 만드는 도중(git worktree add 체크아웃 중) 강제로 끝내면 등록 · HEAD 는 있고 파일은 일부만 있는 worktree 가
+    //   남는다(잠금 이유 "initializing"). 다음 accept 가 빠진 파일을 'uncommitted work before accept' 로 삭제 커밋했다.
+    {
+      const r18c = mkRepo({ files: { 'src/one.txt': '1\n', 'src/two.txt': '2\n', 'src/three.txt': '3\n' } });
+      const t18c = await goDone(r18c, work());
+      const P18c = S.taskPaths(r18c, t18c.id);
+      if (fs.existsSync(P18c.wt)) git(r18c, ['worktree', 'remove', '--force', P18c.wt]);
+      git(r18c, ['worktree', 'add', '-q', '--no-checkout', P18c.wt, t18c.branch]);   // 체크아웃 전에 끝난 것처럼
+      const adm = git(P18c.wt, ['rev-parse', '--absolute-git-dir']);
+      fs.writeFileSync(path.join(adm, 'locked'), 'initializing');
+      write(path.join(P18c.wt, 'src', 'one.txt'), '1\n');   // 일부만 체크아웃됨
+      const head18c = git(r18c, ['rev-parse', t18c.branch]), main18c = git(r18c, ['rev-parse', 'main']);
+      const a18c = await I.accept({ ...quiet, root: r18c, id: t18c.id });
+      R.check('[IN-18c] 만들다 끊긴 worktree(locked initializing)에서 accept 는 거절 · 작업 브랜치에 삭제를 커밋하지 않는다 · 안내',
+        a18c.refused === true && /half-created/.test(a18c.reason) && /git worktree remove --force --force/.test(a18c.reason) && git(r18c, ['rev-parse', t18c.branch]) === head18c && git(r18c, ['rev-parse', 'main']) === main18c,
+        `${a18c.status} ${a18c.reason} | ${git(r18c, ['log', '--stat', '--oneline', '-1', t18c.branch])}`);
+      let th18c = null; try { G.commitAll(P18c.wt, 'x', { branch: t18c.branch }); } catch (e) { th18c = e; }
+      R.check('[IN-18c] commitAll 도 그런 worktree 에서는 WORKTREE_INCOMPLETE 로 거부한다', th18c && th18c.code === 'WORKTREE_INCOMPLETE' && git(r18c, ['rev-parse', t18c.branch]) === head18c, th18c ? th18c.message : 'no throw');
+      git(r18c, ['worktree', 'remove', '--force', '--force', P18c.wt]);
+      const a18d = await I.accept({ ...quiet, root: r18c, id: t18c.id });
+      R.check('[IN-18c] 안내대로 지운 뒤 다시 accept → accepted · 파일이 모두 남는다',
+        a18d.status === 'accepted' && ['src/one.txt', 'src/two.txt', 'src/three.txt', 'feature.txt'].every(f => read(path.join(r18c, f)) !== null), `${a18d.status} ${a18d.reason}`);
+    }
 
     // ── accept 의 검사는 작업에 기록된 검사 상한(check_timeout_min · --check-timeout-min)을 쓴다 ──
     //   [적대 2026-10-02] accept · cancel 은 o.checkTimeoutMs 만 봐서 작업의 상한(예: 20분 저장소)을 버리고 기본 15분으로 돌았다.

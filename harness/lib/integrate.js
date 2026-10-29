@@ -86,6 +86,7 @@ function locked(root, staleTask, pre, fn) {
 
 // 작업의 worktree 를 쓸 수 있게 한다 → 못 하면 거부 이유(문자열). 지워지는 중인 예전 폴더는 G.clearWorktreeSlot 이 기다린다(자동 이슈 #1 · #2).
 function ensureWorktree(root, task, P, waitMs, log) {
+  if (G.interruptedAdd(root, P.wt)) return G.incompleteWhy(P.wt);
   if (fs.existsSync(P.wt) && G.worktreeRegistered(root, P.wt) && G.isWorktreeRoot(P.wt, task.branch)) return null;
   const why = G.clearWorktreeSlot(root, P.wt, task.branch, waitMs, G.slotOpts(root, task.id, P.dir, log));
   if (why) {

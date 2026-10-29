@@ -157,6 +157,7 @@ function isWorktreeRoot(dir, branch) {
 function commitAll(cwd, message, o) {
   const opt = o || {};
   if (!isWorktreeRoot(cwd, opt.branch)) throw Object.assign(new Error(`refusing to commit: ${cwd} is not the root of ${opt.branch ? `the ${opt.branch} worktree` : 'a git working tree'} (it may be a leftover folder inside another repository)`), { code: 'NOT_WORKTREE_ROOT' });
+  if (interruptedAdd(cwd, cwd)) throw Object.assign(new Error(`refusing to commit: ${incompleteWhy(cwd)}`), { code: 'WORKTREE_INCOMPLETE' });
   const skip = [];
   for (let i = 0; ; i++) {
     const r = git(cwd, ['add', '-A', '--', ...(opt.paths || [':/']), ...skip.map(p => `:(exclude,literal)${p}`)], { retryLock: true, allowFail: true });
@@ -227,12 +228,19 @@ function worktreeList(root) {
     else if (line.startsWith('branch ')) cur.branch = line.slice(7).replace(/^refs\/heads\//, '');
     else if (line === 'detached') cur.detached = true;
     else if (line === 'bare') cur.bare = true;
+    else if (line === 'locked' || line.startsWith('locked ')) cur.locked = line.slice(7) || true;
   }
   return out;
 }
 // 같은 폴더인가 — 실경로로 비교한다(심볼릭 링크 · Windows 짧은 이름. hooks/_common.real 참고).
 const samePath = (a, b) => require('../hooks/_common').samePath(a, b);
 function worktreeRegistered(root, wt) { return worktreeList(root).some(w => samePath(w.path, wt)); }
+// [자동 이슈 #61] `git worktree add` 가 체크아웃 도중 끝나면(강제 종료) 등록 · HEAD 는 있고 파일은 일부만 있는 worktree 가 남는다(잠금 이유 "initializing").
+//   그대로 쓰면 빠진 파일이 삭제로 커밋된다 — 알아보고 멈춘다. 그 안에 브랜치보다 새 내용은 없다(만드는 중이었다).
+function interruptedAdd(root, wt) { const w = worktreeList(root).find(x => samePath(x.path, wt)); return !!w && w.locked === 'initializing'; }
+function incompleteWhy(wt) {
+  return `the worktree ${wt} was left half-created (an interrupted git worktree add — it is locked "initializing"), so its missing files would be committed as deletions; it holds nothing newer than the task branch. If no git command is running there, remove it with: git worktree remove --force --force "${wt}" — then run the command again`;
+}
 // 대상 브랜치가 체크아웃된 worktree(하네스 worktree 제외). 없으면 null.
 function checkoutOf(root, branch) {
   const P = S.paths(root);
@@ -533,7 +541,7 @@ function copyWorktreeInclude(root, wt) {
 
 module.exports = {
   git, identityArgs, headSha, isWorktreeRoot, removeEmptyDir, clearWorktreeSlot, slotOpts, useAltWorktree, keepEol, procsIn, killProcsIn, salvageLeftover, currentBranch, branchExists, tagExists, isAncestor, ensureRepo, isRepo, statusEntries, dirtyFiles, isClean, ignoredChanges,
-  commitAll, unaddablePaths, isSecretPath, ensureExclude, addWorktree, worktreeList, worktreeRegistered, checkoutOf, mainWorktree, removeWorktree, samePath,
+  commitAll, unaddablePaths, isSecretPath, ensureExclude, addWorktree, worktreeList, worktreeRegistered, interruptedAdd, incompleteWhy, checkoutOf, mainWorktree, removeWorktree, samePath,
   diffNames, mergeBase, unmergedFiles, mergeInProgress, hasConflictMarkers, hasConflictMarkersText, MARKER_RE, worktreeIncludeFiles, copyWorktreeInclude, sha1, LOCK_ERR,
   gitlinks, fillSubmodules, dropSubmoduleClones, worktreeLinks,
 };
