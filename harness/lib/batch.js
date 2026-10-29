@@ -66,7 +66,8 @@ function liveSessionIn(root, wt) {
   const Ch = require('../hooks/_common');
   if (within(process.cwd(), wt)) return null;
   const common = S.paths(root).commonDir;
-  const cand = Ch.listSessions(common).filter(s => within(s.root, wt) || within(s.cwd, wt));
+  const self = process.env.CLAUDE_CODE_SESSION_ID || null;   // [자동 이슈 #67] 부른 세션 자신은 뺀다(예전에 그 칸에 cd 했다)
+  const cand = Ch.listSessions(common).filter(s => String(s.session_id) !== self && (within(s.root, wt) || within(s.cwd, wt)));
   if (!cand.length) return null;   // 후보가 없으면 플랫폼에 묻지 않는다
   let agents = null; try { agents = Ch.platformAgents(common); } catch { agents = null; }
   const now = Date.now(), live = cand.filter(s => Ch.sessionLive(s, agents, now));

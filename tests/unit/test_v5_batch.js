@@ -211,6 +211,13 @@ const parents = (cwd, ref) => git(cwd, ['rev-list', '--parents', '-n', '1', ref]
       const bv = await B.create({ ...quiet, root: V.dir, all: true });
       const mv = (B.readBatch(V.dir, bv.id).members || []).find(m => m.id === va.id) || {};
       R.check('[BA-20] 산 세션이 일하는 칸은 batch(--all)가 건너뛴다(why: live session)', mv.status === 'skipped' && /live session live1111/.test(mv.why), JSON.stringify(mv));
+      // [자동 이슈 #67] 부른 세션 자신이 그 칸을 가리키면(예전에 cd 했다) 건너뛰지 않는다
+      const hadSid = process.env.CLAUDE_CODE_SESSION_ID;
+      process.env.CLAUDE_CODE_SESSION_ID = 'live1111-aaaa';
+      let bself; try { bself = await B.create({ ...quiet, root: V.dir, ids: [va.id] }); } finally { if (hadSid == null) delete process.env.CLAUDE_CODE_SESSION_ID; else process.env.CLAUDE_CODE_SESSION_ID = hadSid; }
+      const mself = (B.readBatch(V.dir, bself.id).members || []).find(m => m.id === va.id) || {};
+      R.check('[BA-20b] (#67) 부른 세션 자신은 산 세션으로 보지 않는다', mself.status === 'merged', JSON.stringify(mself));
+      B.drop({ root: V.dir, bid: bself.id });
       const bvf = await B.create({ ...quiet, root: V.dir, ids: [va.id], force: true });
       R.check('[BA-20] --force 면 산 세션이 있어도 묶는다', (B.readBatch(V.dir, bvf.id).members[0] || {}).status === 'merged', JSON.stringify(B.readBatch(V.dir, bvf.id).members));
       B.drop({ root: V.dir, bid: bvf.id });

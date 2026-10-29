@@ -268,6 +268,11 @@ console.log(out.join('\\n'));console.log('# pass '+p+'\\n# fail '+f);process.exi
           a1.refused && /live session/.test(a1.reason) && /lane-1|lane-sess/.test(a1.reason) && /--force/.test(a1.reason) && k1.refused && c1.refused && /live session/.test(c1.reason)
             && git(r, ['rev-parse', 'main']) === main0 && fs.existsSync(path.join(wt, 'half.txt')) && S.readTask(r, t.id).status === 'open',
           JSON.stringify({ a1: a1.reason, k1: k1.reason, c1: c1.reason }));
+        // [자동 이슈 #67] 부른 세션 자신 — 예전에 cwd 가 그 레인에 있었다가 메인으로 돌아와 accept 를 부른다(세션 파일의 cwd 는 아직 레인). 자기 자신은 산 작업자가 아니다
+        const hadSid = process.env.CLAUDE_CODE_SESSION_ID;
+        process.env.CLAUDE_CODE_SESSION_ID = sid;
+        let k0; try { k0 = await I.check({ ...quiet, root: r, id: t.id }); } finally { if (hadSid == null) delete process.env.CLAUDE_CODE_SESSION_ID; else process.env.CLAUDE_CODE_SESSION_ID = hadSid; }
+        R.check('[AC2-14b] (#67) 부른 세션 자신(CLAUDE_CODE_SESSION_ID)이 그 레인을 가리켜도 산 세션으로 거부하지 않는다', !/live session/.test(k0.reason || ''), JSON.stringify([k0.status, k0.reason]));
         write(agentsFile, JSON.stringify([]));   // 그 세션이 끝났다(플랫폼 목록에 없다)
         a2 = await I.accept({ ...quiet, root: r, id: t.id, into: 'nope-branch' });
         R.check('[AC2-14] 세션이 끝나면(플랫폼 목록에 없음) 세션 때문에 거부하지 않는다', !/live session/.test(a2.reason || ''), a2.reason);

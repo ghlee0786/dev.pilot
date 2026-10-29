@@ -132,6 +132,10 @@ function repo(name) {
       const out = samples.map(x => B.sanitize(x)).join('\n');
       R.check('[BR-18] sanitize: Bearer · 토큰 접두사(ghp_ · sk- · AKIA) · KEY=VALUE · -u user:pass · login -p · --password · --token · JWT · URL · 상대 경로를 가린다 · 하네스 파일과 일반 문장은 남긴다',
         !secrets.some(x => out.includes(x)) && B.sanitize('at accept (harness/lib/integrate.js:12:3) — git push -u origin main 은 막힌다 · and/or 1/2') === 'at accept (harness/lib/integrate.js:12:3) — git push -u origin main 은 막힌다 · and/or 1/2', out);
+      // [자동 이슈 #67] 영어 소유격 · 축약의 아포스트로피를 따옴표로 읽어 그 사이를 통째로 '…' 로 지웠다 — 보고가 읽히지 않았다
+      const prose = "accept refused because the lane's worktree still had the session's cwd; it didn't follow";
+      const q = B.sanitize(`${prose} — branch 'feature/secret-name' was used`);
+      R.check("[BR-19] sanitize: 낱말 안의 아포스트로피(lane's · didn't)는 따옴표가 아니다 — 문장은 남고, 진짜 따옴표 안은 가린다", q.startsWith(prose) && !q.includes('secret-name') && /'…'/.test(q), q);
     }
   } catch (e) { R.check('예외 없이 끝난다', false, String(e && e.stack || e).slice(0, 800)); }
   finally { try { fs.rmSync(base, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }); } catch { /* 정리 실패는 결과와 무관 */ } }

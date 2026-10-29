@@ -363,6 +363,13 @@ try {
     R.check('[V6] --migrate: v7-migration.md 에 작업마다 id · 상태 · 목표 첫 줄 · 브랜치 · worktree · 세션 id(기록 또는 최근 transcript) · start --from · claude --resume 을 적고 설치한다 · 같은 목록을 보인다',
       r6m.ok === true && changedBack() && ['t-20261026-095354-6951', 'interrupted', 'goal of t-20261026-095354-6951', 'harness/t-20261026-095354-6951', 'sess-aaa', 'sess-bbb', 'start --from t-20261026-095412-79a8', 'claude --resume sess-aaa'].every(x => mt.includes(x))
         && !mt.includes('second line') && !mt.includes('095500') && /sess-aaa/.test(r6m.report) && /v7-migration\.md/.test(r6m.report), mt.slice(0, 600) + ' | ' + r6m.report.slice(0, 300));
+    // [2026-10-29 배포 뒤] 이미 v7 이 깔린 저장소(v7.0.2 로 이행 끝) — 남은 v6 작업은 v7 이 다룬다. 다음 판 갱신을 막으면 자동 갱신이 영영 멈춘다
+    fs.writeFileSync(path.join(t13, 'harness', 'VERSION'), '7.0.2\n');
+    fs.writeFileSync(lanePath, laneSrc + '// OLD VERSION MARK\n');
+    const v6n = I.busy(t13).v6.length;
+    const r6n = install({ target: t13, source: SOURCE });
+    R.check('[V6] 이미 v7 이 깔렸으면(harness/VERSION 7.x) 남은 v6 작업이 있어도 --migrate 없이 갱신한다 · busy 의 v6 목록은 비어 있다',
+      r6n.ok === true && changedBack() && v6n === 0, `${v6n} | ${r6n.report}`);
     fs.rmSync(path.join(home, '.claude'), { recursive: true, force: true });
   }
 

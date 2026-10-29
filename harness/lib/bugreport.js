@@ -31,7 +31,8 @@ function sanitize(text) {
   s = s.replace(/(\s-u)\s+[^\s:]+:\S+/g, `$1 ${SECRET}`);                                                       // curl -u user:pass
   s = s.replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s'"<>()]+/gi, '<url>');                                             // URL(자격 증명 · 내부 호스트 · 쿼리 토큰)
   s = s.replace(/\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?\b/g, '<ip>');
-  s = s.replace(/'[^'\n]*'|"[^"\n]*"/g, q => (/harness[\\/](lib|hooks|cli)/i.test(q) ? q[0] + keepHarness(q.slice(1, -1)) + q[0] : q.includes(SECRET) ? q : `${q[0]}…${q[0]}`));
+  // 작은따옴표는 낱말 밖에서 열고 닫힌 것만 — 낱말 안의 아포스트로피(lane's · didn't)를 따옴표로 읽어 문장을 통째로 지웠다(자동 이슈 #67)
+  s = s.replace(/(?<!\w)'(?:[^'\n]|(?<=\w)'(?=\w))*'(?!\w)|"[^"\n]*"/g, q => (/harness[\\/](lib|hooks|cli)/i.test(q) ? q[0] + keepHarness(q.slice(1, -1)) + q[0] : q.includes(SECRET) ? q : `${q[0]}…${q[0]}`));
   s = s.replace(/(?:[A-Za-z]:[\\/]|\\\\)[^\s'"()<>|]+/g, keepHarness);          // Windows 절대 경로 · UNC
   s = s.replace(/(?<![\w.:])\/(?:[^\s'"()<>|/]+\/)+[^\s'"()<>|]*/g, keepHarness);   // POSIX 절대 경로
   // 상대 경로(./ · ../ 로 시작 · 구분자 둘 이상 · 확장자 있는 파일) — 하네스 파일만 남긴다

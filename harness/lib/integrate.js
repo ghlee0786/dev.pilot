@@ -129,7 +129,9 @@ function liveLaneSessions(root, task) {
   if (inside(process.cwd())) return [];
   const common = S.paths(root).commonDir;
   let cand = [];
-  try { cand = Ch.listSessions(common).filter(s => inside(s.root) || inside(s.cwd)); } catch { return []; }
+  // [자동 이슈 #67] 부른 세션 자신(CLAUDE_CODE_SESSION_ID)은 뺀다 — 예전에 그 레인에 cd 했다가 돌아와 accept 를 부르면 세션 파일의 cwd 가 아직 레인이다.
+  const self = process.env.CLAUDE_CODE_SESSION_ID || null;
+  try { cand = Ch.listSessions(common).filter(s => String(s.session_id) !== self && (inside(s.root) || inside(s.cwd))); } catch { return []; }
   if (!cand.length) return [];
   let agents = null; try { agents = Ch.platformAgents(common); } catch { agents = null; }
   return cand.filter(s => Ch.sessionLive(s, agents)).map(s => { const a = Ch.agentOf(s, agents); return { session_id: s.session_id, name: a && a.name || null, status: a && a.status || null }; });

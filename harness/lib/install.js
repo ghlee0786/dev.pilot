@@ -591,6 +591,10 @@ function busy(root0, now) {
   const recent = f => { try { return now - fs.statSync(f).mtimeMs < QUIET_MS; } catch { return false; } };
   let here = null; try { here = S.repoRoot(process.cwd()); } catch { here = null; }   // 설치를 부른 세션 자신의 worktree 는 빼고 본다
   let tasks = []; try { tasks = S.listTasks(root); } catch { tasks = []; }
+  // 이미 v7 이 깔렸으면(harness/VERSION 주 판 ≥ 7) 남은 v6 작업은 v7 이 다룬다(start --from · status) — 이행은 v6 → v7 한 번만.
+  //   [2026-10-29 배포 뒤] 이 구분이 없어 이행을 마친 저장소의 다음 판 갱신(자동 갱신 포함)이 영영 거부됐다.
+  let installed = NaN; try { installed = parseInt(fs.readFileSync(path.join(root, 'harness', 'VERSION'), 'utf8').trim(), 10); } catch { installed = NaN; }
+  const v6Gate = !(installed >= 7);
   for (const t of tasks) {
     const P = S.taskPathsFor(root, t), wt = t.worktree_alt || t.worktree || P.wt;
     const dirs = [...new Set([wt, t.worktree].filter(Boolean))];   // 옆 경로로 옮겨진 작업의 대화 기록은 원래 자리에 묶여 있다
@@ -601,7 +605,7 @@ function busy(root0, now) {
       const tr = newestTranscript(dirs);
       if (tr && now - tr.mtimeMs < QUIET_MS) out.live.push(`작업 ${t.id} 의 세션(${tr.id})이 ${mins}분 안에 기록했다`);
     }
-    if (t.mode !== 'light' && V6_OPEN.has(t.status) && fs.existsSync(wt)) {
+    if (v6Gate && t.mode !== 'light' && V6_OPEN.has(t.status) && fs.existsSync(wt)) {
       let ri = null; try { ri = require('./lane').resumeInfo(t, wt); } catch { ri = null; }
       out.v6.push({ id: t.id, status: t.status, goal: String(t.goal || '').split(/\r?\n/)[0].slice(0, 120), branch: t.branch || P.branch, worktree: wt,
         session: (ri && ri.session_id) || t.session_id || null, command: (ri && ri.command) || null, transcript_dir: (ri && ri.transcript_dir) || null });
