@@ -3,7 +3,7 @@
 //   push: guard 가 에이전트의 git push 를 무조건 막는데 AGENTS.md 는 "명시한 뒤에만" 이라 적었다 → 좁힌 하네스 명령으로 허락의 길.
 //   [v7 Light] stop(무인 작업 멈추기)은 무인 작업자와 함께 빠졌다 — ST-* 를 빼고, 뺀 명령이 exit 2 와 대체 명령을 알리는지(RM-*)를 본다.
 const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
-const { spawnSync } = require('node:child_process');
+const { spawnSync, spawn } = require('node:child_process');
 const { makeReporter } = require('../run.js');
 const Push = require('../../harness/lib/push.js');
 const R = makeReporter('push — 허락의 길 · v7 에서 뺀 명령');
@@ -46,6 +46,25 @@ const cfg = d => { git(d, 'config', 'user.name', 't'); git(d, 'config', 'user.em
     const authOut = Push.format({ ok: false, remote: 'gitea', branch: 'main', reason: 'would push 1 commit(s)', fetchError: "remote: Failed to authenticate user\nfatal: Authentication failed for 'http://h/r.git/'" });
     const plainOut = Push.format({ ok: false, remote: 'gitea', branch: 'main', reason: 'git push failed: fatal: unable to access: Could not resolve host' });
     R.check('[PS-07] 인증 실패면 자기 터미널에서 자격을 저장하라고 안내한다 · 다른 실패에는 안내하지 않는다', /hint: authentication to gitea failed — run `git fetch gitea`/.test(authOut) && !/hint:/.test(plainOut), authOut + '\n--\n' + plainOut);
+    // PS-07b [2026-10-29 사용자 지시 중계] "토큰을 오래 보유하고 계속 요청하지 마라" — 원격 git 호출은 자격 증명 창을 띄우지 않는다(저장된 토큰만 쓴다) ·
+    //   fetch 가 인증에서 막히면 push 를 시도하지 않고 한 번만 알린다. 401 을 주는 서버(자식 프로세스) · 받은 환경을 적는 자격 증명 도우미로 본다 — 진짜 창은 뜨지 않는다.
+    {
+      const srv = spawn(process.execPath, ['-e', "const s=require('http').createServer((q,r)=>{r.writeHead(401,{'WWW-Authenticate':'Basic realm=\"x\"'});r.end()});s.listen(0,'127.0.0.1',()=>console.log(s.address().port))"], { stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true });
+      const port = await new Promise(res => srv.stdout.once('data', d => res(Number(String(d).trim()))));
+      const envLog = path.join(base, 'helper-env.jsonl').replace(/\\/g, '/');
+      const helper = path.join(base, 'helper.js').replace(/\\/g, '/');
+      write(helper, `require('fs').appendFileSync(${JSON.stringify(envLog)}, JSON.stringify({ gcm: process.env.GCM_INTERACTIVE || null, prompt: process.env.GIT_TERMINAL_PROMPT || null, op: process.argv[2] }) + '\\n');\n`);
+      const c = path.join(base, 'auth'); fs.mkdirSync(c); git(c, 'init', '-q', '-b', 'main'); cfg(c);
+      git(c, 'config', 'credential.helper', ''); git(c, 'config', '--add', 'credential.helper', `!node "${helper}"`);
+      git(c, 'remote', 'add', 'gitea', `http://127.0.0.1:${port}/r.git`);
+      write(path.join(c, 'f.txt'), 'f\n'); git(c, 'add', '-A'); git(c, 'commit', '-qm', 'f');
+      let ra; try { ra = Push.push({ root: c, remote: 'gitea', branch: 'main' }); } finally { srv.kill(); }
+      const calls = fs.existsSync(envLog) ? fs.readFileSync(envLog, 'utf8').trim().split('\n').map(l => JSON.parse(l)) : [];
+      const gets = calls.filter(x => x.op === 'get');
+      R.check('[PS-07b] 원격 git 호출은 창을 띄우지 않는다(GCM_INTERACTIVE=never · GIT_TERMINAL_PROMPT=0) · fetch 가 인증에서 막히면 push 를 시도하지 않고 한 번 알린다',
+        gets.length >= 1 && gets.every(x => x.gcm === 'never' && x.prompt === '0') && ra && !ra.ok && !ra.pushed && /authentication/i.test(Push.format(ra)) && !/git push failed/.test(ra.reason || ''),
+        JSON.stringify({ calls, reason: ra && ra.reason }));
+    }
 
     // ── 태그 push(릴리스) — 덮어쓰지 않는다 · 강제 없음 ──
     //   [2026-10-13] dev.harness 릴리스(v 태그 → release.yml)를 올릴 길이 없었다 — guard 는 git push 를 막고 하네스 push 는 브랜치만 올렸다.

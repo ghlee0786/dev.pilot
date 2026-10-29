@@ -9,6 +9,9 @@
 const S = require('./state'), G = require('./git');
 
 function usage(m) { return Object.assign(new Error(m), { code: 'USAGE' }); }
+// 원격 git 호출은 자격 증명 창(GCM · 편집기 askpass · 터미널)을 띄우지 않는다 — 저장된 토큰만 쓴다. 없으면 실패를 한 번 알린다(authHint).
+//   [2026-10-29 사용자 지시 중계] "토큰을 오래 보유하고 계속 요청하지 마라" — 하네스 push 의 fetch · ls-remote · push 가 매번 창을 띄울 수 있었다.
+const NO_PROMPT = { GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never', GIT_ASKPASS: '', SSH_ASKPASS: '' };
 
 function plan(o) {
   const root = S.mainRoot(o.root);
@@ -25,7 +28,7 @@ function plan(o) {
     else throw usage(`push: ${branch} has no upstream and there are ${remotes.length} remotes (${remotes.join(', ') || 'none'}) — name the remote`);
   }
   if (!remotes.includes(remote)) throw usage(`push: unknown remote ${remote} (have: ${remotes.join(', ') || 'none'})`);
-  const fetched = G.git(root, ['fetch', '--quiet', remote, branch], { allowFail: true });
+  const fetched = G.git(root, ['fetch', '--quiet', remote, branch], { allowFail: true, env: NO_PROMPT });
   const remoteRef = `${remote}/${branch}`;
   const remoteSha = G.headSha(root, `refs/remotes/${remoteRef}`);
   const localSha = G.headSha(root, branch);
@@ -48,14 +51,15 @@ function pushTag(o) {
   const remote = o.remote || (remotes.length === 1 ? remotes[0] : null);
   if (!remote) throw usage(`push --tag: there are ${remotes.length} remotes (${remotes.join(', ') || 'none'}) — name the remote`);
   if (!remotes.includes(remote)) throw usage(`push --tag: unknown remote ${remote} (have: ${remotes.join(', ') || 'none'})`);
-  const ls = G.git(root, ['ls-remote', '--tags', remote, `refs/tags/${tag}`, `refs/tags/${tag}^{}`], { allowFail: true });
+  const ls = G.git(root, ['ls-remote', '--tags', remote, `refs/tags/${tag}`, `refs/tags/${tag}^{}`], { allowFail: true, env: NO_PROMPT });
   const lines = ls.out.split(/\r?\n/).filter(Boolean).map(l => l.split(/\s+/));
   const peeled = (lines.find(([, r]) => r === `refs/tags/${tag}^{}`) || lines.find(([, r]) => r === `refs/tags/${tag}`) || [])[0] || null;
   const base = { root, remote, branch: `tag ${tag}`, tag, localSha: local, remoteSha: peeled, ahead: 0, commits: [], fetched: ls.ok, fetchError: ls.ok ? null : String(ls.err || '').trim().slice(0, 200) };
+  if (!ls.ok && AUTH.test(base.fetchError || '')) return { ...base, ok: false, pushed: false, reason: `authentication to ${remote} failed — nothing was pushed` };
   if (peeled && peeled === local) return { ...base, ok: true, pushed: false, reason: `nothing to push — ${remote} already has tag ${tag} at ${local.slice(0, 10)}` };
   if (peeled) return { ...base, ok: false, refused: true, reason: `${remote} has tag ${tag} at a different commit (${peeled.slice(0, 10)}; local ${local.slice(0, 10)}) — tags are not overwritten; use a new tag name` };
   if (o.dryRun) return { ...base, ok: true, pushed: false, dryRun: true, reason: `would push tag ${tag} (${local.slice(0, 10)})` };
-  const r = G.git(root, ['push', remote, `refs/tags/${tag}:refs/tags/${tag}`], { allowFail: true, timeout: 180000 });
+  const r = G.git(root, ['push', remote, `refs/tags/${tag}:refs/tags/${tag}`], { allowFail: true, timeout: 180000, env: NO_PROMPT });
   if (!r.ok) return { ...base, ok: false, pushed: false, reason: `git push failed: ${String(r.err || '').trim().slice(0, 400)}` };
   return { ...base, ok: true, pushed: true, reason: `pushed tag ${tag} (${local.slice(0, 10)}) to ${remote}` };
 }
@@ -63,11 +67,13 @@ function pushTag(o) {
 function push(o) {
   if (o.tag) return pushTag(o);
   const p = plan(o);
+  // 인증에서 막혔으면 push 도 같은 이유로 막힌다 — 다시 묻지 않고 여기서 한 번 알린다
+  if (!p.fetched && AUTH.test(p.fetchError || '')) return { ...p, ok: false, pushed: false, reason: `authentication to ${p.remote} failed — nothing was pushed` };
   if (!p.fetched && p.remoteSha == null) {/* 새 브랜치일 수 있다 — push 가 판단한다 */}
   if (p.behind > 0) return { ...p, ok: false, refused: true, reason: `${p.remote}/${p.branch} is ${p.behind} commit(s) ahead of ${p.branch} — not a fast-forward. Bring those commits in yourself (pull/merge), then push again.` };
   if (p.ahead === 0) return { ...p, ok: true, pushed: false, reason: `nothing to push — ${p.remote}/${p.branch} already has ${p.branch}` };
   if (o.dryRun) return { ...p, ok: true, pushed: false, dryRun: true, reason: `would push ${p.ahead} commit(s)` };
-  const r = G.git(p.root, ['push', p.remote, `refs/heads/${p.branch}:refs/heads/${p.branch}`], { allowFail: true, timeout: 180000 });
+  const r = G.git(p.root, ['push', p.remote, `refs/heads/${p.branch}:refs/heads/${p.branch}`], { allowFail: true, timeout: 180000, env: NO_PROMPT });
   if (!r.ok) return { ...p, ok: false, pushed: false, reason: `git push failed: ${String(r.err || '').trim().slice(0, 400)}` };
   return { ...p, ok: true, pushed: true, reason: `pushed ${p.ahead} commit(s) to ${p.remote}/${p.branch}` };
 }
