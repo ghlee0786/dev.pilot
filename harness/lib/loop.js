@@ -260,6 +260,7 @@ async function resume(o) {
   if (added.length && task.runtime === 'codex') log(`[pilot] ${task.id} — note: allow rules have no effect on the Codex runtime; its sandbox governs what runs`);
   const c = { root, P, task, run, lock, log, t0, spentBefore: task.spent.wall_ms || 0, o, added };
   try {
+    if (G.interruptedAdd(root, P.wt)) return finish(c, 'interrupted', G.incompleteWhy(P.wt));
     if (!fs.existsSync(P.wt) || !G.worktreeRegistered(root, P.wt) || !G.isWorktreeRoot(P.wt, task.branch)) {
       const why = G.clearWorktreeSlot(root, P.wt, task.branch, o.removalWaitMs, G.slotOpts(root, task.id, P.dir, log));
       if (why && !G.useAltWorktree(root, task, P, why, log)) return finish(c, 'interrupted', why);
