@@ -93,7 +93,11 @@ function v6Lines(s, ko) {
   for (const t of v.slice(0, V6_SHOW)) {
     L.push(`  ${t.id}  ${t.status}${t.mode ? ` (${t.mode})` : ''} — ${t.goal}`);
     L.push(`    node harness/cli.js start --from ${t.id} "<${ko ? '목표' : 'goal'}>"   ${t.worktree ? (ko ? '(그 worktree 를 그대로 레인으로 받는다)' : '(adopts its worktree as a lane, in place)') : (ko ? '(worktree 가 없다 — 그 브랜치에서 새 레인)' : '(no worktree — a new lane from its branch)')}`);
-    if (t.resume && t.resume.command) L.push(`    ${t.resume.command}   ${ko ? '(작업자의 대화를 그대로 이어 간다)' : "(continues the worker's conversation)"}`);
+    if (t.resume && t.resume.command) {
+      L.push(`    ${t.resume.command}   ${ko ? '(작업자의 대화를 그대로 이어 간다)' : "(continues the worker's conversation)"}`);
+      const moved = require('./lane').movedNote(t.resume, t.worktree, ko);
+      if (moved) L.push(`    ${moved}`);
+    }
     else if (t.worktree) L.push(`    cd "${t.worktree}"   ${ko ? '(대화 기록을 찾지 못했다)' : '(no conversation transcript found)'}`);
   }
   if (v.length > V6_SHOW) L.push(ko ? `  … ${v.length - V6_SHOW}개 더(status --json 의 v6)` : `  … ${v.length - V6_SHOW} more (v6 in status --json)`);

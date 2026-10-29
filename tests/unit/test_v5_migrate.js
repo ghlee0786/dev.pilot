@@ -119,6 +119,21 @@ function v6Task(root, id, o) {
     write(path.join(r10, 'harness', 'cli.js'), '// untracked, not ignored\n');
     const l10 = Ln.start({ ...quiet, root: r10, goal: 'lane where harness is neither tracked nor ignored' });
     R.check('[MG-09] 무시되지 않는 harness/ 는 복사하지 않고(커밋될 수 있다) 보고에 주의', !fs.existsSync(path.join(l10.worktree, 'harness')) && /주의: harness/.test(l10.report), l10.report);
+
+    // MG-10 [2026-10-29 설치 전 점검 · 실제 배포처] 작업 폴더가 옆 경로(<id>-2, worktree_alt)로 옮겨졌고 대화 기록은 원래 자리에 묶여 있다 —
+    //   옆 경로로 cd 하면 claude --resume 이 그 대화를 찾지 못한다. 기록이 있는 폴더로 안내하고, 작업 파일이 옮겨졌다고 함께 알린다.
+    const r11 = repo({ 'a.txt': 'a\n' });
+    const ID11 = 't-20261021-104504-42a0', SID11 = 'e572658a-44cc-41f2-b111-9030fedc7410';
+    const P11 = v6Task(r11, ID11, { status: 'capped', session_id: SID11 });
+    const alt11 = `${P11.wt}-2`;
+    git(r11, 'worktree', 'move', P11.wt, alt11); fs.mkdirSync(P11.wt);
+    const t11 = S.readTask(r11, ID11); t11.worktree_alt = alt11; S.writeTask(r11, t11);
+    write(path.join(home, '.claude', 'projects', Ln.mangle(fs.realpathSync.native(P11.wt)), `${SID11}.jsonl`), '{}\n');
+    const tx11 = St.formatStatus({ ...St.status({ root: r11 }), language: 'Korean' });
+    R.check('[MG-10] status: 대화 기록이 원래 자리에 있으면 그 폴더로 이어 가는 명령 · 작업 파일은 옆 경로라고 알린다',
+      tx11.includes(`cd "${P11.wt}" ; claude --resume ${SID11}`) && tx11.includes(alt11), tx11);
+    const a11 = Ln.start({ ...quiet, root: r11, goal: 'go on', from: ID11 });
+    R.check('[MG-10] start --from 보고: 같은 명령 · 작업 폴더(옆 경로) 안내', a11.worktree === alt11 && a11.report.includes(`cd "${P11.wt}" ; claude --resume ${SID11}`) && a11.resume.transcript_dir === P11.wt, a11.report);
   } catch (e) { R.check('예외 없이 끝난다', false, String(e && e.stack || e).slice(0, 900)); }
   finally { try { fs.rmSync(base, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }); } catch { /* 정리 실패는 결과와 무관 */ } }
   R.done();

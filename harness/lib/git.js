@@ -410,8 +410,10 @@ function procsIn(dir) {
     const r = spawnSync('powershell', ['-NoProfile', '-NonInteractive', '-Command', ps], { encoding: 'utf8', windowsHide: true, timeout: 30000, maxBuffer: 32 << 20 });
     rows = String(r.stdout || '').split(/\r?\n/).map(l => l.split('\t')).filter(c => c.length >= 4).map(([pid, name, exe, cmd]) => ({ pid: Number(pid), name, text: `${exe} ${cmd}` }));
   } else {
-    const r = spawnSync('ps', ['-eo', 'pid=,comm=,args='], { encoding: 'utf8', timeout: 15000, maxBuffer: 32 << 20 });
-    rows = String(r.stdout || '').split('\n').map(l => /^\s*(\d+)\s+(\S+)\s+(.*)$/.exec(l)).filter(Boolean).map(m => ({ pid: Number(m[1]), name: m[2], text: m[3] }));
+    // 이름은 따로(ucomm — 실행 파일 이름만) — macOS 의 comm 은 전체 경로라 공백(…/Microsoft VS Code/…)에서 잘려 사용자 앱을 알아보지 못했다.
+    const ps = fmt => String(spawnSync('ps', ['-eo', `pid=,${fmt}=`], { encoding: 'utf8', timeout: 15000, maxBuffer: 32 << 20 }).stdout || '').split('\n').map(l => /^\s*(\d+)\s+(.*)$/.exec(l)).filter(Boolean);
+    const names = new Map(ps('ucomm').map(m => [m[1], m[2].trim()]));
+    rows = ps('args').map(m => ({ pid: Number(m[1]), name: names.get(m[1]) || '', text: m[2] }));
   }
   // 경로 뒤가 구분자 · 따옴표 · 공백 · 끝일 때만 그 폴더다 — [2026-10-17 적대적 검증] 접두어로만 비교해 …/<id> 를 치우다
   //   옆 경로 …/<id>-2 에서 도는 살아 있는 작업을 잡았다.

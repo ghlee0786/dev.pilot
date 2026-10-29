@@ -71,6 +71,7 @@ const isObj = v => !!v && typeof v === 'object' && !Array.isArray(v);
 // 하네스가 일하는 중으로 보는 창 — 작업 기록 · 세션 기록이 이 안에 바뀌었으면 갈아 끼우지 않는다.
 const QUIET_MS = 20 * 60 * 1000;
 const V6_OPEN = new Set(['running', 'interrupted', 'capped', 'stalled', 'blocked', 'failed', 'error']);
+const FINAL = new Set(['accepted', 'cancelled']);
 
 // ── 훅 정의 ──
 // Claude: ${CLAUDE_PROJECT_DIR} 는 세션 시작 루트에 고정된다 — cwd 가 하위 폴더나 worktree 로 옮겨도 경로가 깨지지 않는다(Claude 조사 §4 · §10.3).
@@ -565,10 +566,10 @@ function blockSpan(text) {
 // Claude Code 의 세션 기록 폴더 이름 — 경로에서 영문자 · 숫자 아닌 글자를 모두 '-' 로(예: C:\a_b → C--a-b).
 const mangle = p => String(p).replace(/[^A-Za-z0-9]/g, '-');
 // 그 worktree 에서 돈 세션의 가장 최근 기록 {id, mtimeMs} | null — ~/.claude/projects/<mangled>/*.jsonl
-function newestTranscript(wt) {
-  const dir = path.join(os.homedir(), '.claude', 'projects');
-  const cands = new Set([path.resolve(wt)]);
-  try { cands.add(fs.realpathSync.native(wt)); } catch { /* 없음 */ }
+function newestTranscript(wts) {
+  const dir = path.join(process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude'), 'projects');
+  const cands = new Set();
+  for (const wt of [].concat(wts)) { cands.add(path.resolve(wt)); try { cands.add(fs.realpathSync.native(wt)); } catch { /* 없음 */ } }
   let best = null;
   for (const p of cands) {
     const d = path.join(dir, mangle(p));
@@ -592,15 +593,18 @@ function busy(root0, now) {
   let tasks = []; try { tasks = S.listTasks(root); } catch { tasks = []; }
   for (const t of tasks) {
     const P = S.taskPathsFor(root, t), wt = t.worktree_alt || t.worktree || P.wt;
+    const dirs = [...new Set([wt, t.worktree].filter(Boolean))];   // 옆 경로로 옮겨진 작업의 대화 기록은 원래 자리에 묶여 있다
+    if (FINAL.has(t.status)) continue;   // 끝난 작업에 남은 주인 · 기록은 일하는 흔적이 아니다
     if (t.owner && S.ownerAlive(t.owner)) out.live.push(`작업 ${t.id} 의 주인 프로세스(pid ${t.owner.pid})가 살아 있다`);
     else if (recent(P.taskFile) || recent(P.logFile)) out.live.push(`작업 ${t.id} 의 기록이 ${mins}분 안에 바뀌었다`);
     else if (!(here && C.samePath(here, wt))) {
-      const tr = newestTranscript(wt);
+      const tr = newestTranscript(dirs);
       if (tr && now - tr.mtimeMs < QUIET_MS) out.live.push(`작업 ${t.id} 의 세션(${tr.id})이 ${mins}분 안에 기록했다`);
     }
     if (t.mode !== 'light' && V6_OPEN.has(t.status) && fs.existsSync(wt)) {
-      const tr = t.session_id ? null : newestTranscript(wt);
-      out.v6.push({ id: t.id, status: t.status, goal: String(t.goal || '').split(/\r?\n/)[0].slice(0, 120), branch: t.branch || P.branch, worktree: wt, session: t.session_id || (tr && tr.id) || null });
+      let ri = null; try { ri = require('./lane').resumeInfo(t, wt); } catch { ri = null; }
+      out.v6.push({ id: t.id, status: t.status, goal: String(t.goal || '').split(/\r?\n/)[0].slice(0, 120), branch: t.branch || P.branch, worktree: wt,
+        session: (ri && ri.session_id) || t.session_id || null, command: (ri && ri.command) || null, transcript_dir: (ri && ri.transcript_dir) || null });
     }
   }
   let locks = []; try { locks = S.listLocks(root); } catch { locks = []; }
@@ -610,7 +614,8 @@ function busy(root0, now) {
 // --migrate — 끝나지 않은 v6 작업마다 v7 에서 이어 가는 법을 먼저 적고(<git-common-dir>/harness/v7-migration.md) 같은 목록을 보인다.
 function migrationLines(list) {
   return list.map(t => [`## ${t.id} (${t.status})`, `- 목표: ${t.goal || '(없음)'}`, `- 브랜치: ${t.branch}`, `- worktree: ${t.worktree}`, `- 세션: ${t.session || '(못 찾음)'}`,
-    `- 이어 가기: \`node harness/cli.js start --from ${t.id}\` (그 worktree 를 그대로 쓴다) → \`cd "${t.worktree}" ; claude${t.session ? ` --resume ${t.session}` : ''}\``].join('\n'));
+    `- 이어 가기: \`node harness/cli.js start --from ${t.id}\` (그 worktree 를 그대로 쓴다) → \`${t.command || `cd "${t.worktree}" ; claude`}\``,
+    ...(t.transcript_dir ? [`- 대화 기록은 원래 자리(${t.transcript_dir})에 묶여 있다 — 작업 파일은 ${t.worktree} 로 옮겨졌다. 이어 간 대화에 그 폴더에서 일하라고 알려 준다.`] : [])].join('\n'));
 }
 function writeMigration(ctx, list) {
   const file = path.join(C.harnessDir(ctx.common), 'v7-migration.md');

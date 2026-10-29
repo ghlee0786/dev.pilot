@@ -20,33 +20,51 @@ const FINAL = new Set(['accepted', 'cancelled']);
 const mangle = p => String(p).replace(/[^A-Za-z0-9]/g, '-');
 const SID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{5,127}$/;   // 셸 명령에 그대로 싣는다 — 이 꼴만
 function claudeProjectsDir() { return path.join(process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude'), 'projects'); }
-// 그 폴더에서 가장 최근의 대화 id — 없으면 null
+// 대화 기록 { id, dir } — dirs 중 sid 의 기록이 있는 폴더(sid 가 없으면 가장 최근 기록) · 없으면 null
 let projCache = null;   // status 가 작업마다 부른다 — 폴더 목록은 몇 초 동안 한 번만 읽는다
-function transcriptSession(wt) {
+function findTranscript(dirs, sid) {
   const dir = claudeProjectsDir();
-  let names = [];
-  if (projCache && projCache.dir === dir && Date.now() - projCache.at < 5000) names = projCache.names;
-  else { try { names = fs.readdirSync(dir); } catch { names = []; } projCache = { dir, at: Date.now(), names }; }
+  const wants = dirs.map(d => new Set([d, (() => { try { return fs.realpathSync.native(d); } catch { return d; } })()].map(p => mangle(path.resolve(p)).toLowerCase())));
+  const read = () => { let n = []; try { n = fs.readdirSync(dir); } catch { n = []; } projCache = { dir, at: Date.now(), names: n }; return n; };
+  const cached = projCache && projCache.dir === dir && Date.now() - projCache.at < 5000;
+  let names = cached ? projCache.names : read();
+  // 캐시를 채운 뒤 생긴 기록 폴더(방금 연 세션)는 목록에 없다 — 찾는 폴더가 하나도 없으면 한 번 다시 읽는다
+  if (cached && !names.some(x => wants.some(w => w.has(x.toLowerCase())))) names = read();
   if (!names.length) return null;
-  const want = new Set([wt, (() => { try { return fs.realpathSync.native(wt); } catch { return wt; } })()].map(p => mangle(path.resolve(p)).toLowerCase()));
   let best = null;
-  for (const n of names.filter(x => want.has(x.toLowerCase()))) {
-    let files = []; try { files = fs.readdirSync(path.join(dir, n)); } catch { continue; }
-    for (const f of files) {
-      if (!f.endsWith('.jsonl') || !SID_RE.test(f.slice(0, -6))) continue;
-      let m = 0; try { m = fs.statSync(path.join(dir, n, f)).mtimeMs; } catch { continue; }
-      if (!best || m > best.m) best = { id: f.slice(0, -6), m };
+  for (const [i, d] of dirs.entries()) {
+    const want = wants[i];
+    for (const n of names.filter(x => want.has(x.toLowerCase()))) {
+      let files = []; try { files = fs.readdirSync(path.join(dir, n)); } catch { continue; }
+      for (const f of files) {
+        const id = f.slice(0, -6);
+        if (!f.endsWith('.jsonl') || !SID_RE.test(id) || (sid && id !== sid)) continue;
+        let m = 0; try { m = fs.statSync(path.join(dir, n, f)).mtimeMs; } catch { continue; }
+        if (!best || m > best.m) best = { id, dir: d, m };
+      }
     }
   }
-  return best ? best.id : null;
+  return best ? { id: best.id, dir: best.dir } : null;
 }
-// 작업자의 대화를 그대로 이어 가는 명령 → { runtime, session_id, source, command } (모르면 command null)
+// 그 폴더에서 가장 최근의 대화 id — 없으면 null
+function transcriptSession(wt) { const f = findTranscript([wt]); return f ? f.id : null; }
+// 작업자의 대화를 그대로 이어 가는 명령 → { runtime, session_id, source, command, transcript_dir? } (모르면 command null)
+//   [2026-10-29 설치 전 점검] 작업 폴더가 옆 경로(worktree_alt)로 옮겨졌으면 대화 기록은 원래 자리(task.worktree)에 묶여 있다 —
+//   기록이 있는 폴더에서 이어 가야 claude --resume 이 찾는다(transcript_dir 로 알린다).
 function resumeInfo(task, wt) {
   const runtime = task.runtime === 'codex' ? 'codex' : 'claude';
   const known = SID_RE.test(String(task.session_id || '')) ? task.session_id : null;
-  const sid = known || (runtime === 'claude' ? transcriptSession(wt) : null);
-  const command = sid ? `cd "${wt}" ; ${runtime === 'codex' ? `codex resume ${sid}` : `claude --resume ${sid}`}` : null;
-  return { runtime, session_id: sid, source: known ? 'task' : sid ? 'transcript' : null, command };
+  const found = runtime === 'claude' ? findTranscript([...new Set([wt, task.worktree].filter(Boolean))], known) : null;
+  const sid = known || (found && found.id);
+  const at = found ? found.dir : wt;
+  const command = sid ? `cd "${at}" ; ${runtime === 'codex' ? `codex resume ${sid}` : `claude --resume ${sid}`}` : null;
+  return { runtime, session_id: sid, source: known ? 'task' : sid ? 'transcript' : null, command, ...(at !== wt ? { transcript_dir: at } : {}) };
+}
+// 대화 기록이 원래 자리에 묶여 있을 때 붙이는 한 줄
+function movedNote(resume, wt, ko) {
+  if (!resume || !resume.transcript_dir) return null;
+  return ko ? `(대화 기록은 원래 자리에 묶여 있다 — 작업 파일은 ${wt} 로 옮겨졌다. 이어 간 대화에 그 폴더에서 일하라고 알려 준다)`
+    : `(the conversation is tied to the original folder — the work files moved to ${wt}; tell the resumed conversation to work there)`;
 }
 
 // ── 하네스가 추적되지 않는 저장소 ────────────────────────────────────────────
@@ -209,6 +227,7 @@ function adoptReport(task, wt, resume) {
   if (task.ports) L.push(`포트: ${task.ports.base}–${task.ports.base + task.ports.count - 1} (이 칸 전용 · HARNESS_PORT_BASE=${task.ports.base} HARNESS_PORT_COUNT=${task.ports.count})`);
   L.push('작업자의 대화를 그대로 이어 가려면:',
     resume.command ? `  ${resume.command}` : `  대화 기록을 찾지 못했다 — 그 폴더에서 새 세션을 연다: cd "${wt}" ; claude`,
+    ...(movedNote(resume, wt, true) ? [`  ${movedNote(resume, wt, true)}`] : []),
     `끝나면(사용자가 말한 뒤) ${cli} accept ${task.id} — 검사를 한 번 돌려 나빠지지 않았을 때만 병합한다.`, `버리기: ${cli} cancel ${task.id}`);
   return L.join('\n');
 }
@@ -240,4 +259,4 @@ function report(root, task, related, harnessCopy) {
   return L.join('\n');
 }
 
-module.exports = { start, resumeInfo, transcriptSession, mangle };
+module.exports = { start, resumeInfo, transcriptSession, movedNote, mangle };

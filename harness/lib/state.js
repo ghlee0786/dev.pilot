@@ -203,6 +203,9 @@ function ownerAlive(owner) {
     if (typeof now === 'number') return Math.abs(now - started) <= START_SLACK_MS;
     return !(at && Date.now() - at > FOREIGN_STALE_MS);   // 시작 시각을 알 수 없다 — 신호 나이로
   }
+  // [2026-10-29 설치 전 점검] 시작 시각이 없는 옛 기록 — 주인은 마지막 신호 때 살아 있었다. 지금 그 pid 의 프로세스가 그 뒤에 시작됐으면
+  //   다른 프로세스다(재부팅 뒤 svchost 가 같은 pid 를 받아 끝난 작업이 '일하는 중' 으로 보였다).
+  if (at) { const now = procStartMs(Number(owner.pid)); if (now === 'none' || (typeof now === 'number' && now > at + START_SLACK_MS)) return false; }
   return !(at && Date.now() - at > FOREIGN_STALE_MS);
 }
 

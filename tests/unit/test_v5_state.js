@@ -225,6 +225,9 @@ function runChildren(n, script, env) {
       const real = S.ownerAlive({ pid: sl.pid, host, at: old, started_at: new Date(spawnedAt).toISOString() });
       const nowFresh = S.ownerAlive({ pid: sl.pid, host, heartbeat_at: fresh });
       const selfStart = S.procStartMs(process.pid);
+      // [2026-10-29 설치 전 점검] 시작 시각이 없는 옛 기록 — 재부팅 뒤 같은 pid 를 받은 프로세스(svchost)가 마지막 신호 뒤에 시작됐다 → 다른 프로세스
+      const rebooted = S.ownerAlive({ pid: sl.pid, host, heartbeat_at: new Date(spawnedAt - 3600000).toISOString() });
+      R.check('[ST-15] 시작 시각이 없는 옛 기록: 그 pid 의 프로세스가 마지막 신호 뒤에 시작됐으면 죽은 주인(pid 재사용)', rebooted === false, JSON.stringify({ rebooted }));
       R.check('[ST-14] 같은 호스트: 신호가 사흘 멈춘 옛 기록 → 죽음 · 시작 시각이 다른(재사용된) pid → 죽음 · 시작 시각이 맞으면 오래 쥐어도 산 것 · 새 신호면 산 것 · 없는 pid 는 none',
         !v6 && !reused && real && nowFresh && typeof selfStart === 'number' && Math.abs(selfStart - Date.parse(S.PROC_STARTED_AT)) < 10000 && S.procStartMs(deadPid()) === 'none',
         JSON.stringify({ v6, reused, real, nowFresh, selfStart, started: S.PROC_STARTED_AT }));

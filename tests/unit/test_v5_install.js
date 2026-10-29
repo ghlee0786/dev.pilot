@@ -306,6 +306,12 @@ try {
   fs.utimesSync(path.join(taskDir, 'task.json'), ago(30 * 60000), ago(30 * 60000));
   const r10b = install({ target: t10, source: SOURCE });
   R.check('[RUN] 주인이 죽고 조용한 작업은 막지 않는다', r10b.ok !== false && read(path.join(t10, 'harness', 'cli.js')) === cliBefore, r10b.report);
+  // [2026-10-29 설치 전 점검] 끝난(accepted) 작업에 남은 주인 기록 — 그 pid 가 살아 있어도(재사용) 일하는 중이 아니다
+  fs.writeFileSync(path.join(taskDir, 'task.json'), JSON.stringify({ id: 't-20260930-000000-abcd', status: 'accepted', owner: { pid: process.pid, host: os.hostname(), heartbeat_at: ago(60 * 60000).toISOString() } }));
+  fs.utimesSync(path.join(taskDir, 'task.json'), ago(30 * 60000), ago(30 * 60000));
+  fs.writeFileSync(path.join(t10, 'harness', 'cli.js'), cliBefore + '\n// local marker\n');
+  const r10c = install({ target: t10, source: SOURCE });
+  R.check('[RUN] 끝난(accepted) 작업에 남은 주인 기록은 일하는 중으로 보지 않는다', r10c.ok !== false && read(path.join(t10, 'harness', 'cli.js')) === cliBefore, r10c.report);
 
   // ── [2026-10-29 감사] v7 에서는 'running' 작업이 생기지 않는다 — accept · batch 의 잠금 · 레인 세션의 기록(transcript)으로 일하는 중을 본다 ──
   {
