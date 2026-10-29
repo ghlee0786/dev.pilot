@@ -8,9 +8,12 @@ const S = require('./state');
 const LOCK_ERR = /index\.lock|config\.lock|\.lock': File exists|Unable to create '.*\.lock'|could not lock|cannot lock ref|Another git process/i;
 const BACKOFF_MS = [200, 400, 800, 1600, 3200];
 
+// [자동 이슈 #54] Windows: core.longpaths 가 없는 저장소에서 MAX_PATH 를 넘는 경로가 있으면 git 이 그 파일을 읽지 못해
+//   status 가 "바뀌었다" 로 보고(정리가 시작도 못 함) · worktree remove 는 'Filename too long' 으로 등록만 지웠다 — 하네스의 git 은 늘 긴 경로를 켠다.
+const LONGPATHS = process.platform === 'win32' ? ['-c', 'core.longpaths=true'] : [];
 function run(cwd, args, o) {
   const opt = o || {};
-  const r = spawnSync('git', args, { cwd, encoding: 'utf8', windowsHide: true, maxBuffer: 256 * 1024 * 1024, input: opt.input, env: opt.env ? { ...process.env, ...opt.env } : process.env });
+  const r = spawnSync('git', [...LONGPATHS, ...args], { cwd, encoding: 'utf8', windowsHide: true, maxBuffer: 256 * 1024 * 1024, input: opt.input, env: opt.env ? { ...process.env, ...opt.env } : process.env });
   return { ok: r.status === 0, code: r.status, out: String(r.stdout || ''), err: String(r.stderr || (r.error && r.error.message) || '') };
 }
 function fail(args, r) {
@@ -260,14 +263,15 @@ function removeWorktree(root, wt, o) {
   if (subKept.length) return { ok: false, error: `submodule copies were changed in the worktree (their changes are not in the branch): ${subKept.join(', ')}` };
   let r = null, first = null;
   for (let i = 0; i < 3; i++) {
-    r = git(root, ['worktree', 'remove', wt], { allowFail: true, retryLock: true });
+    r = git(root, ['worktree', 'remove', wt], { allowFail: true, retryLock: true });   // 긴 경로는 run() 이 켠다(#54)
     if (r.ok) break;
     if (!first) first = r.err.trim();
     // [버그 2026-10-01] 1차 시도가 등록과 파일은 지우고 폴더만 못 지운 뒤(죽은 프로세스의 핸들), 2차부터는 'is not a working tree' 가 되어
     //   진짜 이유를 덮고 거부로 끝났다. 등록이 사라졌으면 prune 하고 남은 빈 폴더를 치운다.
+    //   [#54] 남은 것이 빈 폴더가 아니어도 — 이 호출이 처음에 깨끗함(isClean)을 확인했으니 내용은 브랜치에 있다 — 긴 경로째 지운다.
     if (/is not a working tree/i.test(r.err) && !worktreeRegistered(root, wt)) {
       git(root, ['worktree', 'prune'], { allowFail: true });
-      const gone = removeEmptyDir(wt);
+      const gone = removeEmptyDir(wt) || rdTree(wt);
       if (gone) { try { const parent = path.dirname(wt); if (fs.readdirSync(parent).length === 0) fs.rmdirSync(parent); } catch { /* 다른 worktree 가 남아 있다 */ } return { ok: true, removed: true, recovered: first }; }
       return { ok: false, error: `the worktree registration is gone but the folder ${wt} is not empty — inspect it and remove it by hand (first error: ${first.slice(0, 200)})`, leftover: true };
     }
@@ -278,6 +282,13 @@ function removeWorktree(root, wt, o) {
   return { ok: true, removed: true };
 }
 
+// Windows: 긴 경로(MAX_PATH 초과) · 읽기 전용이 섞인 폴더를 rd /s /q "\\?\…" 로 지운다 → 지웠으면 true. 내용이 브랜치에 있는(깨끗했던) worktree 에만 쓴다.
+function rdTree(dir, o) {
+  if (!fs.existsSync(dir)) return true;
+  if (process.platform !== 'win32') return false;
+  try { ((o && o.rd) || (p => spawnSync('cmd.exe', ['/d', '/c', 'rd', '/s', '/q', `\\\\?\\${path.resolve(p)}`], { windowsHide: true, timeout: 120000 })))(dir); } catch { /* 남으면 아래 */ }
+  return !fs.existsSync(dir);
+}
 // 비어 있는(하위 폴더도 비어 있는) 폴더만 지운다 → 지웠으면 true. 파일이 하나라도 있으면 건드리지 않는다.
 function removeEmptyDir(dir) {
   const hasFile = d => { let ents = []; try { ents = fs.readdirSync(d, { withFileTypes: true }); } catch { return false; } return ents.some(e => e.isDirectory() ? hasFile(path.join(d, e.name)) : true); };
@@ -532,7 +543,7 @@ function copyWorktreeInclude(root, wt) {
 }
 
 module.exports = {
-  git, identityArgs, headSha, isWorktreeRoot, removeEmptyDir, clearWorktreeSlot, slotOpts, useAltWorktree, keepEol, procsIn, killProcsIn, salvageLeftover, currentBranch, branchExists, tagExists, isAncestor, ensureRepo, isRepo, statusEntries, dirtyFiles, isClean, ignoredChanges,
+  git, identityArgs, headSha, isWorktreeRoot, removeEmptyDir, rdTree, clearWorktreeSlot, slotOpts, useAltWorktree, keepEol, procsIn, killProcsIn, salvageLeftover, currentBranch, branchExists, tagExists, isAncestor, ensureRepo, isRepo, statusEntries, dirtyFiles, isClean, ignoredChanges,
   commitAll, unaddablePaths, isSecretPath, ensureExclude, addWorktree, worktreeList, worktreeRegistered, checkoutOf, mainWorktree, removeWorktree, samePath,
   diffNames, mergeBase, unmergedFiles, mergeInProgress, hasConflictMarkers, hasConflictMarkersText, MARKER_RE, worktreeIncludeFiles, copyWorktreeInclude, sha1, LOCK_ERR,
   gitlinks, fillSubmodules, dropSubmoduleClones, worktreeLinks,

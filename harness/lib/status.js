@@ -22,7 +22,7 @@ function status(o) {
     const alive = running && S.ownerAlive(t.owner);
     const files = FINAL.has(t.status) ? [] : taskFiles(root, t);
     const hb = t.owner && t.owner.heartbeat_at ? Date.parse(t.owner.heartbeat_at) : null;
-    return { id: t.id, status: t.status, reason: t.reason || '', goal: String(t.goal || '').split(/\r?\n/)[0].slice(0, 100), runtime: t.runtime,
+    return { id: t.id, status: t.status, mode: t.mode || null, reason: t.reason || '', goal: String(t.goal || '').split(/\r?\n/)[0].slice(0, 100), runtime: t.runtime,
       owner: t.owner ? { pid: t.owner.pid, host: t.owner.host, alive, heartbeat_at: t.owner.heartbeat_at || null, heartbeat_age_s: hb ? Math.round((now - hb) / 1000) : null } : null,
       stale: running && !alive, branch: t.branch, branch_exists: !!(t.branch && G.branchExists(root, t.branch)), base_branch: t.base_branch,
       files_changed: files.length, files, cost_usd: t.spent ? t.spent.cost_usd : 0, worktree: t.worktree && fs.existsSync(t.worktree) ? t.worktree : null,
@@ -38,7 +38,10 @@ function status(o) {
   // 메인 체크아웃의 미커밋 변경 → 세션별 · 주인 없음.
   const main = G.mainWorktree(root);
   const dirty = G.dirtyFiles(main).map(e => e.path).filter(f => !f.startsWith('.harness-worktrees/'));
-  const sessions = S.readSessions(root);
+  // 다른 worktree(가벼운 길)에서 일하는 세션의 파일은 그 worktree 의 상대 경로다 — 메인 체크아웃의 같은 이름 파일을 그 세션 것으로 잡지 않는다.
+  const Ch = require('../hooks/_common');
+  const where = new Map(Ch.listSessions(S.paths(root).commonDir).map(s => [String(s.session_id), s.root || null]));
+  const sessions = S.readSessions(root).filter(s => { const r = where.get(String(s.session_id)); return !r || Ch.samePath(r, main); });
   const bySession = [], owned = new Set();
   for (const s of sessions) {
     const mine = new Set(s.files.map(norm));
@@ -51,7 +54,56 @@ function status(o) {
   // 출력 언어 — 저장소 블록 reply_language(부른 체크아웃 · 메인), 없으면 지정 없음(영어). [2026-10-13] 결과가 영어로 나온다는 보고.
   let language = null; try { const K = require('./checks'); language = K.yamlString(main, 'reply_language') || K.yamlString(root, 'reply_language'); } catch { /* 블록 없음 */ }
   const cost_total = Math.round(tasks.reduce((a, t) => a + (Number(t.cost_usd) || 0), 0) * 100) / 100;
-  return { root, checkout: main, branch: G.currentBranch(main), language, cost_total, tasks: tasks.map(({ files, ...t }) => t), broken: S.listBrokenTasks(root), overlaps, uncommitted: { by_session: bySession, unowned } };
+  return { root, checkout: main, branch: G.currentBranch(main), language, cost_total, tasks: tasks.map(({ files, ...t }) => t), broken: S.listBrokenTasks(root), overlaps, uncommitted: { by_session: bySession, unowned },
+    board: board(root, tasks, now) };
+}
+
+// 게시판 — 대화형 세션(세션 파일 그대로: root · branch · goal · last_seen · ended_at)과 가벼운 길(mode light).
+//   산 세션의 첫 근거는 플랫폼 목록(`claude agents --json` · _common.platformAgents · 30초 캐시) — 이름(예: workspace-cpp-34) · busy/idle.
+//   state: busy|idle(목록에 있음) · live|quiet(목록 없음 · Codex — last_seen 30분 안/밖) · ended(SessionEnd) · gone(목록에 없는데 SessionEnd 도 없음 — 꺼졌다).
+//   ended · gone 은 1시간 뒤 숨긴다. quiet 는 하루 뒤 숨긴다.
+const ENDED_SHOW_MS = 3600 * 1000, LIVE_MS = 30 * 60 * 1000, SILENT_HIDE_MS = 24 * 3600 * 1000;
+function board(root, tasks, now) {
+  let Ch = null, raw = [];
+  try { Ch = require('../hooks/_common'); raw = Ch.listSessions(S.paths(root).commonDir); } catch { raw = []; }
+  const cand = raw.filter(s => Date.parse(s.last_seen || '') || Date.parse(s.ended_at || ''));   // 게시판 이전의 기록(파일 목록만)은 미커밋 분류에만 쓴다
+  // 보일 만한 Claude 세션이 있을 때만 플랫폼에 묻는다
+  let agents = null;
+  if (Ch && cand.some(s => (s.runtime || 'claude') === 'claude' && !(Date.parse(s.ended_at || '') && now - Date.parse(s.ended_at) > ENDED_SHOW_MS))) {
+    try { agents = Ch.platformAgents(S.paths(root).commonDir); } catch { agents = null; }
+  }
+  const sessions = [];
+  for (const s of cand) {
+    const seen = Date.parse(s.last_seen || ''), ended = Date.parse(s.ended_at || '');
+    const a = Ch.agentOf(s, agents), byPlatform = Array.isArray(agents) && (s.runtime || 'claude') === 'claude';
+    const state = a ? (a.status === 'busy' || a.status === 'idle' ? a.status : 'live') : ended ? 'ended' : byPlatform ? 'gone' : seen && now - seen <= LIVE_MS ? 'live' : 'quiet';
+    if (state === 'ended' && now - ended > ENDED_SHOW_MS) continue;
+    if (state === 'gone' && (!seen || now - seen > ENDED_SHOW_MS)) continue;
+    if (state === 'quiet' && (!seen || now - seen > SILENT_HIDE_MS)) continue;
+    sessions.push({ session_id: s.session_id, sid8: String(s.session_id).replace(/[^A-Za-z0-9]/g, '').slice(0, 8), runtime: s.runtime || null, root: s.root || null, branch: s.branch || null,
+      goal: String(s.goal || '').split(/\r?\n/)[0].slice(0, 100), last_seen: s.last_seen || null, age_s: seen ? Math.round((now - seen) / 1000) : null, ended_at: s.ended_at || null,
+      live: !!a || state === 'live', state, name: a ? a.name : null, pid: a ? a.pid : null });
+  }
+  sessions.sort((a, b) => (b.live - a.live) || ((a.age_s == null ? Infinity : a.age_s) - (b.age_s == null ? Infinity : b.age_s)));
+  const lanes = tasks.filter(t => t.mode === 'light' && !FINAL.has(t.status)).map(t => ({ id: t.id, status: t.status, branch: t.branch, worktree: t.worktree || S.taskPaths(root, t.id).wt, goal: t.goal }));
+  return { liveness: Array.isArray(agents) ? 'platform' : 'last_seen', sessions, lanes };
+}
+const ageText = (s, ko) => s == null ? '?' : s < 90 ? (ko ? `${s}초` : `${s}s`) : s < 5400 ? (ko ? `${Math.round(s / 60)}분` : `${Math.round(s / 60)}m`) : (ko ? `${Math.round(s / 3600)}시간` : `${Math.round(s / 3600)}h`);
+function boardLines(s, ko) {
+  const b = s.board || { sessions: [], lanes: [] }, L = [];
+  if (b.sessions.length) {
+    L.push(ko ? `세션 (${b.sessions.length}):` : `sessions (${b.sessions.length}):`);
+    const WORD = ko ? { live: '활동 중', quiet: '조용함', ended: '끝남', gone: '사라짐(플랫폼 목록에 없음)' } : { gone: 'gone (not in the platform list)' };
+    for (const x of b.sessions) {
+      const st = x.state || (x.ended_at ? 'ended' : x.live ? 'live' : 'quiet');
+      L.push(`  ${x.sid8}${x.name ? ` ${x.name}` : ''}${x.runtime ? ` (${x.runtime})` : ''} ${WORD[st] || st} · ${ko ? '마지막' : 'seen'} ${ageText(x.age_s, ko)}${ko ? ' 전' : ' ago'} · ${x.root || '?'} · ${x.branch || (ko ? '분리된 HEAD' : 'detached')}${x.goal ? ` — ${x.goal}` : ''}`);
+    }
+  }
+  if (b.lanes.length) {
+    L.push(ko ? `가벼운 길 (${b.lanes.length}):` : `light lanes (${b.lanes.length}):`);
+    for (const x of b.lanes) L.push(`  ${x.id}  ${x.status} · ${x.worktree} · ${x.branch || `harness/${x.id}`}${x.goal ? ` — ${x.goal}` : ''}`);
+  }
+  return L;
 }
 
 function formatStatusKo(s) {
@@ -60,11 +112,14 @@ function formatStatusKo(s) {
   else {
     L.push(`작업 (${s.tasks.length}):`);
     for (const t of s.tasks) {
-      const own = t.status === 'running' ? (t.owner && t.owner.alive ? ` · 실행 중 pid ${t.owner.pid}(신호 ${t.owner.heartbeat_age_s}초 전)` : ' · 주인 프로세스 없음 — resume 하세요') : '';
-      L.push(`  ${t.id}  ${t.status}${own} · ${t.branch}${t.branch_exists ? '' : ' (없음)'} · 파일 ${t.files_changed}개 · $${Number(t.cost_usd || 0).toFixed(2)} — ${t.goal}`);
+      // [2026-10-25] 주인이 죽은 running 은 상태 칸부터 DEAD — 무엇이 실제로 도는지 한눈에.
+      const dead = t.status === 'running' && !(t.owner && t.owner.alive);
+      const own = t.status === 'running' ? (dead ? ` (running · 주인 프로세스${t.owner ? ` pid ${t.owner.pid}` : ''} 없음${t.owner && t.owner.heartbeat_age_s != null ? ` · 마지막 신호 ${t.owner.heartbeat_age_s}초 전` : ''}) — 아무것도 돌지 않는다 · start --from ${t.id} 로 이어 가거나 cancel 하세요` : ` · 실행 중 pid ${t.owner.pid}(신호 ${t.owner.heartbeat_age_s}초 전)`) : '';
+      L.push(`  ${t.id}  ${dead ? 'DEAD' : t.status}${own} · ${t.branch}${t.branch_exists ? '' : ' (없음)'} · 파일 ${t.files_changed}개 · $${Number(t.cost_usd || 0).toFixed(2)} — ${t.goal}`);
     }
     L.push(`누적 비용: 작업 ${s.tasks.length}개 · $${Number(s.cost_total || 0).toFixed(2)}`);
   }
+  L.push(...boardLines(s, true));
   for (const b of s.broken || []) L.push(`  ${b.id}  손상 — task.json 을 읽을 수 없다(${b.task_file}) · 기록: ${b.log} — ${b.goal}`);
   if (s.overlaps.length) {
     L.push('겹침(열린 작업 둘 이상이 같은 파일을 바꿨다 — 두 번째를 들일 때 충돌한다):');
@@ -86,11 +141,13 @@ function formatStatus(s) {
   else {
     L.push(`tasks (${s.tasks.length}):`);
     for (const t of s.tasks) {
-      const own = t.status === 'running' ? (t.owner && t.owner.alive ? ` · owner pid ${t.owner.pid} alive (heartbeat ${t.owner.heartbeat_age_s}s ago)` : ' · OWNER DEAD — resume it') : '';
-      L.push(`  ${t.id}  ${t.status}${own} · ${t.branch}${t.branch_exists ? '' : ' (gone)'} · ${t.files_changed} files · $${Number(t.cost_usd || 0).toFixed(2)} — ${t.goal}`);
+      const dead = t.status === 'running' && !(t.owner && t.owner.alive);
+      const own = t.status === 'running' ? (dead ? ` (running · OWNER DEAD: ${t.owner ? `pid ${t.owner.pid} is gone` : 'no owner recorded'}${t.owner && t.owner.heartbeat_age_s != null ? `, last heartbeat ${t.owner.heartbeat_age_s}s ago` : ''}) — nothing is running it; continue it with start --from ${t.id} or cancel it` : ` · owner pid ${t.owner.pid} alive (heartbeat ${t.owner.heartbeat_age_s}s ago)`) : '';
+      L.push(`  ${t.id}  ${dead ? 'DEAD' : t.status}${own} · ${t.branch}${t.branch_exists ? '' : ' (gone)'} · ${t.files_changed} files · $${Number(t.cost_usd || 0).toFixed(2)} — ${t.goal}`);
     }
     L.push(`spent across ${s.tasks.length} tasks: $${Number(s.cost_total || 0).toFixed(2)}`);
   }
+  L.push(...boardLines(s, false));
   for (const b of s.broken || []) L.push(`  ${b.id}  BROKEN — task.json cannot be read (${b.task_file}) · its log: ${b.log} — ${b.goal}`);
   if (s.overlaps.length) {
     L.push('overlaps (the same file changed by more than one open task — integrating the second will conflict):');
@@ -159,11 +216,13 @@ function gc(o) {
   const P = S.paths(root);
   const removed = [], kept = [];
   const known = new Set();
-  const lockHeldWhy = name => `lock ${name} is held by a live owner (an accept/cancel/restore/resume is in progress) — skipped`;
+  const lockHeldWhy = name => `lock ${name} is held by a live owner (an accept/cancel/restore/check is in progress) — skipped`;
   const released = [];
   for (const t of S.listTasks(root)) {
     const tp = S.taskPaths(root, t.id);
     known.add(norm(tp.wt));
+    // 열린 레인은 사람(세션)이 일하는 중이다 — 주인 프로세스가 없어도 치우지 않는다(accept · batch · cancel 이 끝낸다). [2026-10-29 v7 시험 정리에서 발견]
+    if (t.mode === 'light' && t.status === 'open') { if (fs.existsSync(tp.wt)) kept.push({ id: t.id, worktree: tp.wt, why: 'open lane — someone works in it (accept · batch · cancel ends it)' }); continue; }
     // [PRD R1] 끝난 작업의 git 밖 자원(볼륨 · 이미지 · 임시 폴더 · 프로젝트 정리 명령)을 한 번 회수한다. 산 주인이 있는 작업 · 잠긴 작업은 건너뛴다.
     if (!(t.status === 'running' && S.ownerAlive(t.owner)) && !(t.resources && t.resources.release_at) && !S.lockLive(root, `task-${t.id}`)) {
       try {

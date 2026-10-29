@@ -42,11 +42,11 @@ const cli = (args, env) => new Promise(res => { const c = spawn(process.execPath
     R.check('[UP-03] update: 릴리스를 내려받아 설치 — harness/VERSION 9.9.9 · 관리 블록 그대로', u1.code === 0 && fs.readFileSync(path.join(repo, 'harness', 'VERSION'), 'utf8').trim() === '9.9.9' && /harness:begin/.test(fs.readFileSync(path.join(repo, 'AGENTS.md'), 'utf8')), u1.out.slice(-400));
     const u2 = await cli(['update', '--root', repo], env);
     R.check('[UP-04] 이미 최신이면 아무것도 하지 않는다', u2.code === 0 && /최신이다/.test(u2.out), u2.out);
-    // 실행 중인 작업이 있으면 install 이 거부 → update 도 바꾸지 않는다
+    // 실행 중인 작업이 있으면 install 이 거부 → update 도 바꾸지 않는다(주인 = 이 테스트 프로세스 — v7 에서 S.ownerRecord 가 빠져 직접 적는다)
     latest = 'v10.0.0';
     const S = require('../../harness/lib/state');
     const id = 't-20261013-000000-abcd';
-    S.writeTask(repo, { ...S.newTask({ id, goal: 'g', runtime: 'claude', model: 'opus', base_branch: 'main', base_commit: git(repo, 'rev-parse', 'HEAD'), branch: `harness/${id}`, worktree: path.join(repo, '.harness-worktrees', id), owner: S.ownerRecord(), caps: { budget_usd: 1, wall_min: 1, max_continuations: 1 } }), status: 'running' });
+    S.writeTask(repo, { ...S.newTask({ id, goal: 'g', runtime: 'claude', model: 'opus', base_branch: 'main', base_commit: git(repo, 'rev-parse', 'HEAD'), branch: `harness/${id}`, worktree: path.join(repo, '.harness-worktrees', id), owner: { pid: process.pid, host: os.hostname(), heartbeat_at: new Date().toISOString() }, caps: { budget_usd: 1, wall_min: 1, max_continuations: 1 } }), status: 'running' });
     const u3 = await cli(['update', '--root', repo], env);
     R.check('[UP-05] 실행 중인 작업이 있으면 갈아 끼우지 않는다(install 이 거부)', u3.code !== 0 && fs.readFileSync(path.join(repo, 'harness', 'VERSION'), 'utf8').trim() === '9.9.9' && /설치하지 않았다/.test(u3.out), u3.out.slice(0, 400));
 

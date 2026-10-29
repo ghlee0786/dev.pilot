@@ -73,7 +73,11 @@ try {
   const agents = read(path.join(t1, 'AGENTS.md'));
   const blk = agents.slice(agents.indexOf('<!-- harness:begin -->'), agents.indexOf('<!-- harness:end -->') + '<!-- harness:end -->'.length);
   R.check('[install] AGENTS.md: 원래 내용 그대로 + 관리 블록', agents.startsWith(AGENTS0 + '\n\n<!-- harness:begin -->') && agents.endsWith('<!-- harness:end -->\n'), JSON.stringify(agents.slice(0, 120)));
-  R.check('[install] 관리 블록 ≤ 40줄 · 핵심 규칙(go · accept · 자기 파일만 커밋 · BLOCKED)', blk.split('\n').length <= 40 && /node harness\/cli\.js go/.test(blk) && /accept <id>/.test(blk) && /자기가 고친 파일만/.test(blk) && /BLOCKED\.md/.test(blk), String(blk.split('\n').length));
+  // [v7 Light] 블록에서 go · factory · doc · note · stop · attach · worker_allow 를 뺐다 — 레인(start) · accept · batch · 백그라운드 세션(claude --bg)
+  R.check('[install] 관리 블록 ≤ 40줄 · 핵심 규칙(start · --from · accept · batch · claude --bg · 자기 파일만 커밋 · 막히면 보고)', blk.split('\n').length <= 40 && /node harness\/cli\.js start "/.test(blk) && /start --from <id>/.test(blk) && /accept <id>/.test(blk) && /batch accept <bid>/.test(blk)
+    && /claude --bg/.test(blk) && /자기가 고친 파일만/.test(blk) && /이유 · 시도한 것 · 필요한 것/.test(blk), String(blk.split('\n').length));
+  const goneFromBlock = [/cli\.js go\b/, /\bgo "/, /`go\b/, /factory/, /doc new/, /cli\.js note/, /cli\.js stop/, /stop <id>/, /--attach/, /worker_allow/, /BLOCKED\.md/, /\bresume\b/, /cleanup-legacy/].filter(re => re.test(blk));
+  R.check('[install] 관리 블록에 v7 에서 뺀 명령(go · resume · factory · doc · note · stop · attach · worker_allow · BLOCKED.md · cleanup-legacy)이 없다', !goneFromBlock.length, goneFromBlock.map(String).join(' '));
 
   const claude = read(path.join(t1, 'CLAUDE.md'));
   R.check('[install] CLAUDE.md: 첫 제목 다음에 @AGENTS.md (CRLF 유지)', claude === '# Title\r\n\r\n@AGENTS.md\r\nbody line\r\n', JSON.stringify(claude));
@@ -87,9 +91,30 @@ try {
   R.check('[install] settings: git add/commit 과 읽기 전용 git 만 허용에 더한다(push·reset 은 없다)',
     ['Bash(git add:*)', 'Bash(git commit:*)', 'PowerShell(git commit:*)', 'Bash(git status:*)'].every(x => settings.permissions.allow.includes(x)) &&
     !settings.permissions.allow.some(x => /push|reset|rebase|merge|clean/.test(x)), JSON.stringify(settings.permissions));
-  const expect = { PreToolUse: ['Bash|PowerShell', 'guard'], PostToolUse: ['Write|Edit|MultiEdit|NotebookEdit', 'track'], Stop: [undefined, 'stop'], SessionEnd: [undefined, 'session-end'] };
-  R.check('[install] settings: 우리 훅 4종 · 매처 · node "${CLAUDE_PROJECT_DIR}/harness/hooks/<x>.js"', Object.entries(expect).every(([ev, [matcher, x]]) =>
-    settings.hooks[ev].some(g => g.matcher === matcher && g.hooks.some(h => h.type === 'command' && h.command === `node "\${CLAUDE_PROJECT_DIR}/harness/hooks/${x}.js"`))), JSON.stringify(settings.hooks));
+  // 사양 변경(2026-10-25): guard 매처에 mcp__.* (git · GitHub MCP 쓰기) · track 매처에 파일 시스템 MCP 쓰기 · 게시판(board) — 요청 · 시작 · 쓰기 전.
+  const expect = [['PreToolUse', 'Bash|PowerShell|mcp__.*', 'guard'], ['PostToolUse', 'Write|Edit|MultiEdit|NotebookEdit|mcp__.*__(write_file|edit_file|move_file|create_file)', 'track'], ['Stop', undefined, 'stop'], ['SessionEnd', undefined, 'session-end'],
+    ['PreToolUse', 'Write|Edit|MultiEdit|NotebookEdit', 'board'], ['UserPromptSubmit', undefined, 'board'], ['SessionStart', undefined, 'board'], ['UserPromptSubmit', undefined, 'lang']];
+  R.check('[install] settings: 우리 훅 · 매처 · node "${CLAUDE_PROJECT_DIR}/harness/hooks/<x>.js"', expect.every(([ev, matcher, x]) =>
+    (settings.hooks[ev] || []).some(g => g.matcher === matcher && g.hooks.some(h => h.type === 'command' && h.command === `node "\${CLAUDE_PROJECT_DIR}/harness/hooks/${x}.js"`))), JSON.stringify(settings.hooks));
+  // [2026-10-29] guard 는 실패(오류 · 시간 초과 · 셸 없음)해도 막는다(onFailure: 'block') — 다른 훅(board · track · lang · stop · session-end)은 실패해도 막지 않는다 · Codex 훅에는 이 키가 없다
+  {
+    const ours = Object.entries(settings.hooks).flatMap(([ev, gs]) => gs.flatMap(g => g.hooks.filter(h => /harness\/hooks\//.test(h.command || '')).map(h => ({ ev, h }))));
+    const guardH = ours.filter(x => /hooks\/guard\.js"$/.test(x.h.command));
+    const codexAll = Object.values(readJson(path.join(t1, '.codex', 'hooks.json')).hooks).flatMap(gs => gs.flatMap(g => g.hooks));
+    R.check('[install] settings: guard 훅 하나만 onFailure: block(그 객체 = type · command · timeout 10 · onFailure) · 나머지 우리 훅 · Codex 훅에는 onFailure 가 없다',
+      guardH.length === 1 && JSON.stringify(guardH[0].h) === JSON.stringify({ type: 'command', command: 'node "${CLAUDE_PROJECT_DIR}/harness/hooks/guard.js"', timeout: 10, onFailure: 'block' })
+        && ours.filter(x => x.h.onFailure !== undefined).length === 1 && ours.length >= 7 && codexAll.length > 0 && codexAll.every(h => h.onFailure === undefined),
+      JSON.stringify({ guard: guardH.map(x => x.h), others: ours.filter(x => x.h.onFailure !== undefined).map(x => x.ev) }));
+  }
+  {
+    const re = new RegExp(`^(?:${settings.hooks.PreToolUse.find(g => g.hooks.some(h => /harness\/hooks\/guard\.js/.test(h.command))).matcher})$`);   // 남의 my-guard.js 가 아니라 우리 것
+    const tr = new RegExp(`^(?:${settings.hooks.PostToolUse.find(g => g.hooks.some(h => /harness\/hooks\/track\.js/.test(h.command))).matcher})$`);
+    R.check('[install] 매처(정규식): guard 는 셸 · mcp__ 도구 전부 · track 은 쓰기 도구 · 파일 시스템 MCP 쓰기만',
+      ['Bash', 'PowerShell', 'mcp__git__git_commit', 'mcp__github__push_files'].every(t => re.test(t)) && !re.test('Write') &&
+      ['Write', 'mcp__filesystem__write_file', 'mcp__filesystem__move_file', 'mcp__fs__edit_file'].every(t => tr.test(t)) && !tr.test('mcp__filesystem__read_file') && !tr.test('mcp__git__git_commit'));
+  }
+  const codexUps = (readJson(path.join(t1, '.codex', 'hooks.json')).hooks.UserPromptSubmit || []).flatMap(g => g.hooks.map(h => h.command));
+  R.check('[install] Codex: 게시판은 UserPromptSubmit 에만(--codex) · SessionStart 는 없다', codexUps.some(c => /harness\/hooks\/board\.js" --codex$/.test(c)) && !readJson(path.join(t1, '.codex', 'hooks.json')).hooks.SessionStart, JSON.stringify(codexUps));
   R.check('[install] settings: 4칸 들여쓰기 유지', read(path.join(t1, '.claude', 'settings.json')).includes('\n    "permissions"'));
 
   const codex = readJson(path.join(t1, '.codex', 'hooks.json'));
@@ -111,9 +136,11 @@ try {
 
   // 설치된 명령이 그대로 돈다 — 설정 파일의 문자열을 셸로 실행해 git push 가 막히는지 본다.
   const payload = JSON.stringify({ hook_event_name: 'PreToolUse', session_id: 'e2e', cwd: t1, tool_name: 'Bash', tool_input: { command: 'git push origin main' } });
-  const claudeCmd = settings.hooks.PreToolUse.find(g => g.matcher === 'Bash|PowerShell').hooks[0].command.replace('${CLAUDE_PROJECT_DIR}', t1);
+  const claudeCmd = settings.hooks.PreToolUse.find(g => g.matcher === 'Bash|PowerShell|mcp__.*').hooks[0].command.replace('${CLAUDE_PROJECT_DIR}', t1);
   const e2e = spawnSync(claudeCmd, { shell: true, input: payload, encoding: 'utf8', cwd: t1, env: ENV, windowsHide: true, timeout: 30000 });
   R.check('[install/e2e] Claude 명령으로 설치된 guard 가 git push 를 deny', e2e.status === 0 && /"permissionDecision":"deny"/.test(e2e.stdout), e2e.stdout + e2e.stderr);
+  const e2m = spawnSync(claudeCmd, { shell: true, input: JSON.stringify({ hook_event_name: 'PreToolUse', session_id: 'e2e', cwd: t1, tool_name: 'mcp__git__git_reset', tool_input: { repo_path: t1 } }), encoding: 'utf8', cwd: t1, env: ENV, windowsHide: true, timeout: 30000 });
+  R.check('[install/e2e] 설치된 guard 가 git MCP 의 reset 도 deny', e2m.status === 0 && /"permissionDecision":"deny"/.test(e2m.stdout), e2m.stdout + e2m.stderr);
   const codexCmd = codex.hooks.PreToolUse[0].hooks[0][process.platform === 'win32' ? 'commandWindows' : 'command'];
   const e2x = spawnSync(codexCmd, { shell: true, input: payload, encoding: 'utf8', cwd: t1, env: ENV, windowsHide: true, timeout: 30000 });
   R.check('[install/e2e] Codex 명령(저장소 루트에서)으로도 deny', e2x.status === 0 && /"permissionDecision":"deny"/.test(e2x.stdout), e2x.stdout + e2x.stderr);
@@ -281,6 +308,54 @@ try {
     !/적게 쓴다|검증용 서브에이전트를 두지 않는다/.test(c11) && c11.includes(tpl[5]) && c11.includes(tpl[6]) && /한 메시지에서 동시에/.test(c11) && c11.includes('- 사용자가 더한 줄 — 그대로\r\n') && !/[^\r]\n/.test(c11), JSON.stringify(c11).slice(0, 400));
   const c11b = (install({ target: t11, source: SOURCE }), read(path.join(t11, 'CLAUDE.md')));
   R.check('[CLAUDE 이전] 두 번째 설치는 CLAUDE.md 를 바꾸지 않는다', c11b === c11);
+  // [2026-10-25 Light] factory 로 나누라던 줄(직전 템플릿) → 각자 lane(`start`) · 다른 줄 · LF 는 그대로
+  const t11f = mkRepo('legacy-claude-factory');
+  const FAC = '- 서로 독립적인 일(조사 · 시나리오 시험 · 검토 · 서로 다른 파일의 작업)은 서브에이전트로 나눠 한 메시지에서 동시에 띄운다. 같은 파일을 여러 에이전트가 고치게 나누지 않는다 — 그렇게 나눠야 하면 `factory` · `go --owns`.';
+  write(path.join(t11f, 'CLAUDE.md'), ['@AGENTS.md', '', '# Claude Code 전용', '', FAC, tpl[6], '- 사용자 줄', ''].join('\n'));
+  install({ target: t11f, source: SOURCE });
+  const c11f = read(path.join(t11f, 'CLAUDE.md'));
+  R.check('[CLAUDE 이전] factory 를 가리키던 줄 → 템플릿의 레인 문구 · 템플릿에 factory · go 없음 · 사용자 줄 · LF 유지',
+    !c11f.includes('`factory`') && c11f.includes(tpl[5]) && /그렇게 나눠야 하면 각자 레인\(`start`\)\.$/.test(tpl[5]) && !/factory|`go\b|go --owns/.test(tpl.join('\n')) && c11f.includes('- 사용자 줄\n') && !c11f.includes('\r'), JSON.stringify(c11f).slice(0, 400));
+  // [v7 Light] 직전 템플릿(각자 lane(`start`) · `go --owns`) → 새 문구 · CRLF · 다른 줄 그대로 · 두 번째 설치는 무변경
+  const t11g = mkRepo('legacy-claude-lane-go');
+  const LANEGO = '- 서로 독립적인 일(조사 · 시나리오 시험 · 검토 · 서로 다른 파일의 작업)은 서브에이전트로 나눠 한 메시지에서 동시에 띄운다. 같은 파일을 여러 에이전트가 고치게 나누지 않는다 — 그렇게 나눠야 하면 각자 lane(`start`) · `go --owns`.';
+  write(path.join(t11g, 'CLAUDE.md'), ['@AGENTS.md', '', '# Claude Code 전용', '', tpl[4], LANEGO, tpl[6], '- 사용자 줄', ''].join('\r\n'));
+  const r11g = install({ target: t11g, source: SOURCE });
+  const c11g = read(path.join(t11g, 'CLAUDE.md'));
+  R.check('[CLAUDE 이전] 직전 템플릿 줄(각자 lane(`start`) · `go --owns`) → 템플릿의 레인 문구 · 사용자 줄 · CRLF 유지 · 두 번째 설치는 무변경',
+    r11g.changed.includes('CLAUDE.md') && !c11g.includes('go --owns') && c11g === ['@AGENTS.md', '', '# Claude Code 전용', '', tpl[4], tpl[5], tpl[6], '- 사용자 줄', ''].join('\r\n')
+      && (install({ target: t11g, source: SOURCE }), read(path.join(t11g, 'CLAUDE.md'))) === c11g, JSON.stringify(c11g).slice(0, 500));
+
+  // ── [v7 Light] 재설치는 새 판에서 빠진 하네스 파일을 지운다 — 설치 기록에 하네스가 만든 것으로 적힌 harness/ 파일만 · 사용자 파일은 그대로 ──
+  {
+    const copyTree = (s, d) => { fs.mkdirSync(d, { recursive: true }); for (const e of fs.readdirSync(s, { withFileTypes: true })) { const a = path.join(s, e.name), b = path.join(d, e.name); if (e.isDirectory()) copyTree(a, b); else fs.copyFileSync(a, b); } };
+    const oldSrc = path.join(base, 'old-source', 'harness');
+    copyTree(SOURCE, oldSrc);
+    write(path.join(oldSrc, 'lib', 'loop_old.js'), '// removed in the next version\n');
+    write(path.join(oldSrc, 'lib', 'gone', 'deep.js'), '// removed with its folder\n');
+    const t12 = mkRepo('stale-files');
+    const manifestOf = () => readJson(path.join(t12, '.git', 'harness', 'install.json')).files;
+    install({ target: t12, source: oldSrc });
+    const stale = ['harness/lib/loop_old.js', 'harness/lib/gone/deep.js'];
+    const m0 = manifestOf();
+    R.check('[stale] 옛 판 설치: 그 판에만 있는 파일이 깔리고 설치 기록에 created 로 적힌다',
+      stale.every(k => fs.existsSync(path.join(t12, ...k.split('/'))) && m0[k] && m0[k].created === true), JSON.stringify(stale.map(k => m0[k])));
+    write(path.join(t12, 'harness', 'lib', 'my_notes.js'), '// user file — not ours\n');   // 설치 뒤 사용자가 만든 파일(기록에 없음)
+    write(path.join(t12, 'harness', 'local.md'), 'user notes\n');
+    const dry = install({ target: t12, source: SOURCE, dryRun: true });
+    R.check('[stale] dryRun: 지울 파일을 바뀔 목록에 내고 아무것도 지우지 않는다(기록도 그대로)',
+      stale.every(k => dry.changed.includes(k) && fs.existsSync(path.join(t12, ...k.split('/')))) && stale.every(k => manifestOf()[k]), JSON.stringify(dry.changed.filter(k => /loop_old|deep|my_notes|local\.md/.test(k))));
+    const r12 = install({ target: t12, source: SOURCE });
+    const m1 = manifestOf();
+    R.check('[stale] 새 판 재설치: 빠진 하네스 파일은 대상에서 · 설치 기록에서 사라진다(바뀐 목록에 있다)',
+      r12.ok !== false && stale.every(k => !fs.existsSync(path.join(t12, ...k.split('/'))) && !m1[k] && r12.changed.includes(k)), JSON.stringify({ changed: r12.changed.filter(k => /loop_old|deep/.test(k)), left: stale.filter(k => fs.existsSync(path.join(t12, ...k.split('/')))) }));
+    R.check('[stale] 기록에 없는 사용자 파일(harness/lib/my_notes.js · harness/local.md)은 그대로 · 원본에 있는 파일은 그대로 · 마커도 남는다',
+      read(path.join(t12, 'harness', 'lib', 'my_notes.js')) === '// user file — not ours\n' && read(path.join(t12, 'harness', 'local.md')) === 'user notes\n' && !r12.changed.some(k => /my_notes|local\.md/.test(k))
+        && read(path.join(t12, 'harness', 'hooks', 'guard.js')) === read(path.join(SOURCE, 'hooks', 'guard.js')) && fs.existsSync(path.join(t12, 'harness', '.harness-version')) && m1['harness/hooks/guard.js'], JSON.stringify(r12.changed.slice(0, 10)));
+    R.check('[stale] 빈 폴더로 남은 harness/lib/gone/ 도 지운다 · 사용자 파일이 있는 harness/lib/ 와 harness/ 는 남는다',
+      !fs.existsSync(path.join(t12, 'harness', 'lib', 'gone')) && fs.existsSync(path.join(t12, 'harness', 'lib')) && fs.existsSync(path.join(t12, 'harness')));
+    R.check('[stale] 그 뒤 재설치는 바꿀 것이 없다', install({ target: t12, source: SOURCE }).changed.length === 0);
+  }
 
   R.check('[격리] 전역 CODEX_HOME/hooks.json 은 바이트 그대로 · 다른 파일 없음', read(path.join(codexHome, 'hooks.json')) === GLOBAL_HOOKS && fs.readdirSync(codexHome).length === 1);
   R.check('[격리] 가짜 HOME 에 .claude · .agents 가 생기지 않았다', !fs.existsSync(path.join(home, '.claude')) && !fs.existsSync(path.join(home, '.agents')));

@@ -1,21 +1,31 @@
 'use strict';
-// v5 통합 — accept / cancel / restore. 사용자가 받아들인다고 말한 뒤에만 부른다. 전부 `merge` 잠금 아래 직렬로.
+// 통합 — accept / cancel / restore / check. 사용자가 받아들인다고 말한 뒤에만 부른다. 전부 `merge` 잠금 아래 직렬로.
 //   accept : .harness/<id>/ 를 기록 보관소로 옮겨 결과 브랜치에서 걷어 냄 → 대상 브랜치를 결과 브랜치로 가져와 최신화
-//            (충돌이면 같은 세션에 최대 2회 "충돌을 풀어라") → 검사 재실행 → 메인 체크아웃이 대상 브랜치이고
+//            (충돌이면 그 작업 폴더에 병합을 남겨 두고 거부 — 그 레인에서 풀고 다시 accept) → 검사 → 메인 체크아웃이 대상 브랜치이고
 //            결과 브랜치가 건드린 파일에 미커밋 변경이 없을 때만 `merge --no-ff` + 태그 harness/merged/<id>.
 //   cancel : 병합 전 — 미커밋분을 커밋한 뒤 worktree 제거, 브랜치 끝을 태그 harness/cancelled/<id> 로 남기고 브랜치 삭제.
 //            병합 후 — 임시 worktree 에서 `revert -m 1 <merge>` 를 만들고 검사 통과를 확인한 뒤 대상 브랜치를 그 커밋으로 fast-forward.
 //   restore: 취소를 되돌린다(revert 의 revert · 병합 전 취소는 태그에서 브랜치 복원).
+//   light 칸(start 로 연 · mode 'light' · status 'open'): --force 없이 받아들인다 · 검사는 accept 때 늘 한 번 돈다(사람이 계속 커밋한 칸이라
+//            앞서 잰 결과를 믿지 않는다). 사용자의 accept 는 검사 줄의 맨 앞(priority 0). 시간 초과뿐인 실패는 "나빠짐" 이 아니라 판정 불가로 거부.
 //   금지: reset --hard · 강제 push · 다른 세션 미커밋 변경을 stash/덮기.
 const fs = require('node:fs'), path = require('node:path'), crypto = require('node:crypto');
-const S = require('./state'), G = require('./git'), K = require('./checks'), Pr = require('./prompts'), L = require('./loop'), St = require('./status');
+const S = require('./state'), G = require('./git'), K = require('./checks'), B = require('./baseline'), St = require('./status');
 
 const MERGE_WAIT_MS = 10 * 60 * 1000;
-const MAX_CONFLICT_ROUNDS = 2;
-const DEFAULT_CONFLICT_BUDGET_USD = 5;   // 작업에 비용 상한이 없을 때만
 // 검사 상한: 이번 호출의 --check-timeout-min > 작업에 기록된 상한(go 때 check_timeout_min · --check-timeout-min) > 기본.
 const checkTimeout = (task, o) => o.checkTimeoutMs || (task.checks && task.checks.timeout_ms) || K.CHECK_TIMEOUT_MS;
 const norm = f => { const p = String(f).replace(/\\/g, '/').replace(/^\.\//, ''); return S.IS_WIN ? p.toLowerCase() : p; };
+// 검사를 하나씩 돌릴 저장소 — 직렬이 기본(K.serialChecksOn · 프로젝트 블록 serial_checks: off 면 끔). 그 함수가 없는 판이면 작업에 기록된 값.
+const serialRootOf = (root, task) => ((typeof K.serialChecksOn === 'function' ? K.serialChecksOn(root) : !!(task && task.checks && task.checks.serial)) ? root : null);
+// 판정 불가 — 실패한 검사가 모두 시간 초과로만 실패했다(무엇이 나빠졌는지 잰 것이 없다). checks.js 의 j.indeterminate 가 없으면 여기서 같은 규칙으로.
+function isIndeterminate(j) {
+  if (!j) return false;
+  if (j.indeterminate != null) return !!j.indeterminate;
+  const bad = (j.results || []).filter(r => !r.ok);
+  return bad.length > 0 && bad.every(r => r.timed_out && !r.stalled);   // 출력이 멈춘 시험(stalled)은 기준선이 떼어 낸다 — 판정 불가가 아니다
+}
+const failedTests = j => ((j && j.failed_tests) || []).slice(0, 10);
 
 // 진입점 검증: id 는 경로 조각이 된다(tasks/<id>/ · .harness-worktrees/<id>) — 형식이 맞지 않으면 아무것도 읽지 않는다.
 function load(o) {
@@ -25,28 +35,49 @@ function load(o) {
   if (!task) throw Object.assign(new Error(`unknown task: ${o.id}`), { code: 'UNKNOWN_TASK' });
   return { root, task, P: S.taskPathsFor(root, task), log: o.log || (m => process.stderr.write(m + '\n')) };
 }
+// 기계용 결과(HARNESS_RESULT) — 작업 기록의 요약
+function checksVerdict(ch) {
+  if (!ch) return null;
+  if (!(ch.commands || []).length && (ch.dropped || []).length) return 'unverified';
+  if (ch.deferred && !ch.last) return 'deferred';
+  return ch.verdict || null;
+}
+function result(task) {
+  const ch = task.checks || null, last = ch && (ch.last || null), sp = task.spent || {};
+  return { id: task.id, status: task.status, reason: task.reason, mode: task.mode || null, branch: task.branch, commit: task.head || (task.commits || []).slice(-1)[0] || null,
+    base_branch: task.base_branch, base_commit: task.base_commit,
+    checks: { source: ch ? ch.source : 'none', ok: last && checksVerdict(ch) !== 'unverified' ? last.ok : null, pass: last ? last.pass : null, fail: last ? last.fail : null,
+      baseline_fail: ch && ch.baseline ? ch.baseline.fail : null, verdict: checksVerdict(ch), baseline_warning: ch && ch.baseline_warning || null },
+    cost_usd: sp.cost_usd || 0, merge_commit: task.merge_commit || null, revert_commit: task.revert_commit || null, outside_git: task.outside_git || null };
+}
 function out(task, extra) {
-  const r = { ...L.result(task), ...(extra || {}) };
+  const r = { ...result(task), ...(extra || {}) };
   r.report = extra && extra.report ? extra.report : `pilot ${task.id} — ${r.status}${r.reason ? ': ' + r.reason : ''}`;
   return r;
 }
 // 한국어 작업(task.language === 'Korean')이면 보고를 한국어로 — [2026-10-13 사용자 보고] 결과가 영어로 나왔다.
 const isKo = task => !!task && task.language === 'Korean';
 const REFUSE_KO = [
-  [/^task is still running \(pid (\d+)\)(.*)$/s, m => `작업이 아직 실행 중이다(pid ${m[1]}) — 끝나기를 기다리거나 node harness/cli.js stop 으로 멈추세요`],
+  [/^task is still running \(pid (\d+)\)(.*)$/s, m => `작업이 아직 실행 중이다(pid ${m[1]}) — 끝나기를 기다리거나 그 세션을 멈추세요(claude agents)`],
   [/^task status is (\w+)(.*) — only done tasks are accepted; pass --force to merge it anyway$/s, m => `작업 상태가 ${m[1]}${m[2]} — done 인 작업만 받아들인다. 그래도 병합하려면 --force`],
   [/^already accepted into (\S+) \((\w+)\)$/, m => `이미 ${m[1]} 에 받아들였다(${m[2]})`],
   [/^the task was cancelled; use restore first$/, () => '취소된 작업이다 — 먼저 restore'],
   [/^already cancelled$/, () => '이미 취소했다'],
   [/^uncommitted changes in (\S+) touch files this (?:task changed|task changes|would change): (.*) — commit them first$/s, m => `${m[1]} 의 미커밋 변경이 이 작업의 파일과 겹친다: ${m[2]} — 먼저 커밋하세요`],
   [/^target branch (\S+) is not checked out in any checkout(.*)$/s, m => `대상 브랜치 ${m[1]} 가 어느 체크아웃에도 열려 있지 않다 — 메인 체크아웃에서 열고 다시 하세요`],
-  [/^checks fail after bringing (\S+) into (\S+) \((\d+) failing\)(.*)$/s, m => `${m[1]} 를 ${m[2]} 에 들인 뒤 검사가 실패한다(${m[3]}건) — 결과 브랜치에 ${m[1]} 가 들어 있다. resume 하거나 고친 뒤 다시 accept`],
-  [/^lint fails on (\S+) \((.*?)\): (.*) — resume or fix it, then accept again( \(this lints the whole repository.*\))?$/s, m => `${m[1]} 에서 린트가 실패한다(${m[2]}): ${m[3]} — resume 하거나 고친 뒤 다시 accept${m[4] ? ' (저장소 전체 린트다 — lint_command 에 {files} 를 쓰면 바꾼 파일만 본다(accept 는 지금 값을 읽는다) · 또는 accept --force)' : ''}`],
+  [/^checks fail after bringing (\S+) into (\S+) \((\d+) failing\)(.*)$/s, m => `${m[1]} 를 ${m[2]} 에 들인 뒤 검사가 실패한다(${m[3]}건) — 결과 브랜치에 ${m[1]} 가 들어 있다. 레인에서 고친 뒤 다시 accept`],
+  [/^lint fails on (\S+) \((.*?)\): (.*) — fix it in the lane, then accept again( \(this lints the whole repository.*\))?$/s, m => `${m[1]} 에서 린트가 실패한다(${m[2]}): ${m[3]} — 레인에서 고친 뒤 다시 accept${m[4] ? ' (저장소 전체 린트다 — lint_command 에 {files} 를 쓰면 바꾼 파일만 본다(accept 는 지금 값을 읽는다) · 또는 accept --force)' : ''}`],
   [/^this task is stacked on (\S+) \(task (\S+?)(?:, (\w+))?\) — (.*)$/s, m => `이 작업은 ${m[1]} 위에 쌓은 작업이다(앞 작업 ${m[2]}${m[3] ? ` · ${m[3]}` : ''}) — 앞 작업을 먼저 accept 하면(그러면 이 작업도 같은 브랜치로 따라간다) 되고, 아니면 --into <브랜치>`],
   [/^the previous worktree (\S+) is still being removed(.*)$/s, m => `이전 worktree ${m[1]} 가 아직 지워지는 중이다(다른 프로세스가 파일을 잡고 있다) — 1분쯤 뒤 다시 하세요`],
+  [/^checks undetermined on (\S+) — every failing check timed out \((.*?)\)(.*)$/s, m => `${m[1]} 의 검사를 판정하지 못했다 — 실패한 검사가 모두 시간 초과다(${m[2]}). "작업 전보다 나빠짐" 이 아니다 — accept 를 다시 하거나(부하가 줄었을 때) 결과를 알고 합치려면 --force`],
 ];
 const refuseKo = r => { for (const [re, fn] of REFUSE_KO) { const m = re.exec(String(r)); if (m) return fn(m); } return String(r); };
-const refused = (task, reason) => out(task, { refused: true, reason, report: isKo(task) ? `pilot ${task.id} — 바뀐 것 없음: ${refuseKo(reason)}` : `pilot ${task.id} — nothing changed: ${reason}` });
+// extra.failed_tests: 실패한 시험 이름(최대 10) — 결과 · 보고에 함께 싣는다.
+const refused = (task, reason, extra) => {
+  const tests = (extra && extra.failed_tests) || [];
+  const tl = tests.length ? [`${isKo(task) ? '실패한 시험' : 'failing tests'}: ${tests.join(', ')}`] : [];
+  return out(task, { refused: true, reason, ...(tests.length ? { failed_tests: tests } : {}), report: [isKo(task) ? `pilot ${task.id} — 바뀐 것 없음: ${refuseKo(reason)}` : `pilot ${task.id} — nothing changed: ${reason}`, ...tl].join('\n') });
+};
 
 // 메인 체크아웃(대상 브랜치가 체크아웃된 곳)의 미커밋 변경 중 files 와 겹치는 것.
 function dirtyOverlap(cwd, files) {
@@ -59,7 +90,9 @@ function dirtyOverlap(cwd, files) {
 // [PRD R1] 작업을 치울 때 git 밖 자원(볼륨 · 이미지 · 임시 폴더 · 프로젝트 정리 명령)을 회수한다 — 실패해도 병합 · 취소는 그대로, 남은 것은 기록한다.
 function releaseResources(root, task) {
   try {
-    const r = require('./resources').release(root, task);
+    const Rs = require('./resources');
+    if (typeof Rs.freePorts === 'function') { try { Rs.freePorts(root, task.id); } catch { /* 장부는 끝난 작업을 다음 할당 때 스스로 비운다 */ } }
+    const r = Rs.release(root, task);
     if (Object.keys(r.docker.removed).length || r.residue.length || r.cleanup || (r.tmp && r.tmp.removed)) S.log(root, task.id, { event: 'resources_released', docker: r.docker.removed, cleanup: r.cleanup && { ok: r.cleanup.ok, exit_code: r.cleanup.exit_code }, tmp_removed: !!(r.tmp && r.tmp.removed), residue: r.residue });
     return r;
   } catch (e) { task.resources = { ...(task.resources || {}), error: String(e.message).slice(0, 200) }; return null; }
@@ -101,6 +134,32 @@ function commitInto(task, cwd, label) {
   if (sha) task.commits.push(sha);
   return sha;
 }
+// 칸의 커밋되지 않은 변경을 그 칸의 브랜치에 커밋한다 → 커밋한 파일(없으면 []) — 무엇을 대신 커밋했는지 보고에 싣는다.
+//   light 칸은 사람이 일한 곳이라 턴 체크포인트가 없었다 — 줄바꿈을 먼저 원래대로(G.keepEol · 루프의 체크포인트와 같이).
+function commitLeftovers(task, wt, label) {
+  if (task.mode === 'light') { try { G.keepEol(wt); } catch { /* 줄바꿈 복원 실패는 커밋을 막지 않는다 */ } }
+  const sha = commitInto(task, wt, label);
+  return sha ? G.diffNames(wt, `${sha}^`, sha) : [];
+}
+// 커밋하지 않은 삭제가 수상한가 — 서브모듈(gitlink) 삭제가 있거나 MASS_DELETE 개 이상이면 { deleted, gitlinks, sample } · 아니면 null
+const MASS_DELETE = 20;
+function suspiciousDeletes(wt) {
+  const del = G.statusEntries(wt).filter(e => e.code !== '??' && e.code !== '!!' && (e.x === 'D' || e.y === 'D')).map(e => e.path);
+  if (!del.length) return null;
+  const stage = G.git(wt, ['ls-files', '-s', '--', ...del.slice(0, 500).map(p => `:(literal)${p}`)], { allowFail: true }).out;
+  const gitlinks = stage.split(/\r?\n/).filter(l => /^160000 /.test(l)).map(l => l.split('\t')[1]).filter(Boolean);
+  return gitlinks.length || del.length >= MASS_DELETE ? { deleted: del.length, gitlinks, sample: del.slice(0, 5) } : null;
+}
+// [자동 이슈 #57] 검사가 추적 파일(빌드 산출물 · outside_git_ok 경로)을 다시 쓰면 그것이 작업 브랜치에 커밋돼 다음 병합을 막았다 —
+//   검사 전에 미커밋이 아니던 추적 파일의 변경은 검사 뒤 HEAD 로 되돌린다(새로 생긴 추적 안 된 파일은 그대로 — 무시 규칙의 몫이다) → 되돌린 경로
+function undoCheckWrites(wt, before) {
+  const ps = G.statusEntries(wt).filter(e => e.code !== '??' && e.code !== '!!' && !before.has(e.path)).map(e => e.path);
+  for (let i = 0; i < ps.length; i += 100) G.git(wt, ['checkout', '-q', 'HEAD', '--', ...ps.slice(i, i + 100).map(p => `:(literal)${p}`)], { allowFail: true, retryLock: true });
+  return ps;
+}
+// [자동 이슈 #56] 검사 뒤 대상 브랜치에 들어온 것이 문서뿐이면 다시 들이되 전체 검사는 다시 돌리지 않는다(문서 커밋 하나에 몇 시간 재검사)
+const DOC_ONLY = /(^|\/)(docs?|\.harness)\/|\.(md|markdown|rst|adoc)$/i;   // .txt 는 아니다(CMakeLists.txt · requirements.txt)
+const docsOnly = files => files.length > 0 && files.every(f => DOC_ONLY.test(f));
 function copyDir(src, dst) {
   fs.mkdirSync(dst, { recursive: true });
   for (const e of fs.readdirSync(src, { withFileTypes: true })) {
@@ -121,57 +180,12 @@ function archivePlan(root, task, P) {
   return sha;
 }
 
-// 충돌 해결 예산: --budget-usd(o.budgetUsd)를 주면 이번 accept 에서 쓸 수 있는 총액, 아니면 작업 상한에서 남은 만큼.
-//   남은 것이 0 이하면 모델을 부르지 않는다(상한은 모델 밖에서 강제한다 — 설계 §0.6).
-function conflictBudget(task, o, spentAtStart) {
-  if (o.budgetUsd != null) {
-    const cap = Number(o.budgetUsd), used = task.spent.cost_usd - spentAtStart;
-    return { left: cap - used, why: `the --budget-usd $${cap.toFixed(2)} for conflict resolution is used up ($${used.toFixed(2)} spent)` };
-  }
-  const cap = task.caps && task.caps.budget_usd;
-  if (cap == null || !Number.isFinite(Number(cap))) return { left: DEFAULT_CONFLICT_BUDGET_USD - (task.spent.cost_usd - spentAtStart), why: `the default conflict-resolution budget $${DEFAULT_CONFLICT_BUDGET_USD} is used up` };
-  return { left: Number(cap) - task.spent.cost_usd, why: `no budget left for conflict resolution ($${task.spent.cost_usd.toFixed(2)} of the task's $${Number(cap).toFixed(2)} spent)` };
-}
-
-async function resolveConflicts(root, task, P, target, o) {
-  // 모델은 git 을 쓰지 못하므로 턴 뒤에도 색인은 "미병합" 이다 — 판정은 충돌 표식으로 한다.
-  const conflicted = G.unmergedFiles(P.wt);
-  let pending = conflicted;
-  const spentAtStart = task.spent.cost_usd;
-  let run = null;
-  for (let round = 1; round <= MAX_CONFLICT_ROUNDS; round++) {
-    const b = conflictBudget(task, o, spentAtStart);
-    if (!(b.left > 0)) {
-      G.git(P.wt, ['merge', '--abort'], { allowFail: true });
-      S.log(root, task.id, { event: 'conflict_budget', round, left: b.left });
-      return { ok: false, why: `conflicts with ${target} in ${pending.join(', ')} — ${b.why}; nothing was merged (pass --budget-usd <N> to let the session resolve them, or resolve by hand)` };
-    }
-    const budget = Math.round(b.left * 1e6) / 1e6;
-    run = run || L.getRun(o);
-    let r;
-    try {
-      r = await run({ runtime: task.runtime, cwd: P.wt, prompt: Pr.conflictMessage(task, target, pending), sessionId: task.session_id || null,
-        newSessionId: task.session_id || task.runtime !== 'claude' ? undefined : crypto.randomUUID(), model: task.model, effort: task.effort,
-        budgetUsd: budget, tokenBudget: task.caps.token_budget, timeoutMs: (o.conflictTimeoutMin || 30) * 60000,
-        allowCommands: K.allowCommands(P.wt, task.checks), systemAppend: Pr.systemAppend(task), priorSessionCostUsd: task.session_id ? (task.session_cost_usd || 0) : 0 });
-    } catch (e) { r = { is_error: true, error_kind: 'crash', error_message: e.message }; }
-    r = r || {};
-    task.spent.cost_usd = Math.round((task.spent.cost_usd + (Number(r.cost_usd) || 0)) * 1e6) / 1e6;
-    if (r.session_cost_usd != null) task.session_cost_usd = Number(r.session_cost_usd) || 0;
-    else if (r.session_id) task.session_cost_usd = (r.session_id === task.session_id ? (task.session_cost_usd || 0) : 0) + (Number(r.cost_usd) || 0);
-    if (r.session_id) task.session_id = r.session_id;
-    S.log(root, task.id, { event: 'conflict_turn', round, files: pending, is_error: !!r.is_error, error_kind: r.error_kind || null });
-    pending = conflicted.filter(f => G.hasConflictMarkers(path.join(P.wt, f)));
-    if (!pending.length) {
-      G.git(P.wt, ['add', '-A'], { retryLock: true });
-      G.git(P.wt, [...G.identityArgs(P.wt), 'commit', '-q', '--no-verify', '--no-edit'], { retryLock: true });
-      task.commits.push(G.headSha(P.wt));
-      return { ok: true, rounds: round };
-    }
-    if (r.is_error && (r.error_kind === 'quota' || r.error_kind === 'auth')) break;
-  }
-  G.git(P.wt, ['merge', '--abort'], { allowFail: true });
-  return { ok: false, why: `conflicts with ${target} were not resolved after ${MAX_CONFLICT_ROUNDS} attempts (the branch is unchanged; resolve by hand or cancel)` };
+// 충돌 — 모델에게 풀게 하지 않는다(v7: 무인 작업자 없음). 병합을 그 작업 폴더에 진행 중으로 남겨 두고 알린다 —
+//   그 폴더의 세션(또는 사람)이 충돌 표식을 풀고 커밋한 뒤 accept 를 다시 한다(직접 git merge 는 guard 가 막으므로 남겨 둬야 풀 수 있다).
+function leaveConflicts(root, task, P, target) {
+  const files = G.unmergedFiles(P.wt);
+  S.log(root, task.id, { event: 'conflict_left', target, files: files.slice(0, 200) });
+  return `conflicts with ${target} in ${files.slice(0, 10).join(', ')}${files.length > 10 ? ` … (+${files.length - 10})` : ''} — the merge is left in progress in ${P.wt}: resolve the conflict markers there (in that lane's session or by hand), commit, then accept again (or cancel)`;
 }
 
 // ── accept ────────────────────────────────────────────────────────────
@@ -196,7 +210,8 @@ function acceptPre(root, o) {
     if (task.status === 'accepted') return `already accepted into ${task.accepted_into} (${String(task.merge_commit).slice(0, 10)})`;
     if (task.status === 'cancelled') return 'the task was cancelled; use restore first';
     if (ownerBusy(task)) return `task is still running (pid ${task.owner.pid})`;
-    if (task.status !== 'done' && !o.force) return `task status is ${task.status}${task.reason ? ` (${task.reason})` : ''} — only done tasks are accepted; pass --force to merge it anyway`;
+    // light 칸은 끝났다는 신호가 사용자의 accept 자체다 — open 을 done 처럼 받는다(검사는 아래에서 한 번).
+    if (task.status !== 'done' && !(task.mode === 'light' && task.status === 'open') && !o.force) return `task status is ${task.status}${task.reason ? ` (${task.reason})` : ''} — only done tasks are accepted; pass --force to merge it anyway`;
     if (!G.branchExists(root, task.branch)) return `branch ${task.branch} does not exist`;
     const target = acceptTarget(task, o, root);
     if (!target) return 'no target branch (the task started on a detached HEAD); pass --into <branch>';
@@ -234,16 +249,35 @@ async function accept(o) {
     // 1. .harness/<id>/ 보관 → 삭제 커밋
     const wtWhy = ensureWorktree(root, task, P, o.removalWaitMs, log);
     if (wtWhy) return refused(task, wtWhy);
-    commitInto(task, P.wt, 'uncommitted work before accept');
+    // 앞선 accept 가 남긴 충돌 병합(leaveConflicts) — 표식이 남았으면 거절, 다 풀었으면 아래 커밋이 병합을 마친다
+    if (G.mergeInProgress(P.wt)) {
+      // 미병합 목록만 보면 표식이 남은 채 git add 된 파일을 놓친다 — 병합 중 바뀐 파일 전부에서 본다
+      const still = [...new Set([...G.unmergedFiles(P.wt), ...G.dirtyFiles(P.wt).map(e => e.path)])].filter(f => G.hasConflictMarkers(path.join(P.wt, f)));
+      if (still.length) return refused(task, `the merge left in ${P.wt} still has conflict markers in ${still.slice(0, 10).join(', ')} — resolve them, commit, then accept again (or cancel)`);
+    }
+    // 남은 미커밋분은 커밋하고 무엇을 커밋했는지 보고한다 — light 칸에서는 사람이 아직 고치던 파일일 수 있다.
+    //   [자동 이슈 #61] 강제로 끝난 accept 뒤 작업 폴더에서 추적 파일 79개 · 서브모듈 등록이 사라졌고, 다음 accept 가 그 "삭제" 를 그대로 커밋했다 — 커밋하지 않고 멈춘다.
+    const gone = suspiciousDeletes(P.wt);
+    if (gone) { S.writeTask(root, task); return refused(task, `the worktree ${P.wt} is missing ${gone.deleted} tracked file(s)${gone.gitlinks.length ? ` including submodule(s) ${gone.gitlinks.slice(0, 5).join(', ')}` : ''} that are not committed as deleted (e.g. ${gone.sample.join(', ')}) — this looks like an interrupted git operation, not work; nothing was committed. Restore them (git -C "${P.wt}" checkout HEAD -- .) or, if the deletions are intended, commit them yourself, then accept again`); }
+    const leftover = commitLeftovers(task, P.wt, 'uncommitted work before accept');
+    if (leftover.length) S.log(root, task.id, { event: 'leftovers_committed', phase: 'accept', files: leftover.slice(0, 200) });
     archivePlan(root, task, P);
 
-    // 2. 대상 브랜치를 가져와 최신화(충돌 → 같은 세션이 푼다 · 예산 안에서만) → 검사
+    // 2. 대상 브랜치를 가져와 최신화(충돌 → 그 작업 폴더에 남기고 거부) → 검사
+    let checkedNow = false;
     const checkHere = async (why) => {
-      const run1 = async () => (await K.runJudged(P.wt, K.commandsForJudge(P.wt, task.checks), { timeoutMs: checkTimeout(task, o), rerun: task.checks.rerun, serialRoot: task.checks.serial ? root : null })).judged;
+      checkedNow = true;
+      const dirtyBefore = new Set(G.dirtyFiles(P.wt).map(e => e.path));
+      // priority 0: 사용자가 기다리는 accept 가 검사 줄의 맨 앞으로(state.acquireQueued — 없는 판이면 무시된다)
+      const run1 = async () => (await K.runJudged(P.wt, K.commandsForJudge(P.wt, task.checks), { timeoutMs: checkTimeout(task, o), rerun: task.checks.rerun, serialRoot: serialRootOf(root, task), priority: 0 })).judged;
       let j = await run1();
+      // light 칸: 시간 초과뿐인 실패면 기준선을 재지 않는다 — 부하로 기준선마저 시간 초과면 검사가 판정에서 영영 빠진다(아래 #29). 판정 불가로 바로 거부.
+      const early = !j.ok && task.mode === 'light' && !task.checks.baseline && isIndeterminate(j);
       // 늦은 기준선(D2): 실패했는데 기준선이 없으면 지금 작업 시작 시점에서 잰다 — 명령이 바뀌면(멈춘 테스트 · 빠진 검사) 다시 잰다
-      if (!j.ok && !task.checks.baseline) { const before = JSON.stringify(task.checks.commands); await L.ensureBaseline(root, task, { o: { checkTimeoutMs: checkTimeout(task, o) }, log }); if (JSON.stringify(task.checks.commands) !== before) j = await run1(); }
+      if (!j.ok && !early && !task.checks.baseline) { const before = JSON.stringify(task.checks.commands); await B.ensureBaseline(root, task, { o: { checkTimeoutMs: checkTimeout(task, o) }, log }); if (JSON.stringify(task.checks.commands) !== before) j = await run1(); }
       task.checks.last = K.brief(j);
+      const undone = undoCheckWrites(P.wt, dirtyBefore);
+      if (undone.length) S.log(root, task.id, { event: 'check_writes_undone', phase: 'accept', files: undone.slice(0, 50) });
       // [자동 이슈 #29] 저장소 검사가 작업 전부터 시간 초과로 모두 빠졌다 — 아무것도 재지 못했으니 검증 안 된 병합을 막는다(--force 면 이 단계를 거치지 않는다)
       if (!task.checks.commands.length && (task.checks.dropped || []).length) {
         S.log(root, task.id, { event: 'checks', phase: 'accept', why, verdict: 'unverified', dropped: task.checks.dropped.length });
@@ -251,28 +285,33 @@ async function accept(o) {
         return refused(task, `unverified — the repository checks were dropped (${task.checks.dropped.map(d => d.command).join(' ; ').slice(0, 200)}: timed out even before the task), so nothing judged this work; run the tests yourself, then accept again with --force`);
       }
       const v = K.judge(j, task.checks.baseline, { notWorse: task.checks.source !== 'user' });
-      S.log(root, task.id, { event: 'checks', phase: 'accept', why, verdict: v.verdict, pass: j.pass, fail: j.fail });
-      if (v.verdict !== 'fail') return null;
-      commitInto(task, P.wt, 'checks after bringing target up to date');
-      S.writeTask(root, task);
-      if (why === 'deferred checks (thin)') return refused(task, `checks fail on ${task.branch} and are worse than before the task (${j.fail} failing) — resume or fix it, then accept again (or --force if you accept the failures)`);
-      return refused(task, `checks fail after bringing ${target} into ${task.branch} (${j.fail} failing) — the task branch now contains ${target}; resume or fix it, then accept again`);
+      const undecided = early || (v.verdict === 'fail' && isIndeterminate(j));
+      S.log(root, task.id, { event: 'checks', phase: 'accept', why, verdict: undecided ? 'indeterminate' : v.verdict, pass: j.pass, fail: j.fail });
+      if (v.verdict !== 'fail' && !undecided) return null;
+      S.writeTask(root, task);   // 검사가 쓴 것은 커밋하지 않는다(#57 — 위에서 되돌렸다)
+      const tests = { failed_tests: failedTests(j) };
+      // [2026-10-25 C++ 저장소] 부하가 큰 PC 에서 시간 초과뿐인 실패가 "작업 전보다 나빠짐" 으로 거부돼 작업을 처음부터 다시 만들었다 — 판정 불가로 따로 말한다.
+      if (undecided) return refused(task, `checks undetermined on ${task.branch} — every failing check timed out (${j.results.filter(r => !r.ok).map(r => r.command).join(' ; ').slice(0, 200)}) — this is not "worse than before"; run accept again (when the machine is less busy), or --force to merge without a verdict`, tests);
+      if (why === 'deferred checks (thin)') return refused(task, `checks fail on ${task.branch} and are worse than before the task (${j.fail} failing) — fix it in the lane, then accept again (or --force if you accept the failures)`, tests);
+      return refused(task, `checks fail after bringing ${target} into ${task.branch} (${j.fail} failing) — the task branch now contains ${target}; fix it in the lane, then accept again`, tests);
     };
-    let rounds = 0;
-    for (let pass = 0; pass < 2 && !G.isAncestor(root, target, task.branch); pass++) {
+    let checkedAt = null, checkedPasses = 0;
+    for (let pass = 0; pass < 6 && checkedPasses < 2 && !G.isAncestor(root, target, task.branch); pass++) {
       broughtTarget = true;
+      const targetNow = G.headSha(root, target);
+      // #56: 앞서 검사한 뒤 대상 브랜치에 들어온 것이 문서뿐이면 들이기만 하고 다시 검사하지 않는다
+      const docsSince = checkedAt ? G.diffNames(root, checkedAt, targetNow) : [];
       const m = G.git(P.wt, [...G.identityArgs(P.wt), 'merge', '--no-ff', '--no-edit', '--no-verify', '-m', `harness(${task.id}): bring ${target} up to date`, target], { allowFail: true, retryLock: true });
       if (!m.ok) {
         if (!G.mergeInProgress(P.wt)) { S.writeTask(root, task); return refused(task, `could not bring ${target} into ${task.branch}: ${m.err.trim().slice(0, 300)}`); }
-        log(`[pilot] ${task.id} — conflicts with ${target}; asking the session to resolve them`);
-        const res = await resolveConflicts(root, task, P, target, o);
-        if (!res.ok) { S.writeTask(root, task); return refused(task, res.why); }
-        rounds += res.rounds;
+        S.writeTask(root, task); return refused(task, leaveConflicts(root, task, P, target));
       } else task.commits.push(G.headSha(P.wt));
-      S.log(root, task.id, { event: 'target_merged', target, rounds });
+      S.log(root, task.id, { event: 'target_merged', target });
       // [자동 이슈 #31] --force 는 사용자가 검사 결과를 알고 합치기로 한 것 — 대상을 들인 뒤의 검사도 건너뛴다(기록은 남긴다)
       if (o.force) S.log(root, task.id, { event: 'checks', phase: 'accept', why: 'target brought in', verdict: 'skipped', skipped: 'force' });
-      else if (task.checks.commands.length) { const no = await checkHere('target brought in'); if (no) return no; }
+      else if (task.checks.commands.length && docsOnly(docsSince)) S.log(root, task.id, { event: 'checks', phase: 'accept', why: 'target brought in', verdict: 'skipped', skipped: 'docs only since the last check', files: docsSince.slice(0, 20) });
+      else if (task.checks.commands.length) { const no = await checkHere('target brought in'); if (no) return no; checkedPasses++; }
+      checkedAt = targetNow;
     }
     // 대상 브랜치를 새로 들이지 않았어도, 마지막으로 기록된 검사가 실패면 다시 잰다 — [2026-10-20 실측 · 작업 수치에서 발견]
     //   위에서 거절된 작업을 다시 accept 하면 이미 들인 상태라 위 고리를 건너뛰어 검사 없이 병합됐다(실패 0 → 133 인 채로 사용자 브랜치에).
@@ -281,7 +320,8 @@ async function accept(o) {
       const no = await checkHere('last recorded checks failed'); if (no) return no;
     }
     // thin: 작업이 끝 검사를 미뤘다 — 합치기 전에 여기서 처음 잰다(실패면 기준선과 비교해 나빠졌을 때만 막는다). --force 면 재지 않는다.
-    if (!broughtTarget && !o.force && task.checks.commands.length && task.checks.deferred && !task.checks.last) {
+    //   light 칸은 앞서 잰 결과(check <id>)가 있어도 다시 잰다 — 그 뒤에도 사람이 커밋했을 수 있다(턴마다 지우는 루프가 없다).
+    if (!broughtTarget && !checkedNow && !o.force && task.checks.commands.length && task.checks.deferred && (!task.checks.last || task.mode === 'light')) {
       const no = await checkHere('deferred checks (thin)'); if (no) return no;
     }
     // 린트 — 대상 브랜치를 들인 뒤에도 작업이 바꾼 파일에서 다시 본다(루프에서 통과했어도 그 뒤의 커밋 · 대상 브랜치가 깨뜨릴 수 있다).
@@ -299,7 +339,7 @@ async function accept(o) {
       if (argv) {
         const lr = await K.runCheck(P.wt, argv, { timeoutMs: checkTimeout(task, o) });
         S.log(root, task.id, { event: 'lint', phase: 'accept', ok: lr.ok, exit_code: lr.exit_code });
-        if (!lr.ok && (lt.files || lt.baseline_ok !== false)) { S.writeTask(root, task); return refused(task, `lint fails on ${task.branch} (${lr.command}): ${K.firstAssertion(lr).slice(0, 200)} — resume or fix it, then accept again${lt.files ? '' : ' (this lints the whole repository; put {files} in lint_command to lint only the changed files — accept reads the current value — or accept --force)'}`); }
+        if (!lr.ok && (lt.files || lt.baseline_ok !== false)) { S.writeTask(root, task); return refused(task, `lint fails on ${task.branch} (${lr.command}): ${K.firstAssertion(lr).slice(0, 200)} — fix it in the lane, then accept again${lt.files ? '' : ' (this lints the whole repository; put {files} in lint_command to lint only the changed files — accept reads the current value — or accept --force)'}`); }
       }
     }
     if (!G.isAncestor(root, target, task.branch)) { S.writeTask(root, task); return refused(task, `${target} kept moving while integrating; run accept again`); }
@@ -335,10 +375,11 @@ async function accept(o) {
     }
     // 병합은 끝났다 — 무엇보다 먼저 기록한다(태그 · worktree 정리가 실패해도 기록은 남는다).
     Object.assign(task, { status: 'accepted', reason: `merged into ${target} as ${merge.slice(0, 10)}`, merge_commit: merge, accepted_into: target, accepted_at: S.nowIso(), revert_commit: null });
-    if (was.status !== 'done') task.forced_from = { status: was.status, reason: was.reason };
+    const forced = was.status !== 'done' && !(task.mode === 'light' && was.status === 'open');
+    if (forced) task.forced_from = { status: was.status, reason: was.reason };
     delete task.tag_error;
     S.writeTask(root, task);
-    S.log(root, task.id, { event: 'accepted', merge_commit: merge, into: target, conflict_rounds: rounds, forced_from: was.status !== 'done' ? was.status : null });
+    S.log(root, task.id, { event: 'accepted', merge_commit: merge, into: target, forced_from: forced ? was.status : null, leftovers: leftover.length || undefined });
 
     const tag = `harness/merged/${task.id}`;
     let tagErr = null;
@@ -361,33 +402,19 @@ async function accept(o) {
       if (rm.ignored) task.outside_git = { ...(task.outside_git || {}), ignored_changed: rm.ignored };
     }
     releaseResources(root, task);
-    // go --doc 로 연결한 관리 문서: tasks 에 id · updated · 색인. git 이 추적하는 문서만 그 경로로 커밋한다. 실패해도 병합은 그대로.
-    let docLines = [];
-    if ((task.docs || []).length) {
-      try {
-        const lk = require('./docs').linkTask(root, task, { target });
-        docLines = lk.lines;
-        task.docs_linked = { updated: lk.updated, commit: lk.commit, committed: lk.committed, skipped: lk.skipped };
-        S.log(root, task.id, { event: 'docs_linked', updated: lk.updated, commit: lk.commit, skipped: lk.skipped });
-      } catch (e) {
-        docLines = [`warning: could not link the documents (${task.docs.join(', ')}): ${e.message}`];
-        S.log(root, task.id, { event: 'docs_link_failed', error: String(e.message).slice(0, 300) });
-      }
-    }
     S.writeTask(root, task);
+    const leftLines = ko => (leftover.length ? [`${ko ? '커밋되지 않았던 변경을 커밋해 함께 병합했다' : 'committed the uncommitted changes and merged them too'}: ${leftover.slice(0, 20).join(', ')}${leftover.length > 20 ? ` … (+${leftover.length - 20})` : ''}`] : []);
     if (isKo(task)) {
-      const headKo = was.status === 'done' ? `pilot ${task.id} — 받아들임` : `pilot ${task.id} — 받아들임(강제) — 작업 상태는 ${was.status}: ${was.reason || '(이유 기록 없음)'}`;
-      return out(task, { report: [headKo, `${task.branch} 를 ${target} 에 ${merge.slice(0, 10)} 로 병합했다${tagErr ? '' : `(태그 ${tag})`}${rounds ? ` — 충돌 해결 ${rounds}회 뒤` : ''}.`,
+      const headKo = was.status === 'done' || (task.mode === 'light' && was.status === 'open') ? `pilot ${task.id} — 받아들임` : `pilot ${task.id} — 받아들임(강제) — 작업 상태는 ${was.status}: ${was.reason || '(이유 기록 없음)'}`;
+      return out(task, { report: [headKo, `${task.branch} 를 ${target} 에 ${merge.slice(0, 10)} 로 병합했다${tagErr ? '' : `(태그 ${tag})`}.`, ...leftLines(true),
         ...(tagErr ? [`경고: 태그 ${tag} 를 만들지 못했다: ${tagErr} — 병합은 작업 기록(merge_commit ${merge.slice(0, 10)})에 있어 cancel 은 그대로 된다`] : []),
         ...(task.worktree_kept ? [`작업 폴더(worktree) 남김: ${P.wt} (${task.worktree_kept})`] : []),
-        ...docLines,
         `계획 보관: ${P.archiveDir}`, `되돌리기: node harness/cli.js cancel ${task.id}   (revert 커밋을 만든다 · reset 은 쓰지 않는다)`].join('\n') });
     }
-    const head = was.status === 'done' ? `pilot ${task.id} — ACCEPTED` : `pilot ${task.id} — ACCEPTED (forced) — the task was ${was.status}: ${was.reason || '(no reason recorded)'}`;
-    return out(task, { report: [head, `merged ${task.branch} into ${target} as ${merge.slice(0, 10)}${tagErr ? '' : ` (tag ${tag})`}${rounds ? ` after ${rounds} conflict-resolution round(s)` : ''}.`,
+    const head = was.status === 'done' || (task.mode === 'light' && was.status === 'open') ? `pilot ${task.id} — ACCEPTED` : `pilot ${task.id} — ACCEPTED (forced) — the task was ${was.status}: ${was.reason || '(no reason recorded)'}`;
+    return out(task, { report: [head, `merged ${task.branch} into ${target} as ${merge.slice(0, 10)}${tagErr ? '' : ` (tag ${tag})`}.`, ...leftLines(false),
       ...(tagErr ? [`warning: could not create tag ${tag}: ${tagErr} — the merge is recorded in the task (merge_commit ${merge.slice(0, 10)}); cancel still works`] : []),
       ...(task.worktree_kept ? [`worktree kept: ${P.wt} (${task.worktree_kept})`] : []),
-      ...docLines,
       `plan archived at ${P.archiveDir}`, `undo: node harness/cli.js cancel ${task.id}   (creates a revert commit; never resets)`].join('\n') });
   });
 }
@@ -419,9 +446,9 @@ async function revertOnto(root, task, target, commit, extra, label, o) {
     } else if (task.checks.commands.length) {
       // cancel: 되돌린 뒤의 상태는 작업 전 기준선보다 나쁘지 않으면 된다(사용자 검사는 되돌린 기능을 묘사하므로 다시 빨개지는 게 맞다).
       // restore: 기능이 돌아오므로 accept 때와 같은 판정.
-      const runT = () => K.runAll(tmp, K.commandsForJudge(tmp, task.checks), { timeoutMs: checkTimeout(task, o), serialRoot: task.checks.serial ? root : null });
+      const runT = () => K.runAll(tmp, K.commandsForJudge(tmp, task.checks), { timeoutMs: checkTimeout(task, o), serialRoot: serialRootOf(root, task) });
       let j = await runT();
-      if (!j.ok && !task.checks.baseline) { const before = JSON.stringify(task.checks.commands); await L.ensureBaseline(root, task, { o: { checkTimeoutMs: checkTimeout(task, o) }, log: (o && o.log) || (() => {}) }); if (JSON.stringify(task.checks.commands) !== before) j = await runT(); }
+      if (!j.ok && !task.checks.baseline) { const before = JSON.stringify(task.checks.commands); await B.ensureBaseline(root, task, { o: { checkTimeoutMs: checkTimeout(task, o) }, log: (o && o.log) || (() => {}) }); if (JSON.stringify(task.checks.commands) !== before) j = await runT(); }
       const v = K.judge(j, task.checks.baseline, { notWorse: label === 'cancel' || task.checks.source !== 'user' });
       S.log(root, task.id, { event: 'checks', phase: label, verdict: v.verdict, pass: j.pass, fail: j.fail });
       if (v.verdict === 'fail') return { refused: `checks fail on ${target} after the ${label} revert (${j.fail} failing); nothing was applied — if this is only an environment problem, run ${label} again with --skip-checks` };
@@ -445,7 +472,7 @@ async function revertOnto(root, task, target, commit, extra, label, o) {
 const skippedLine = (r, label) => (r.checksSkipped ? [`checks skipped (--skip-checks): the ${label} commit was applied without running the checks — verify it yourself`] : []);
 function cancelPre(task) {
   if (task.status === 'cancelled') return 'already cancelled';
-  if (ownerBusy(task)) return `task is still running (pid ${task.owner.pid}); wait for it, or stop it with: node harness/cli.js stop ${task.id}`;
+  if (ownerBusy(task)) return `task is still running (pid ${task.owner.pid}); wait for it, or stop that session (claude agents)`;
   return null;
 }
 async function cancel(o) {
@@ -535,15 +562,15 @@ async function restore(o) {
 //   실패면 작업 시작 시점의 기준선과 비교한다(원래부터 실패 = 나빠지지 않음). 기록된 결과는 accept 가 그대로 쓴다(나빠졌으면 다시 재고 막는다).
 async function check(o) {
   const { root, task: task0, P, log } = load(o);
-  if (!['done', 'failed', 'interrupted', 'capped', 'blocked', 'stalled'].includes(task0.status)) return refused(task0, `task status is ${task0.status} — check runs on finished work`);
+  if (!['done', 'failed', 'interrupted', 'capped', 'blocked', 'stalled'].includes(task0.status) && !(task0.mode === 'light' && task0.status === 'open')) return refused(task0, `task status is ${task0.status} — check runs on finished work`);
   return withTaskLock(root, task0, async () => {
     const task = S.readTask(root, task0.id);
     if (!(task.checks && task.checks.commands && task.checks.commands.length)) return out(task, { status: 'checked', report: `pilot ${task.id} — no checks found for this repository` });
     const wtWhy = ensureWorktree(root, task, P, o.removalWaitMs, log);
     if (wtWhy) return refused(task, wtWhy);
-    const run1 = async () => (await K.runJudged(P.wt, K.commandsForJudge(P.wt, task.checks), { timeoutMs: checkTimeout(task, o), rerun: task.checks.rerun, serialRoot: task.checks.serial ? root : null })).judged;
+    const run1 = async () => (await K.runJudged(P.wt, K.commandsForJudge(P.wt, task.checks), { timeoutMs: checkTimeout(task, o), rerun: task.checks.rerun, serialRoot: serialRootOf(root, task) })).judged;
     let j = await run1();
-    if (!j.ok && !task.checks.baseline && task.checks.source !== 'user') { const before = JSON.stringify(task.checks.commands); await L.ensureBaseline(root, task, { o: { checkTimeoutMs: checkTimeout(task, o) }, log }); if (JSON.stringify(task.checks.commands) !== before) j = await run1(); }
+    if (!j.ok && !task.checks.baseline && task.checks.source !== 'user') { const before = JSON.stringify(task.checks.commands); await B.ensureBaseline(root, task, { o: { checkTimeoutMs: checkTimeout(task, o) }, log }); if (JSON.stringify(task.checks.commands) !== before) j = await run1(); }
     task.checks.last = K.brief(j);
     const v = K.judge(j, task.checks.baseline, { notWorse: task.checks.source !== 'user' });
     task.checks.verdict = v.verdict;
@@ -555,4 +582,4 @@ async function check(o) {
   });
 }
 
-module.exports = { accept, cancel, restore, check, dirtyOverlap, archivePlan, conflictBudget };
+module.exports = { accept, cancel, restore, check, dirtyOverlap, archivePlan, acceptTarget, result, releaseResources, commitLeftovers, copyDir, isIndeterminate, serialRootOf, MERGE_WAIT_MS };

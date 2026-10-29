@@ -77,7 +77,7 @@ function main() {
     if (!sid) return;
     const cwd = typeof input.cwd === 'string' && input.cwd ? input.cwd : process.cwd();
     const info = C.repoInfo(cwd);
-    if (!info || C.isHarnessWorktree(info.root)) return;
+    if (!info || C.harnessOwned(info)) return;            // 가벼운 길의 worktree 는 사람이 모는 세션 — 메인 체크아웃처럼 커밋시킨다
     if (C.detectRuntime(input) !== 'codex') {
       const why = promiseWithoutAction(input);
       if (why) { process.stdout.write(JSON.stringify({ decision: 'block', reason: why }) + '\n'); return; }

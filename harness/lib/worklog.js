@@ -22,12 +22,8 @@ function similarity(a, b) {
   return nx && ny ? dot / Math.sqrt(nx * ny) : 0;
 }
 
-// 작업의 "무엇을 하라고 했나" — 목표 + 사용자가 덧붙인 지시(note)
-function intentOf(root, t) {
-  let notes = [];
-  try { notes = require('./loop').allNotes ? require('./loop').allNotes(root, t.id) : []; } catch { /* 없음 */ }
-  return [t.goal, ...notes.map(n => n.text)].join('\n');
-}
+// 작업의 "무엇을 하라고 했나" — 목표
+function intentOf(root, t) { return String((t && t.goal) || ''); }
 
 // → [{ id, score, status, kind: 'same' | 'related' }] (점수 높은 순, 최대 MAX_RELATED)
 function related(root, task) {
@@ -42,55 +38,7 @@ function related(root, task) {
   return out.sort((a, b) => b.score - a.score).slice(0, MAX_RELATED);
 }
 
-const clip = (s, n) => { s = String(s || '').replace(/\s+/g, ' ').trim(); return s.length > n ? s.slice(0, n - 1) + '…' : s; };
-const DONE = new Set(['accepted', 'done']);
-// 이전 작업 하나의 요약 — 결과 · 결정 분기점(선택한 것) · 바꾼 파일
-function summary(root, ref) {
-  const t = S.readTask(root, ref.id);
-  if (!t) return null;
-  const head = `- ${t.id} (${t.status}${t.merge_commit ? `, merged as ${String(t.merge_commit).slice(0, 10)}` : ''}, ${Math.round(ref.score * 100)}% similar): ${clip(t.goal, 220)}`;
-  const lines = [head];
-  if (t.reason) lines.push(`  result: ${clip(t.reason, 200)}`);
-  for (const d of (t.decisions || []).slice(0, 4)) {
-    const chosen = (d.body || []).find(l => /^-?\s*chosen\s*:/i.test(l));
-    lines.push(`  decision: ${clip(d.title, 140)}${chosen ? ` → ${clip(chosen.replace(/^-?\s*chosen\s*:\s*/i, ''), 140)}` : ''}`);
-  }
-  try {
-    const G = require('./git');
-    const to = t.head || (G.branchExists(root, t.branch) ? t.branch : null);
-    if (t.base_commit && to) {
-      const files = G.diffNames(root, t.base_commit, to).filter(f => !f.startsWith('.harness/'));
-      if (files.length) lines.push(`  files changed: ${files.length} (${files.slice(0, 8).join(', ')}${files.length > 8 ? ', …' : ''})`);
-    }
-  } catch { /* 브랜치가 사라졌으면 생략 */ }
-  return lines;
-}
 
-// 작업자 지시문 블록 — 관련 작업이 없으면 빈 배열
-function promptLines(root, task) {
-  const refs = task.related || [];
-  if (!refs.length || !root) return [];
-  const L = ['# Earlier work in this repository',
-    'The harness found earlier tasks with a similar goal. Build on them: do not redo finished work and do not undo their decisions unless this goal requires it.'];
-  for (const r of refs) { const s = summary(root, r); if (s) L.push(...s); }
-  const same = refs.find(r => r.kind === 'same' && DONE.has(r.status));
-  if (same) L.push(`This goal looks the same as ${same.id}, which is already ${same.status}. Do not start over: first check whether what it asks for already exists in this worktree and verify it (run or inspect it), then do only what is still missing or wrong. Write what you found in DECISIONS.md.`);
-  const live = refs.filter(r => r.status === 'running');
-  if (live.length) L.push(`${live.map(r => r.id).join(', ')} with a similar goal ${live.length > 1 ? 'are' : 'is'} running right now in another worktree — stay within this goal and avoid changing the same files where you can.`);
-  let text = L.join('\n');
-  if (text.length > MAX_CHARS) text = text.slice(0, MAX_CHARS - 1) + '…';
-  return [...text.split('\n'), ''];
-}
 
-// 보고의 주의 한 줄 — 없으면 null
-function reportWarning(task, ko) {
-  const refs = task.related || [];
-  const same = refs.filter(r => r.kind === 'same'), live = refs.filter(r => r.status === 'running');
-  if (!same.length && !live.length) return null;
-  const parts = [];
-  if (same.length) parts.push(ko ? `같은 목표의 이전 작업이 있다(${same.map(r => `${r.id} ${r.status}`).join(', ')}) — 다시 하지 않고 확인 · 이어 가도록 지시했다` : `an earlier task has the same goal (${same.map(r => `${r.id} ${r.status}`).join(', ')}) — the worker was told to verify and continue from it, not redo it`);
-  if (live.length) parts.push(ko ? `비슷한 작업이 동시에 돌고 있었다(${live.map(r => r.id).join(', ')}) — 겹치는 변경이 있는지 보세요` : `a similar task was running at the same time (${live.map(r => r.id).join(', ')}) — check for overlapping changes`);
-  return parts.join(' · ');
-}
 
-module.exports = { related, similarity, promptLines, reportWarning, SAME, RELATED };
+module.exports = { related, similarity, SAME, RELATED };

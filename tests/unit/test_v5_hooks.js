@@ -166,7 +166,31 @@ const claudeWrite = (repo, sid, file, tool) => hook('track', { hook_event_name: 
     const ffo = pre('git merge --ff-only feature', 'Bash');
     R.check('[guard/L10] git merge --ff-only 는 막고 이유에 accept 를 쓰는 까닭을 적는다', isDeny(ffo) && /--ff-only/.test(ffo.json.hookSpecificOutput.permissionDecisionReason) && /accept/.test(ffo.json.hookSpecificOutput.permissionDecisionReason), ffo.stdout);
 
-    R.check('[guard] 쓰기 도구·MCP 는 보지 않는다', isAllow(hook('guard', { hook_event_name: 'PreToolUse', session_id: 's', cwd: repo, tool_name: 'Write', tool_input: { file_path: 'x', content: 'git push' } })));
+    R.check('[guard] 쓰기 도구는 보지 않는다(대화형)', isAllow(hook('guard', { hook_event_name: 'PreToolUse', session_id: 's', cwd: repo, tool_name: 'Write', tool_input: { file_path: 'x', content: 'git push' } })));
+
+    // [2026-10-25 보안 구멍] mcp__ 도구가 모두 통과였다 — git · GitHub MCP 서버로 reset · commit · push · 병합이 guard 를 비켜 갔다.
+    {
+      const GD = require(path.join(HOOKS, 'guard.js'));
+      const mcp = (tool, ti) => GD.decide({ hook_event_name: 'PreToolUse', session_id: 'm', cwd: repo, tool_name: tool, tool_input: ti || { repo_path: repo } }, 'claude');
+      const mcpBlock = [
+        ['mcp__git__git_reset'], ['mcp__git__git_checkout', { repo_path: repo, branch_name: 'x' }], ['mcp__git__git_commit', { repo_path: repo, message: 'm' }], ['mcp__git__git_add', { repo_path: repo, files: ['a'] }],
+        ['mcp__git__git_create_branch'], ['mcp__git__git_push'], ['mcp__git__git_merge'], ['mcp__git__git_rebase'], ['mcp__git__git_stash'], ['mcp__git__git_clean'], ['mcp__git__git_tag'],
+        ['mcp__git__git_cherry_pick'], ['mcp__git__git_revert'], ['mcp__git__git_pull'], ['mcp__git__delete_branch'], ['mcp__local-git__reset'], ['mcp__git__git_branch', { repo_path: repo, delete: true, branch: 'x' }],
+        ['mcp__github__push_files'], ['mcp__github__merge_pull_request'], ['mcp__github__create_or_update_file'], ['mcp__github__delete_file'], ['mcp__github__update_pull_request_branch'],
+        ['mcp__github__create_repository'], ['mcp__github__fork_repository'], ['mcp__github__create_branch'], ['mcp__gitlab__delete_project'], ['mcp__gitea__push_files'], ['mcp__bitbucket__merge_pull_request'],
+      ];
+      for (const [t, ti] of mcpBlock) R.check(`[guard/mcp] 막는다: ${t}`, typeof mcp(t, ti) === 'string', String(mcp(t, ti)));
+      const mcpAllow = [
+        ['mcp__git__git_status'], ['mcp__git__git_diff'], ['mcp__git__git_diff_staged'], ['mcp__git__git_log'], ['mcp__git__git_show'], ['mcp__git__git_branch', { repo_path: repo, branch_type: 'local' }],
+        ['mcp__github__get_file_contents'], ['mcp__github__list_commits'], ['mcp__github__search_code'], ['mcp__github__create_issue'], ['mcp__github__add_issue_comment'], ['mcp__github__update_issue'],
+        ['mcp__github__get_pull_request'], ['mcp__filesystem__write_file'], ['mcp__memory__add_observations'], ['mcp__claude_ai_Claude_Docs__batch'],
+      ];
+      for (const [t, ti] of mcpAllow) R.check(`[guard/mcp] 통과: ${t}`, mcp(t, ti) === null, String(mcp(t, ti)));
+      const gp = hook('guard', { hook_event_name: 'PreToolUse', session_id: 's', cwd: repo, prompt_id: 'p', tool_name: 'mcp__github__push_files', tool_input: { owner: 'o', repo: 'r', branch: 'main', files: [] } });
+      const gc = hook('guard', { hook_event_name: 'PreToolUse', session_id: 's', cwd: repo, prompt_id: 'p', tool_name: 'mcp__git__git_commit', tool_input: { repo_path: repo, message: 'x' } });
+      R.check('[guard/mcp] 훅 출력: deny · [pilot guard] · 허용된 길(Bash 의 git · cli.js push · accept)', isDeny(gp) && isDeny(gc) && [gp, gc].every(r => { const why = r.json.hookSpecificOutput.permissionDecisionReason; return /^\[pilot guard\]/.test(why) && /node harness\/cli\.js push/.test(why) && /accept <id>/.test(why) && /Bash/.test(why); }), gp.stdout + gc.stdout);
+      R.check('[guard/mcp] 읽기 도구는 훅으로도 통과(출력 없음)', isAllow(hook('guard', { hook_event_name: 'PreToolUse', session_id: 's', cwd: repo, prompt_id: 'p', tool_name: 'mcp__git__git_status', tool_input: { repo_path: repo } })));
+    }
 
     // Codex 페이로드 — 같은 출력 계약. 명령이 argv 배열일 수 있다.
     const cx = (command, tool) => hook('guard', { hook_event_name: 'PreToolUse', session_id: 'c1', turn_id: 't1', model: 'gpt-6', cwd: repo, tool_name: tool || 'Bash', tool_use_id: 'u1', tool_input: { command } }, ['--codex']);
@@ -212,6 +236,10 @@ const claudeWrite = (repo, sid, file, tool) => hook('track', { hook_event_name: 
     git(tr, 'worktree', 'add', '-q', '-b', 'harness/t-x', path.join(tr, '.harness-worktrees', 't-x'));
     claudeWrite(path.join(tr, '.harness-worktrees', 't-x'), 'WT', path.join(tr, '.harness-worktrees', 't-x', 'w.js'));
     R.check('[track] 하네스 작업 worktree 안의 세션은 기록하지 않는다', readSession(tr, 'WT') === null);
+    // 파일 시스템 MCP 의 쓰기 — path · move_file 의 destination(옮기기 전 자리 source 는 기록하지 않는다)
+    hook('track', { hook_event_name: 'PostToolUse', session_id: 'FSM', cwd: tr, prompt_id: 'p', tool_name: 'mcp__filesystem__write_file', tool_input: { path: path.join(tr, 'm', 'w.txt'), content: 'x' } });
+    hook('track', { hook_event_name: 'PostToolUse', session_id: 'FSM', cwd: tr, prompt_id: 'p', tool_name: 'mcp__filesystem__move_file', tool_input: { source: path.join(tr, 'm', 'from.txt'), destination: path.join(tr, 'm', 'to.txt') } });
+    R.check('[track/mcp] 파일 시스템 MCP: write_file 의 path · move_file 의 destination 을 기록 · source 는 아니다', JSON.stringify((readSession(tr, 'FSM') || {}).files) === JSON.stringify(['m/w.txt', 'm/to.txt']), JSON.stringify(readSession(tr, 'FSM')));
     R.check('[track] 깨진 입력 → exit 0', hook('track', '[[[', [], tr).status === 0);
 
     // ── stop (Claude) ─────────────────────────────────────────────────
@@ -305,16 +333,64 @@ const claudeWrite = (repo, sid, file, tool) => hook('track', { hook_event_name: 
     R.check('[session-end] 남은 자기 파일을 그것만 커밋: wip(session <sid8>): auto-commit at session end',
       git(se, 'log', '-1', '--format=%s') === 'wip(session dddd1111): auto-commit at session end' && git(se, 'show', '--name-only', '--format=', 'HEAD') === 'd.js', git(se, 'log', '-1', '--format=%s'));
     R.check('[session-end] 다른 세션의 e.js 는 미커밋 그대로 · 그 세션 기록도 그대로', /^ M e\.js$/m.test(status(se)) && readSession(se, 'eeee') !== null);
-    R.check('[session-end] 깨끗하게 끝난 세션의 기록은 지운다', readSession(se, 'dddd1111-2222') === null);
+    // 사양 변경(2026-10-25 게시판): 깨끗하게 끝난 세션의 기록은 지우지 않고 ended_at 을 적은 채 files 를 비운다 — 게시판이 끝난 세션을 산 세션으로 보지 않게.
+    //   (status 의 주인 분류는 files 로만 하므로 커밋된 파일을 이 세션 것으로 잡지 않는다.) 하루 지난 빈 기록은 session-end 가 치운다.
+    const dEnd = readSession(se, 'dddd1111-2222');
+    R.check('[session-end] 깨끗하게 끝난 세션: ended_at · end_reason 을 적고 files 는 비운다', dEnd && !isNaN(Date.parse(dEnd.ended_at)) && dEnd.end_reason === 'prompt_input_exit' && Array.isArray(dEnd.files) && dEnd.files.length === 0, JSON.stringify(dEnd));
+    {
+      const oldEnd = { session_id: 'old-ended', runtime: 'claude', files: [], ended_at: new Date(Date.now() - 25 * 3600 * 1000).toISOString() };
+      write(sessionFile(se, 'old-ended'), JSON.stringify(oldEnd));
+      write(sessionFile(se, 'old-left'), JSON.stringify({ ...oldEnd, session_id: 'old-left', files: ['x.js'] }));
+      write(sessionFile(se, 'recent-ended'), JSON.stringify({ ...oldEnd, session_id: 'recent-ended', ended_at: new Date(Date.now() - 3600 * 1000).toISOString() }));
+      claudeWrite(se, 'pruner', path.join(se, 'd.js')); end('pruner');
+      R.check('[session-end] 끝난 지 하루 지난 빈 기록만 치운다(남은 파일이 있는 기록 · 최근 기록은 둔다)', readSession(se, 'old-ended') === null && readSession(se, 'old-left') !== null && readSession(se, 'recent-ended') !== null,
+        JSON.stringify([readSession(se, 'old-ended'), !!readSession(se, 'old-left'), !!readSession(se, 'recent-ended')]));
+    }
     write(path.join(se, 'f.js'), 'F\n'); write(path.join(se, 'id_rsa'), 'KEY\n');
     claudeWrite(se, 'ffff', path.join(se, 'f.js')); claudeWrite(se, 'ffff', path.join(se, 'id_rsa'));
     end('ffff', ['--codex']);
     const fs1 = readSession(se, 'ffff');
     R.check('[session-end] 비밀 파일은 커밋하지 않고 기록을 남긴다(f.js 만 커밋)',
       git(se, 'show', '--name-only', '--format=', 'HEAD') === 'f.js' && /^\?\? id_rsa$/m.test(status(se)) && fs1 && fs1.ended_at && fs1.secrets_left.includes('id_rsa'), JSON.stringify(fs1));
-    R.check('[session-end] 기록 없는 세션 · 깨진 입력 → exit 0', isAllow(end('none')) && hook('session-end', 'nope', [], se).status === 0);
+    R.check('[session-end] 기록 없는 세션 · 깨진 입력 → exit 0 · 기록을 새로 만들지 않는다', isAllow(end('none')) && readSession(se, 'none') === null && hook('session-end', 'nope', [], se).status === 0);
 
-    // ── 리뷰 수정: _common · policy ─────────────────────────────────
+    // ── [2026-10-25 Light] 가벼운 길(task.mode 'light')의 worktree 는 사람이 모는 세션 — track · stop · session-end 가 메인 체크아웃처럼 ──
+    {
+      const lr = mkRepo('lane', { 'a.js': 'a\n', 'b.js': 'b\n' });
+      const lid = 't-20261025-101010-abcd', wid = 't-20261025-101011-beef';
+      const lwt = path.join(lr, '.harness-worktrees', lid), wwt = path.join(lr, '.harness-worktrees', wid);
+      git(lr, 'worktree', 'add', '-q', '-b', `harness/${lid}`, lwt);
+      git(lr, 'worktree', 'add', '-q', '-b', `harness/${wid}`, wwt);
+      const taskJson = (id, extra) => write(path.join(lr, '.git', 'harness', 'tasks', id, 'task.json'), JSON.stringify({ id, status: 'open', owner: null, branch: `harness/${id}`, goal: 'lane work', ...extra }));
+      taskJson(lid, { mode: 'light' });
+      taskJson(wid, { status: 'running' });                                   // 무인 작업 — mode 없음
+      const C0 = require(path.join(HOOKS, '_common.js'));
+      const iL = C0.repoInfo(lwt), iW = C0.repoInfo(wwt), iM = C0.repoInfo(lr);
+      R.check('[lane] laneOf: 가벼운 길의 worktree 만 {id, task} · 무인 작업 worktree · 메인 체크아웃은 null', (C0.laneOf(iL) || {}).id === lid && C0.laneOf(iL).task.mode === 'light' && C0.laneOf(iW) === null && C0.laneOf(iM) === null
+        && C0.harnessOwned(iW) === true && C0.harnessOwned(iL) === false && C0.harnessOwned(iM) === false, JSON.stringify([C0.laneOf(iL), C0.laneOf(iW)]));
+      const mainHead = git(lr, 'rev-parse', 'main');
+      write(path.join(lwt, 'a.js'), 'A\n'); write(path.join(lr, 'b.js'), 'B by someone\n');
+      claudeWrite(lwt, 'LANE1', path.join(lwt, 'a.js'));
+      claudeWrite(wwt, 'WORK1', path.join(wwt, 'a.js'));
+      R.check('[lane] track: 가벼운 길의 세션은 기록한다(worktree 상대 경로) · 무인 작업 worktree 는 여전히 기록하지 않는다', JSON.stringify((readSession(lr, 'LANE1') || {}).files) === '["a.js"]' && readSession(lr, 'WORK1') === null, JSON.stringify(readSession(lr, 'LANE1')));
+      const lstop = active => hook('stop', { hook_event_name: 'Stop', session_id: 'LANE1', cwd: lwt, prompt_id: 'p', stop_hook_active: active, last_assistant_message: 'done' });
+      const ls1 = lstop(false);
+      R.check('[lane] stop: 자기 미커밋 파일이 있으면 막는다', ls1.json && ls1.json.decision === 'block' && /`a\.js`/.test(ls1.json.reason), ls1.stdout);
+      const ls2 = lstop(true);
+      R.check('[lane] stop: 이어 간 턴 뒤에도 남았으면 그 길의 브랜치에 그 파일만 커밋 · 메인 브랜치 · 메인의 b.js 는 그대로', isAllow(ls2) && git(lwt, 'log', '-1', '--format=%s') === 'wip(session LANE1): update a.js' && git(lwt, 'rev-parse', '--abbrev-ref', 'HEAD') === `harness/${lid}`
+        && git(lr, 'rev-parse', 'main') === mainHead && /^ M b\.js$/m.test(status(lr)), git(lwt, 'log', '-1', '--format=%s') + ' | ' + status(lr));
+      const lpre = (command, args) => hook('guard', { hook_event_name: 'PreToolUse', session_id: 'LANE1', cwd: lwt, prompt_id: 'p', tool_name: 'Bash', tool_input: { command } }, args);
+      const outside = path.join(base, 'lane-outside-dir');
+      R.check('[lane] guard: 대화형 세션은 가벼운 길에서 자기 파일을 add · commit 할 수 있다 · push 는 여전히 막는다', isAllow(lpre('git add -- a.js')) && isAllow(lpre('git commit -m "x" -- a.js')) && isDeny(lpre('git push')));
+      R.check('[lane] guard: 대화형 규칙이다 — worktree 밖 구체 경로 삭제는 대화형에선 통과', isAllow(lpre(`rm -rf ${JSON.stringify(outside)}`)));
+      write(path.join(lwt, 'c.js'), 'c\n');
+      claudeWrite(lwt, 'LANE1', path.join(lwt, 'c.js'));
+      hook('session-end', { hook_event_name: 'SessionEnd', session_id: 'LANE1', cwd: lwt, reason: 'other' });
+      const le = readSession(lr, 'LANE1');
+      R.check('[lane] session-end: 남은 자기 파일을 그 길의 브랜치에 커밋 · ended_at', git(lwt, 'log', '-1', '--format=%s') === 'wip(session LANE1): auto-commit at session end' && git(lwt, 'show', '--name-only', '--format=', 'HEAD') === 'c.js' && le && le.ended_at && git(lr, 'rev-parse', 'main') === mainHead, JSON.stringify(le));
+    }
+
+    // ── 리뷰 수정: _common ─────────────────────────────────
     const C = require(path.join(HOOKS, '_common.js'));
     // [L10] isSecretPath 확장 — 자격 증명 데이터 파일은 막되 같은 이름의 소스 파일은 막지 않는다.
     const secretYes = ['.npmrc', 'sub/.npmrc', 'credentials', 'credentials.json', '.aws/credentials', 'service-account.json', 'service_account-prod.json', 'keys/app.jks', 'infra/terraform.tfstate', 'terraform.tfstate.backup', 'AuthKey_ABC123.p8'];
@@ -404,13 +480,6 @@ const claudeWrite = (repo, sid, file, tool) => hook('track', { hook_event_name: 
     hook('stop', { hook_event_name: 'Stop', session_id: 'cxcxcxcx', turn_id: 't', cwd: hk, stop_hook_active: false }, ['--codex']);
     R.check('[L11] Codex stop 커밋도 같다', git(hk, 'rev-parse', 'HEAD') !== hkHead2, status(hk));
 
-    // [M8] 워커 권한 — 셸(임의 실행기)은 어떤 경로로 들어와도 허용하지 않는다.
-    const policy = require(path.join(HOOKS, '..', 'lib', 'policy.js'));
-    const allow = policy.claudeSettings(['node', 'bash', 'sh', 'pwsh', 'powershell', 'cmd', 'env', 'bash.exe', 'zsh', 'npm']).permissions.allow;
-    R.check('[M8/policy] claudeSettings 는 bash · sh · cmd · powershell · pwsh · env 를 허용에 넣지 않는다', !allow.some(x => /\((bash|sh|zsh|cmd|powershell|pwsh|env)(\.exe)?:/i.test(x)) && allow.includes('Bash(node:*)') && allow.includes('Bash(npm:*)'), JSON.stringify(allow));
-    R.check('[M8/policy] allowFor 도 셸 검사(bash x.sh · sh -c …)에서 셸을 넣지 않는다', JSON.stringify(policy.allowFor([['bash', 'x.sh'], 'sh -c "npm test"', ['cmd', '/c', 'x'], ['node', 't.js']], null)) === '["node"]');
-    R.check('[M8/policy] NEVER_ALLOW · isNeverAllowed 를 내보낸다(checks.js 가 같은 목록을 쓸 수 있게)', Array.isArray(policy.NEVER_ALLOW) && ['bash', 'sh', 'cmd', 'powershell', 'pwsh', 'env'].every(x => policy.NEVER_ALLOW.includes(x)) && typeof policy.isNeverAllowed === 'function' && policy.isNeverAllowed('Bash.EXE') && !policy.isNeverAllowed('node'));
-
     // ── lang: 한국어로 묻는 세션의 답이 영어로 끝나지 않게(2026-10-13 사용자 보고) ──
     const lrepo = mkRepo('lang', { 'README.md': '# l\n' });
     const lang = (ev, extra, sid) => hook('lang', { hook_event_name: ev, session_id: sid || 'L1', cwd: lrepo, ...(extra || {}) });
@@ -425,125 +494,6 @@ const claudeWrite = (repo, sid, file, tool) => hook('track', { hook_event_name: 
     const enUp = lang('UserPromptSubmit', { prompt: 'please add the lint rules' }, 'L2');
     R.check('[lang] 영어로 묻는 세션에는 아무것도 하지 않는다(덧붙임 · 되돌림 없음)', isAllow(enUp) && isAllow(lang('Stop', { last_assistant_message: EN, stop_hook_active: false }, 'L2')));
     R.check('[lang] 저장소 밖 · 깨진 입력은 조용히 통과', isAllow(hook('lang', { hook_event_name: 'Stop', session_id: 'x', cwd: base, last_assistant_message: EN })) && isAllow(hook('lang', 'not json')) && fs.existsSync(path.join(hookTmp, 'harness', 'hook-errors.log')));
-
-    // ── [2026-10-16 사용자 지시 · 실측] 작업자 명령을 허용 목록으로 막지 않는다(open) — 대신 guard 가 작업자 모드(--worker)에서
-    //    자기 worktree 밖의 삭제를 막는다(실측: open 설정에서 저장소 밖 폴더 rm -rf 가 통과했다). 대화형 모드는 그대로. ──
-    {
-      const wrepo = mkRepo('guard-worker', { 'a.txt': 'a\n', 'build/out.txt': 'x\n' });
-      const outside = path.join(base, 'outside-of-worktree');
-      fs.mkdirSync(outside, { recursive: true }); fs.writeFileSync(path.join(outside, 'k.txt'), 'k');
-      const wpre = (command, tool, args) => hook('guard', { hook_event_name: 'PreToolUse', session_id: 'w1', cwd: wrepo, tool_name: tool || 'Bash', tool_input: { command } }, args || ['--worker'], wrepo);
-      const blockedOut = [[`rm -rf "${outside.replace(/\\/g, '/')}"`, 'Bash'], [`rm "${path.join(outside, 'k.txt').replace(/\\/g, '/')}"`, 'Bash'], [`Remove-Item -Recurse -Force "${outside}"`, 'PowerShell'], [`rm -rf ../outside-of-worktree`, 'Bash']];
-      const res = blockedOut.map(([c, t]) => [c, isDeny(wpre(c, t))]);
-      R.check('[guard/worker] 작업자 모드: worktree 밖 삭제(재귀 · 단일 파일 · PowerShell)를 막는다', res.every(x => x[1]), JSON.stringify(res));
-      R.check('[guard/worker] 작업자 모드: worktree 안 삭제 · 일반 명령은 통과', isAllow(wpre('rm -rf build')) && isAllow(wpre('rm a.txt')) && isAllow(wpre('node -v | head -1')) && isAllow(wpre('for i in 1 2; do echo $i; done')));
-      R.check('[guard/worker] 대화형 모드(인자 없음)는 예전 그대로 — 저장소 밖 일반 폴더 삭제는 막지 않는다', isAllow(wpre(`rm -rf "${outside.replace(/\\/g, '/')}"`, 'Bash', [])));
-    }
-    // ── [2026-10-17 적대적 검증] 작업자 모드 guard 우회 16가지 — 실제 worktree(메인 저장소 안)에서 ──
-    //    ① cd 로 메인 저장소에 들어가면 경계를 메인으로 다시 잡았다 ② 삭제를 명령 이름으로만 봤다(find -delete · mv · robocopy · 리다이렉션 ·
-    //    Set-Content · node/python 한 줄) ③ 풀 수 없는 변수는 마지막 조각이 구체적이면 통과 ④ docker 데몬 전체를 바꾸는 명령
-    {
-      const mainR = mkRepo('guard-adv-main', { 'src/a.js': 'a\n' });
-      const wtA = path.join(mainR, '.harness-worktrees', 't-20261017-000000-abcd');
-      git(mainR, 'worktree', 'add', '-q', '-b', 'harness/t-20261017-000000-abcd', wtA);
-      const userData = path.join(base, 'user-data-adv'); fs.mkdirSync(userData, { recursive: true }); fs.writeFileSync(path.join(userData, 'k.txt'), 'k');
-      const U = userData.replace(/\\/g, '/'), Uw = userData, MR = mainR.replace(/\\/g, '/'), MRw = mainR;
-      const G = require(path.join(HOOKS, 'guard.js'));
-      // 임시 폴더는 따로 둔다 — 이 테스트의 저장소 · 사용자 폴더가 시스템 임시 폴더 안에 있어 "임시 폴더 예외" 가 모두 통과시키지 않게(실제와 같게)
-      const advTmp = path.join(base, 'adv-tmp'); fs.mkdirSync(advTmp, { recursive: true });
-      const dec = (cmd, tool) => { const keep = ['TEMP', 'TMP', 'TMPDIR'].map(k => [k, process.env[k]]); for (const [k] of keep) process.env[k] = advTmp; try { return G.decide({ tool_name: tool, tool_input: { command: cmd }, cwd: wtA }, 'claude', { worker: true }); } finally { for (const [k, v] of keep) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } } };
-      const mustBlockW = [[`cd "${MR}" && rm -rf src`, 'Bash'], ['cd .. && cd .. && rm -rf src', 'Bash'], [`pushd "${MR}"; rm -rf src`, 'Bash'],
-        [`Set-Location "${MRw}"; Remove-Item -Recurse src`, 'PowerShell'], [`find "${U}" -delete`, 'Bash'], [`find "${U}" -type f -exec rm {} +`, 'Bash'],
-        [`mv "${U}" ./trash`, 'Bash'], [`Move-Item "${Uw}" .\\trash`, 'PowerShell'], [`node -e "require('fs').rmSync('${U}',{recursive:true})"`, 'Bash'],
-        [`python -c "import shutil; shutil.rmtree('${U}')"`, 'Bash'], ['rm -rf "$TMP/../user-data"', 'Bash'], ['rm -rf "$OUT_DIR"', 'Bash'],
-        [`robocopy empty "${Uw}" /MIR`, 'PowerShell'], [`echo x > "${U}/k.txt"`, 'Bash'], [`echo x>>${U}/k.txt`, 'Bash'], [`Set-Content -Path "${Uw}\\k.txt" -Value x`, 'PowerShell'],
-        ['docker rm -f $(docker ps -aq)', 'Bash'], ['docker system prune -af', 'Bash'], ['docker compose -p myapp down -v', 'Bash'], [`cd $SOMEWHERE && rm -rf data`, 'Bash']];
-      const blockedW = mustBlockW.map(([c, t]) => [c.replace(base.replace(/\\/g, '/'), '<T>').replace(base, '<T>'), !!dec(c, t)]);
-      R.check('[guard/worker-adv] 작업자 모드: 우회 20가지(cd 후 삭제 · find · mv · robocopy · 리다이렉션 · Set-Content · 한 줄 코드 · 변수 경로 · docker 전역)를 막는다', blockedW.every(x => x[1]), JSON.stringify(blockedW.filter(x => !x[1])));
-      const mustPassW = [['rm -rf build', 'Bash'], ['cd src && rm -f a.js', 'Bash'], ['find . -name "*.tmp" -delete', 'Bash'], ['mv a.js b.js', 'Bash'], ['echo x > out.log', 'Bash'],
-        ['npm test 2>&1 | tail -20', 'Bash'], ['dotnet build 2>&1 > build.log', 'Bash'], ['Set-Content -Path .\\out.txt -Value x', 'PowerShell'], ['docker compose up -d', 'Bash'], ['docker compose down -v', 'Bash'],
-        [`echo x > "${advTmp.replace(/\\/g, '/')}/scratch.txt"`, 'Bash'], ['rm -rf "$PWD/build"', 'Bash'], ['node -e "console.log(1)"', 'Bash'], ['cat a.js > /dev/null', 'Bash']];
-      const passedW = mustPassW.map(([c, t]) => [c, !dec(c, t)]);
-      R.check('[guard/worker-adv] 작업자 모드: worktree 안 · 임시 폴더 · 이 작업의 compose 는 그대로 통과', passedW.every(x => x[1]), JSON.stringify(passedW.filter(x => !x[1]).map(x => [x[0], String(dec(x[0], 'Bash')).slice(0, 80)])));
-      // [2026-10-21 사용 분석 · 거부 재생] ① 따옴표 안의 > 를 리디렉션으로 오인(grep 검색어) ② 지시문대로 이 작업 접두어로 만든 컨테이너를 지우는 것까지 막음
-      const keepEnv = ['COMPOSE_PROJECT_NAME', 'HARNESS_DATA_NS'].map(k => [k, process.env[k]]);
-      process.env.COMPOSE_PROJECT_NAME = 'harness-t-20261017-000000-abcd'; process.env.HARNESS_DATA_NS = 'h_t_20261017_000000_abcd';
-      try {
-        const passQ = [['grep -n "x" a.js | grep -i "raw\\|string>\\|JToken"', 'Bash'], ['grep -rn "TargetType\\b.*=>\\|\\"사람\\"" --include=*.cs .', 'Bash'], ["grep -E '<[a-z]+>' a.js", 'Bash'],
-          ['Select-String -Path a.js -Pattern "a->b"', 'PowerShell'], ['docker rm -f harness-t-20261017-000000-abcd-pg', 'Bash'], ['docker rm -f "$env:COMPOSE_PROJECT_NAME-pg"', 'PowerShell'],
-          ['docker rm -f -v "$HARNESS_DATA_NS-pg"', 'Bash'], ['docker stop -t 5 ${COMPOSE_PROJECT_NAME}-redis', 'Bash'], ['docker volume rm h_t_20261017_000000_abcd_data', 'Bash']];
-        const blockQ = [[`bash -c "echo x > ${U}/k.txt"`, 'Bash'], [`echo "a">${U}/k.txt`, 'Bash'], [`eval "echo hi > ${U}/k.txt"`, 'Bash'], [`cmd /c "echo x > ${Uw}\\k.txt"`, 'PowerShell'],
-          ['docker rm -f other-users-db', 'Bash'], ['docker rm -f harness-t-20261017-000000-abcd-pg other-users-db', 'Bash'], ['docker container prune -f', 'Bash'], ['docker stop $(docker ps -q)', 'Bash'], ['docker kill sso-server', 'Bash']];
-        const badQ = [...passQ.filter(([c, t]) => dec(c, t)).map(([c]) => `막힘(오탐): ${c}`), ...blockQ.filter(([c, t]) => !dec(c, t)).map(([c]) => `통과(구멍): ${c.replace(base, '<T>')}`)];
-        R.check('[guard/worker-q] 따옴표 안 > · < 는 데이터(grep 검색어) · 이 작업 접두어 컨테이너 정리는 통과 — 중첩 셸의 리디렉션 · 남의 컨테이너 · 전역 정리는 그대로 막힘', !badQ.length, JSON.stringify(badQ));
-      } finally { for (const [k, v] of keepEnv) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } }
-      // [2026-10-19 적대적 재평가 · 현장 66건] 정당한 명령을 막았다 — 같은 명령에서 정한 변수 · $env:TEMP · Git Bash /tmp · worktree 안 하위 저장소 · docker 읽기
-      const W2 = wtA.replace(/\\/g, '/');
-      fs.mkdirSync(path.join(wtA, 'nested'), { recursive: true }); git(path.join(wtA, 'nested'), 'init', '-q');
-      const decAt = (cmd, tool, cwd) => { const keep = ['TEMP', 'TMP', 'TMPDIR'].map(k => [k, process.env[k]]); for (const [k] of keep) process.env[k] = advTmp; try { return G.decide({ tool_name: tool, tool_input: { command: cmd }, cwd: cwd || wtA }, 'claude', { worker: true }); } finally { for (const [k, v] of keep) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } } };
-      const fp = [[`W=${W2}/sub; mkdir -p $W && rm -rf "$W/old"`, 'Bash'], [`$root = "${wtA}\\obj\\h3d"; New-Item -ItemType Directory -Force "$root\\x" | Out-Null`, 'PowerShell'],
-        [`$wt='${wtA}'; Remove-Item -Recurse -Force "$wt\\bin"`, 'PowerShell'], ['dotnet test x.sln 2>&1 | Out-File -Encoding utf8 "$env:TEMP\\t.log"', 'PowerShell'],
-        // Git Bash 의 /tmp(= 사용자 임시 폴더)는 Windows 에서만 — POSIX 의 /tmp 는 실제 경로라 임시 폴더를 따로 돌린 이 테스트에서는 밖이다
-        ...(process.platform === 'win32' ? [['dotnet test x.sln > /tmp/t.log 2>&1', 'Bash'], ['rm -rf /tmp/basechk && mkdir /tmp/basechk', 'Bash']] : []),
-        ['docker images --format x', 'Bash'], ['docker network ls', 'Bash'], ['docker ps -a', 'Bash'], ['docker volume ls', 'Bash']];
-      const fpRes = fp.map(([c, t]) => [c.slice(0, 70), !decAt(c, t)]);
-      const nested = !decAt('rm -rf ../build && rm -f ../a.txt', 'Bash', path.join(wtA, 'nested'));
-      R.check('[guard/worker-fp] 정당한 명령은 막지 않는다: 같은 명령의 변수 · $env:TEMP · /tmp · worktree 안 하위 저장소 · docker 읽기',
-        fpRes.every(x => x[1]) && nested, JSON.stringify({ blocked: fpRes.filter(x => !x[1]).map(x => x[0]), nested }));
-      const stillBlock = [[`W=${U}; rm -rf "$W"`, 'Bash'], [`export W=${U}; rm -rf "$W"`, 'Bash'], [`W=${U}; cd $W && rm -rf build`, 'Bash'],
-        ['rm -rf /tmp/../c/x', 'Bash'], ['docker network rm x', 'Bash'], ['docker container prune -f', 'Bash'], ['docker image rm a', 'Bash']];
-      // 2차(현장 재현에서 남은 것): 반복 변수 · $(pwd) · (Resolve-Path .).Path · Join-Path · 하네스가 준 compose 이름 · 한 줄 코드 속 URL 경로
-      const fp2 = [['for d in out-a out-b; do mkdir -p $d && cp -r src $d/; done', 'Bash'], ['for f in logs/m-*.log; do mv $f ${f%.log}-run1.log; done', 'Bash'],
-        ["foreach ($d in 'A.B','C.D') { robocopy \"src\\$d\" \"out\\$d\" *.cs /E }", 'PowerShell'], ['W=$(pwd); mkdir -p "$W/out" && cp a.txt "$W/out/a.txt"', 'Bash'],
-        ["$dst=(Resolve-Path .).Path + '\\copy'; New-Item -ItemType Directory -Force $dst | Out-Null; New-Item -ItemType Directory -Force \"$((Resolve-Path .).Path)\\copy2\" | Out-Null", 'PowerShell'],
-        ["$dst = Join-Path $PWD '.gis'; robocopy src \"$dst\\x\" /E", 'PowerShell'], ['$root = "$PWD\\obj\\h3d"; New-Item -ItemType Directory -Force "$root\\pristine" | Out-Null', 'PowerShell'],
-        ['docker compose -p "$COMPOSE_PROJECT_NAME" -f sim/compose.yaml config --quiet', 'Bash'],
-        [`python -c "import json; out = {'s': get('/api/ha/status')}; open('out.json', 'w').write(json.dumps(out))"`, 'Bash']];
-      const fp2Res = fp2.map(([c, t]) => [c.slice(0, 70), !decAt(c, t), String(decAt(c, t) || '').slice(-60)]);
-      R.check('[guard/worker-fp] 2차: 반복 변수 · $(pwd) · Join-Path · 하네스의 compose 이름 · 한 줄 코드 속 URL 은 막지 않는다', fp2Res.every(x => x[1]), JSON.stringify(fp2Res.filter(x => !x[1])));
-      const stillBlock2 = [[`for d in ok ${U}; do rm -rf $d; done`, 'Bash'], [`for d in a b; do cp x ${U}/$d; done`, 'Bash'], ['docker compose -p other up -d', 'Bash'],
-        [`$dst = Join-Path "${Uw}" 'x'; Remove-Item -Recurse -Force $dst`, 'PowerShell'], [`$dst = "${Uw}" + '\\x'; New-Item -ItemType Directory -Force $dst`, 'PowerShell'], [`python -c "open('${U}/k.txt', 'w').write('x')"`, 'Bash']];
-      R.check('[guard/worker-fp] 2차: 반복 값 하나라도 밖이면 · 다른 compose 이름 · Join-Path 로 만든 밖 경로 · 한 줄 코드의 밖 쓰기는 막는다', stillBlock2.every(([c, t]) => !!decAt(c, t)), JSON.stringify(stillBlock2.map(([c, t]) => [c.slice(0, 50), !!decAt(c, t)])));
-      // 3차: open 모드는 git -C · stash · config 를 권한 deny 대신 guard 가 거른다 — 읽기는 통과, 쓰기는 막는다
-      const gitRead = [[`git -C "${U}" status --short`, 'Bash'], [`git -C ${U} log --oneline -3`, 'PowerShell'], ['git stash list', 'Bash'], ['git stash show -p stash@{0}', 'Bash'],
-        ['git config --get core.autocrlf', 'Bash'], ['git config core.autocrlf', 'Bash'], ['git config --list', 'PowerShell'], [`git -C "${U}" archive -o out/a.tar HEAD`, 'Bash'], [`git -C "${U}" apply --check x.patch`, 'Bash'], [`git -C "${U}" branch --show-current`, 'PowerShell'], [`git -C "${U}" remote -v`, 'Bash']];
-      const gitWrite = [[`git -C "${U}" checkout -- .`, 'Bash'], [`git -C "${U}" commit -m x`, 'Bash'], [`git --git-dir="${U}/.git" reset --hard`, 'Bash'], ['git stash', 'Bash'], ['git stash pop', 'Bash'],
-        ['git config user.name x', 'Bash'], ['git config --unset core.x', 'Bash'], [`git -C "${U}" archive -o "${U}/a.tar" HEAD`, 'Bash'], [`git -C "${U}" apply x.patch`, 'Bash'], [`git -C . push`, 'Bash'], [`git -C "${U}" branch -D old`, 'Bash'], [`git -C "${U}" branch newb`, 'Bash'], [`git -C "${U}" remote add o x`, 'Bash'], [`git -C "${U}" tag v1`, 'Bash']];
-      const gr = gitRead.map(([c, t]) => [c.slice(0, 60), !decAt(c, t)]), gw = gitWrite.map(([c, t]) => [c.slice(0, 60), !!decAt(c, t)]);
-      R.check('[guard/worker-git] git -C · stash · config: 읽기(status · log · archive · stash list · config --get)는 통과', gr.every(x => x[1]), JSON.stringify(gr.filter(x => !x[1])));
-      R.check('[guard/worker-git] git -C · --git-dir · stash · config: 쓰기(checkout · commit · reset · stash · config 설정 · 밖으로 archive · apply · push)는 막는다', gw.every(x => x[1]), JSON.stringify(gw.filter(x => !x[1])));
-      // Monitor 도구(open 에서 허용) — 권한의 git deny 가 붙지 않으므로 guard 가 git 을 읽기만 통과시킨다
-      const mon = { pass: ['until grep -q "exit=" out.log; do sleep 2; done', 'git status --short'].map(c => !decAt(c, 'Monitor')),
-        block: ['git commit -am x', 'git add -A', 'git push', `rm -rf "${U}"`, 'git checkout main'].map(c => !!decAt(c, 'Monitor')) };
-      R.check('[guard/worker-monitor] Monitor: 기다리기 · git 읽기는 통과, git 쓰기 · worktree 밖 삭제는 막는다', mon.pass.every(Boolean) && mon.block.every(Boolean), JSON.stringify(mon));
-      // [PRD R3] 쓰기 소유권 — HARNESS_OWNS 가 있으면 worktree 안이라도 그 밖은 쓰기 · 삭제 · 이동을 막는다(셸 · Edit/Write 도구 모두)
-      const keepOwns = process.env.HARNESS_OWNS;
-      process.env.HARNESS_OWNS = JSON.stringify(['src/billing/**', 'tests/billing/test_x.py', 'docs']);
-      const W3 = wtA.replace(/\\/g, '/');
-      const tool = (name, file) => { const keep = ['TEMP', 'TMP', 'TMPDIR'].map(k => [k, process.env[k]]); for (const [k] of keep) process.env[k] = advTmp; try { return G.decide({ tool_name: name, tool_input: { file_path: file }, cwd: wtA }, 'claude', { worker: true }); } finally { for (const [k, v] of keep) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } } };
-      const ownPass = [decAt('echo x > src/billing/a.py', 'Bash'), decAt('rm -f src/billing/old.py', 'Bash'), decAt('mv src/billing/a.py src/billing/b.py', 'Bash'),
-        decAt(`echo x > "${advTmp.replace(/\\/g, '/')}/run.log"`, 'Bash'), tool('Edit', `${W3}/src/billing/new.py`), tool('Write', `${W3}/docs/guide/readme.md`),
-        tool('Write', `${W3}/.harness/t-20261020-000000-aaaa/PLAN.md`), tool('Write', `${W3}/tests/billing/test_x.py`), decAt('Set-Content -Path .\\src\\billing\\c.py -Value x', 'PowerShell')];
-      const ownBlock = [decAt('echo x > src/other/a.py', 'Bash'), decAt('rm -rf src', 'Bash'), decAt('mv src/billing/a.py src/shared/a.py', 'Bash'), decAt('rm -rf .', 'Bash'),
-        tool('Edit', `${W3}/src/shared/util.py`), tool('Write', `${W3}/tests/billing/test_y.py`), tool('MultiEdit', `${W3}/docsx/a.md`), decAt('Set-Content -Path .\\src\\shared\\c.py -Value x', 'PowerShell')];
-      // [2026-10-25 사용 분석] git 이 무시하는 산출물(build/)은 소유 경로 밖이어도 지우고 만든다 · 추적되는 소스는 그대로 막는다
-      const exclude = path.join(require('node:child_process').spawnSync('git', ['rev-parse', '--git-common-dir'], { cwd: wtA, encoding: 'utf8' }).stdout.trim().replace(/^(?![A-Za-z]:|\/)/, `${wtA}/`), 'info', 'exclude');
-      const exclude0 = fs.existsSync(exclude) ? fs.readFileSync(exclude, 'utf8') : null;
-      fs.mkdirSync(path.dirname(exclude), { recursive: true }); fs.writeFileSync(exclude, `${exclude0 || ''}\nbuild/\n`);
-      const ignPass = [decAt('Remove-Item -Recurse -Force build/check', 'PowerShell'), decAt('rm -rf build/sc && mkdir -p build/sc', 'Bash'), tool('Write', `${W3}/build/e2e/run.ps1`)];
-      const ignBlock = [decAt('rm -rf src/shared', 'Bash'), decAt('Remove-Item -Recurse -Force src', 'PowerShell')];
-      if (exclude0 === null) fs.rmSync(exclude, { force: true }); else fs.writeFileSync(exclude, exclude0);
-      if (keepOwns === undefined) delete process.env.HARNESS_OWNS; else process.env.HARNESS_OWNS = keepOwns;
-      R.check('[guard/worker-owns] git 이 무시하는 산출물(build/)은 소유 경로 밖이어도 지우고 만든다 · 추적 소스(src)는 막는다', ignPass.every(x => !x) && ignBlock.every(x => x && /소유/.test(x)), JSON.stringify({ p: ignPass.map(x => x && String(x).slice(-70)), b: ignBlock.map(x => !!x) }));
-      R.check('[guard/worker-owns] 소유 경로 안 · 하네스 기록 · 임시 폴더는 쓴다(셸 · Edit/Write · PowerShell · 폴더 접두 · 정확한 파일)', ownPass.every(x => !x), JSON.stringify(ownPass.map(x => x && String(x).slice(-80))));
-      R.check('[guard/worker-owns] 소유 경로 밖(다른 폴더 · 상위 폴더 삭제 · 밖으로 이동 · worktree 전체 · 이름만 비슷한 폴더)은 막고 이유에 소유 경로를 적는다', ownBlock.every(x => x && /소유/.test(x)), JSON.stringify(ownBlock.map(x => x && String(x).slice(-60))));
-      const noOwns = [tool('Edit', `${W3}/src/anything.py`), tool('Write', `${U}/k.txt`)];
-      R.check('[guard/worker-owns] 소유 경로가 없으면 worktree 안은 그대로 쓰고 · Edit/Write 도 worktree 밖은 막는다 · 대화형(작업자 아님)은 Edit 를 보지 않는다',
-        !noOwns[0] && !!noOwns[1] && !G.decide({ tool_name: 'Write', tool_input: { file_path: `${U}/k.txt` }, cwd: wtA }, 'claude', {}), JSON.stringify(noOwns));
-      const gm = (g, p) => G.globRe(g).test(p);
-      R.check('[guard/worker-owns] glob: ** 는 아무 깊이(0 포함) · * 는 한 단계 · 글자만이면 그 파일이나 폴더 아래', gm('src/**', 'src/a/b.py') && gm('src/**/x.py', 'src/x.py') && gm('src/**/x.py', 'src/a/b/x.py') && gm('src/*.py', 'src/a.py') && !gm('src/*.py', 'src/a/b.py') && gm('docs', 'docs/a/b.md') && !gm('docs', 'docsx/a.md') && !gm('tests/billing/test_x.py', 'tests/billing/test_y.py'));
-      R.check('[guard/worker-fp] 변수를 풀어도 worktree 밖이면 막는다 · docker 의 rm/prune 은 막는다', stillBlock.every(([c, t]) => !!decAt(c, t)), JSON.stringify(stillBlock.map(([c, t]) => [c.slice(0, 50), !!decAt(c, t)])));
-    }
 
     R.check('[격리] 가짜 HOME 에 .claude · .codex 가 생기지 않았다', !fs.existsSync(path.join(home, '.claude')) && !fs.existsSync(path.join(home, '.codex')));
   } catch (e) { R.check('예외 없이 끝난다', false, String(e && e.stack || e).slice(0, 800)); }

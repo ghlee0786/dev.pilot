@@ -1,7 +1,7 @@
 {
   "name": "dev.pilot",
   "version": "0.0.0-dev",
-  "description": "Pilot — Claude Code · Codex development harness: the model flies, the harness keeps the instruments and the guard rails",
+  "description": "Pilot — light harness for Claude Code · Codex: lanes (isolated worktrees), one-check merges, session coordination and guard rails; the model does the work",
   "license": "MIT",
   "repository": "github:ghlee0786/dev.pilot",
   "bin": {

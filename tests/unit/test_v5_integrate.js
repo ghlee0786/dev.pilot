@@ -1,11 +1,12 @@
 'use strict';
-// v5 통합 — accept(보관 · --no-ff 2부모 · 태그 · 미커밋 충돌 거부 · 대상이 앞서 가 충돌 → 같은 세션이 풂) · cancel(병합 전 · 병합 후 revert) · restore.
-//   모델은 부르지 않는다: 가짜 러너가 worktree 에 파일을 쓴다. 모든 저장소는 임시 디렉터리에 있다.
+// v5 통합 — accept(보관 · --no-ff 2부모 · 태그 · 미커밋 충돌 거부 · 대상이 앞서 가 충돌 → 작업 폴더에 병합을 남기고 거부 → 풀면 받아들임) · cancel(병합 전 · 병합 후 revert) · restore.
+//   모델은 부르지 않는다: light 칸(lane.start)을 열고 그 worktree 에서 직접 커밋한다. 예전 go 작업(mode thin/full · status done 등)은
+//   칸을 연 뒤 task.json 을 예전 모양으로 고쳐 만든다(받아들이기 하위 호환). 모든 저장소는 임시 디렉터리에 있다.
 const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
 const { spawn, spawnSync } = require('node:child_process');
 const { makeReporter } = require('../run.js');
 const S = require('../../harness/lib/state');
-const L = require('../../harness/lib/loop');
+const Ln = require('../../harness/lib/lane');
 const I = require('../../harness/lib/integrate');
 const R = makeReporter('v5 통합 — accept · cancel · restore');
 
@@ -46,34 +47,46 @@ function cliAsync(args, env) {
     c.on('close', code => res({ code, out, err }));
   });
 }
-function fake(steps) {
-  const calls = [];
-  const run = async o => {
-    const n = calls.length; calls.push({ ...o, signal: undefined });
-    const extra = (await steps[Math.min(n, steps.length - 1)](o, n)) || {};
-    return { ok: true, session_id: o.sessionId || o.newSessionId || 'thread', final_text: 'ok', cost_usd: 0.1, is_error: false, error_kind: null, permission_denials: [], ...extra };
-  };
-  run.calls = calls;
-  return run;
-}
 const quiet = { log: () => {} };
-// 작업: feature.txt 를 만들고 a.txt 첫 줄을 바꾸고 PLAN.md 를 쓴다 → 검사 통과 → done.
-const work = (line1) => fake([o => {
-  const id = path.basename(o.cwd);
-  write(path.join(o.cwd, 'feature.txt'), 'feature\n');
-  if (line1) write(path.join(o.cwd, 'a.txt'), `${line1}\ntwo\nthree\n`);
-  write(path.join(o.cwd, '.harness', id, 'PLAN.md'), '# plan\n- [x] feature\n');
-}]);
-const goDone = async (root, run) => L.go({ ...quiet, root, goal: 'add the feature\nwith details', checks: ['node check.js'], run });
+const commitIn = (wt, msg) => { git(wt, ['add', '-A']); git(wt, ['commit', '-qm', msg]); };
+// 기본 작업: feature.txt 를 만들고 a.txt 첫 줄을 바꾸고 PLAN.md 를 쓴다(이 칸의 worktree 에서 커밋).
+const work = (line1) => (wt, id) => {
+  write(path.join(wt, 'feature.txt'), 'feature\n');
+  if (line1) write(path.join(wt, 'a.txt'), `${line1}\ntwo\nthree\n`);
+  write(path.join(wt, '.harness', id, 'PLAN.md'), '# plan\n- [x] feature\n');
+};
+// light 칸을 열고(lane.start) edit 으로 그 worktree 를 고쳐 커밋한다 → start 의 결과(status 'open')
+function laneDone(root, edit, o) {
+  const opt = o || {};
+  const t = Ln.start({ ...quiet, root, goal: opt.goal || 'add the feature\nwith details', checks: opt.checks || ['node check.js'], base: opt.base, checkTimeoutMs: opt.checkTimeoutMs });
+  edit(t.worktree, t.id);
+  commitIn(t.worktree, 'work');
+  return t;
+}
+const dropWt = (root, t) => git(root, ['worktree', 'remove', '--force', S.taskPaths(root, t.id).wt]);
+// 예전 go 작업처럼 보이게: 끝난 go 는 worktree 를 지웠고 head 를 적었다. thin 은 검사를 미뤘고(deferred · last 없음), full 은 루프에서 잰 결과(last)가 있다.
+const PASS_BRIEF = { ok: true, pass: 1, fail: 0, failed_tests: [], indeterminate: false, results: [{ command: 'node check.js', ok: true, pass: 1, fail: 0, exit_code: 0, timed_out: false, found: true }] };
+function asOld(root, t, f) {
+  dropWt(root, t);
+  const task = S.readTask(root, t.id);
+  Object.assign(task, { mode: f.mode, status: f.status, reason: f.reason || 'the work is done', session_id: 'S-old', head: git(root, ['rev-parse', t.branch]), runtime: 'claude', model: 'opus' });
+  delete task.checks.baseline_mode;
+  if (f.mode === 'full') { delete task.checks.deferred; task.checks.last = f.last || PASS_BRIEF; task.checks.verdict = task.checks.last.ok ? 'pass' : 'fail'; }
+  else { task.checks.deferred = true; task.checks.last = null; }
+  if (f.lint && task.checks.lint) Object.assign(task.checks.lint, f.lint);
+  S.writeTask(root, task);
+  return { ...t, status: task.status, reason: task.reason };
+}
 const parents = (cwd, ref) => git(cwd, ['rev-list', '--parents', '-n', '1', ref]).split(/\s+/).length - 1;
+const hasMergeHead = cwd => spawnSync('git', ['rev-parse', '-q', '--verify', 'MERGE_HEAD'], { cwd }).status === 0;
 
 (async () => {
   try {
-    // ── accept: 기본 ────────────────────────────────────────────────
+    // ── accept: 기본(light 칸) ───────────────────────────────────────
     const r1 = mkRepo();
-    const t1 = await goDone(r1, work('ONE'));
+    const t1 = laneDone(r1, work('ONE'));
     const before = git(r1, ['rev-parse', 'main']);
-    R.check('[IN-00] 준비: 작업 done · main 은 그대로', t1.status === 'done' && git(r1, ['rev-parse', 'main']) === before, `${t1.status} ${t1.reason}`);
+    R.check('[IN-00] 준비: 칸 open · main 은 그대로', t1.status === 'open' && S.readTask(r1, t1.id).mode === 'light' && git(r1, ['rev-parse', 'main']) === before, `${t1.status} ${t1.reason}`);
     const acc = await I.accept({ ...quiet, root: r1, id: t1.id });
     const task1 = S.readTask(r1, t1.id);
     const head1 = git(r1, ['rev-parse', 'main']);
@@ -95,9 +108,9 @@ const parents = (cwd, ref) => git(cwd, ['rev-list', '--parents', '-n', '1', ref]
     const rs = await I.restore({ ...quiet, root: r1, id: t1.id });
     R.check('[IN-03] restore → revert 의 revert · 내용 복귀 · 상태 accepted', rs.status === 'restored' && S.readTask(r1, t1.id).status === 'accepted' && read(path.join(r1, 'feature.txt')) === 'feature\n' && read(path.join(r1, 'a.txt')).startsWith('ONE\n') && git(r1, ['rev-parse', 'main^']) === head1c && parents(r1, 'main') === 1, `${rs.status} ${rs.reason}`);
 
-    // ── accept 거부: 메인 체크아웃의 미커밋 변경이 작업이 건드린 파일과 겹침 ─
+    // ── accept 거부: 메인 체크아웃의 미커밋 변경이 작업이 건드린 파일과 겹침 — 예전 go 작업(thin · done · worktree 없음)으로 ─
     const r2 = mkRepo();
-    const t2 = await goDone(r2, work('TASK'));
+    const t2 = asOld(r2, laneDone(r2, work('TASK')), { mode: 'thin', status: 'done' });
     write(path.join(r2, 'a.txt'), 'my own edit\n');
     const mainBefore = git(r2, ['rev-parse', 'main']), branchBefore = git(r2, ['rev-parse', t2.branch]);
     const ref = await I.accept({ ...quiet, root: r2, id: t2.id });
@@ -107,39 +120,40 @@ const parents = (cwd, ref) => git(cwd, ['rev-list', '--parents', '-n', '1', ref]
     write(path.join(r2, 'a.txt'), 'one\ntwo\nthree\n');
     write(path.join(r2, 'b.txt'), 'my unrelated edit\n');
     const ok2 = await I.accept({ ...quiet, root: r2, id: t2.id });
-    R.check('[IN-04] 겹치지 않는 미커밋 변경(b.txt)은 막지 않고 그대로 남는다', ok2.status === 'accepted' && read(path.join(r2, 'b.txt')) === 'my unrelated edit\n' && git(r2, ['status', '--porcelain']) === 'M b.txt', `${ok2.status} ${ok2.reason} ${git(r2, ['status', '--porcelain'])}`);
+    R.check('[IN-04] 겹치지 않는 미커밋 변경(b.txt)은 막지 않고 그대로 남는다 · 예전 thin(done) 작업도 받아들인다', ok2.status === 'accepted' && read(path.join(r2, 'b.txt')) === 'my unrelated edit\n' && git(r2, ['status', '--porcelain']) === 'M b.txt'
+      && /^pilot \S+ — ACCEPTED$/m.test(ok2.report || '') && S.readLog(r2, t2.id).some(e => e.event === 'checks' && e.phase === 'accept' && e.verdict === 'pass'), `${ok2.status} ${ok2.reason} ${git(r2, ['status', '--porcelain'])}`);
     const other = mkRepo();
-    const t2b = await goDone(other, work(null));
+    const t2b = laneDone(other, work(null));
     git(other, ['checkout', '-q', '-b', 'elsewhere']);
     const notOn = await I.accept({ ...quiet, root: other, id: t2b.id });
     R.check('[IN-04] 대상 브랜치가 어디에도 체크아웃되어 있지 않으면 거부', notOn.refused === true && /not checked out/.test(notOn.reason), notOn.reason);
 
-    // ── accept: 대상이 앞서 가서 충돌 → 같은 세션이 풀고 → 병합 ─────────
+    // ── accept: 대상이 앞서 가서 충돌 → 작업 폴더에 병합을 남기고 거부 → 표식이 남으면 다시 거부 → 풀면 받아들임 ─────────
     const r3 = mkRepo();
-    const t3 = await goDone(r3, work('TASK'));
-    const sess3 = S.readTask(r3, t3.id).session_id;
+    const t3 = laneDone(r3, work('TASK'));
+    const br3 = git(r3, ['rev-parse', t3.branch]);
     write(path.join(r3, 'a.txt'), 'USER\ntwo\nthree\n');
     git(r3, ['commit', '-qam', 'user moved ahead']);
-    let sawMarkers = false;
-    const resolver = fake([o => { sawMarkers = /^<<<<<<< /m.test(read(path.join(o.cwd, 'a.txt'))); write(path.join(o.cwd, 'a.txt'), 'USER+TASK\ntwo\nthree\n'); }]);
-    const acc3 = await I.accept({ ...quiet, root: r3, id: t3.id, run: resolver });
-    R.check('[IN-05] 충돌 → 같은 세션에 "충돌을 풀어라" 1회 → 병합', acc3.status === 'accepted' && resolver.calls.length === 1 && resolver.calls[0].sessionId === sess3 && /conflicts/.test(resolver.calls[0].prompt) && resolver.calls[0].prompt.includes('- a.txt') && sawMarkers, `${acc3.status} ${acc3.reason}`);
-    R.check('[IN-05] 해결된 내용이 main 에 · 병합 커밋 부모 2 · 표식 없음', read(path.join(r3, 'a.txt')) === 'USER+TASK\ntwo\nthree\n' && parents(r3, 'main') === 2 && read(path.join(r3, 'feature.txt')) === 'feature\n');
-    const r3b = mkRepo();
-    const t3b = await goDone(r3b, work('TASK'));
-    write(path.join(r3b, 'a.txt'), 'USER\ntwo\nthree\n');
-    git(r3b, ['commit', '-qam', 'user moved ahead']);
-    const main3b = git(r3b, ['rev-parse', 'main']), br3b = git(r3b, ['rev-parse', t3b.branch]);
-    const lazy = fake([() => ({})]);
-    const acc3b = await I.accept({ ...quiet, root: r3b, id: t3b.id, run: lazy });
-    const wt3b = S.taskPaths(r3b, t3b.id).wt;
-    R.check('[IN-05] 2회 안에 못 풀면 거부 · 병합 중단(MERGE_HEAD 없음) · main 그대로', acc3b.refused === true && lazy.calls.length === 2 && /not resolved/.test(acc3b.reason) && git(r3b, ['rev-parse', 'main']) === main3b
-      && spawnSync('git', ['rev-parse', '-q', '--verify', 'MERGE_HEAD'], { cwd: wt3b }).status !== 0, `${acc3b.reason} calls=${lazy.calls.length}`);
-    R.check('[IN-05] 거부된 뒤 작업 브랜치에는 보관 커밋만 더해진다(작업 내용은 그대로)', git(r3b, ['rev-parse', `${t3b.branch}^`]) === br3b && git(r3b, ['show', `${t3b.branch}:a.txt`]).startsWith('TASK'));
+    const main3 = git(r3, ['rev-parse', 'main']);
+    const wt3 = S.taskPaths(r3, t3.id).wt;
+    const acc3 = await I.accept({ ...quiet, root: r3, id: t3.id });
+    R.check('[IN-05] 충돌 → 거부 · 이유에 대상 · 충돌 파일 · 남겨 둔 폴더 · main 그대로 · 상태 open', acc3.refused === true && /conflicts with main in a\.txt/.test(acc3.reason) && acc3.reason.includes(wt3) && /left in progress/.test(acc3.reason)
+      && git(r3, ['rev-parse', 'main']) === main3 && S.readTask(r3, t3.id).status === 'open', `${acc3.status} ${acc3.reason}`);
+    R.check('[IN-05] 병합은 칸의 worktree 에 진행 중으로 남는다(MERGE_HEAD · a.txt 에 충돌 표식) · 기록에 conflict_left', hasMergeHead(wt3) && /^<<<<<<< /m.test(read(path.join(wt3, 'a.txt')) || '')
+      && S.readLog(r3, t3.id).some(e => e.event === 'conflict_left' && e.target === 'main' && (e.files || []).includes('a.txt')), read(path.join(wt3, 'a.txt')));
+    R.check('[IN-05] 거부된 뒤 작업 브랜치에는 보관 커밋만 더해진다(작업 내용은 그대로)', git(r3, ['rev-parse', `${t3.branch}^`]) === br3 && git(r3, ['show', `${t3.branch}:a.txt`]).startsWith('TASK'));
+    const acc3b = await I.accept({ ...quiet, root: r3, id: t3.id });
+    R.check('[IN-05] 표식이 남은 채 다시 accept → 거부(표식이 남은 파일) · main 그대로 · 병합은 그대로 진행 중', acc3b.refused === true && /still has conflict markers in a\.txt/.test(acc3b.reason) && git(r3, ['rev-parse', 'main']) === main3 && hasMergeHead(wt3), `${acc3b.status} ${acc3b.reason}`);
+    write(path.join(wt3, 'a.txt'), 'USER+TASK\ntwo\nthree\n');   // 그 칸의 세션(또는 사람)이 표식을 푼다 — 커밋은 accept 가 한다
+    const acc3c = await I.accept({ ...quiet, root: r3, id: t3.id });
+    R.check('[IN-05] 표식을 풀고 accept → accepted · 해결된 내용이 main 에 · 병합 커밋 부모 2(첫 부모 = 사용자 커밋)', acc3c.status === 'accepted' && !acc3c.refused && read(path.join(r3, 'a.txt')) === 'USER+TASK\ntwo\nthree\n' && parents(r3, 'main') === 2
+      && git(r3, ['rev-parse', 'main^1']) === main3 && read(path.join(r3, 'feature.txt')) === 'feature\n', `${acc3c.status} ${acc3c.reason}`);
+    R.check('[IN-05] 해결 커밋은 대상과 작업을 모두 부모로 가진 병합(대상이 결과 브랜치의 조상) · 표식 없음', spawnSync('git', ['merge-base', '--is-ancestor', main3, t3.branch], { cwd: r3 }).status === 0
+      && !/^(<<<<<<<|>>>>>>>)/m.test(git(r3, ['show', 'main:a.txt'])) && !fs.existsSync(wt3), git(r3, ['log', '--oneline', '--graph', '-8', 'main']));
 
-    // ── cancel(병합 전): 미커밋분은 먼저 커밋 → 태그로 남기고 브랜치 · worktree 버림 → restore ─
+    // ── cancel(병합 전): 미커밋분은 먼저 커밋 → 태그로 남기고 브랜치 · worktree 버림 → restore — 예전 go 작업(interrupted)으로 ─
     const r4 = mkRepo();
-    const i4 = await L.go({ ...quiet, root: r4, goal: 'half', checks: ['node check.js'], quotaWait: false, run: fake([o => { write(path.join(o.cwd, 'half.txt'), 'h'); return { is_error: true, error_kind: 'quota', error_message: 'usage limit', session_id: 'S4' }; }]) });
+    const i4 = asOld(r4, laneDone(r4, wt => write(path.join(wt, 'half.txt'), 'h'), { goal: 'half' }), { mode: 'thin', status: 'interrupted', reason: 'usage limit — resume after the reset' });
     const P4 = S.taskPaths(r4, i4.id);
     git(r4, ['worktree', 'add', '-q', P4.wt, i4.branch]);
     write(path.join(P4.wt, 'uncommitted.txt'), 'not yet committed\n');
@@ -159,22 +173,21 @@ const parents = (cwd, ref) => git(cwd, ['rev-list', '--parents', '-n', '1', ref]
 
     // ── 취소된 작업의 accept 거부 · CLI ─────────────────────────────
     const r5 = mkRepo();
-    const t5 = await goDone(r5, work(null));
+    const t5 = laneDone(r5, work(null));
     const cliCancel = spawnSync(process.execPath, [CLI, 'cancel', t5.id, '--root', r5], { encoding: 'utf8', windowsHide: true, timeout: 30000 });
     R.check('[IN-07] CLI cancel: exit 0 · HARNESS_RESULT cancelled', cliCancel.status === 0 && /HARNESS_RESULT \{.*"status":"cancelled"/.test(cliCancel.stdout), `${cliCancel.status} ${cliCancel.stderr.slice(-300)}`);
     const cliAcc = spawnSync(process.execPath, [CLI, 'accept', t5.id, '--root', r5], { encoding: 'utf8', windowsHide: true, timeout: 30000 });
     R.check('[IN-07] CLI accept(취소된 작업): 거부 · exit 1 · refused', cliAcc.status === 1 && /"refused":true/.test(cliAcc.stdout) && /restore first/.test(cliAcc.stdout), `${cliAcc.status} ${cliAcc.stdout.slice(-300)}`);
 
     // ── [M1] 두 프로세스가 동시에 accept → 병합 커밋 하나 · 두 번째는 거부 ─────────
-    //   대상이 앞서 가 충돌 → 느린 가짜 러너(1.5초)가 푸는 동안 두 번째 프로세스는 이미 낡은 task(done)를 읽고 잠금을 기다린다.
-    const r6 = mkRepo();
-    const t6 = await goDone(r6, work('TASK'));
-    write(path.join(r6, 'a.txt'), 'USER\ntwo\nthree\n');
+    //   대상이 앞서 가(충돌 없음) 결과 브랜치로 들인 뒤 느린 검사(1.5초)가 도는 동안 두 번째 프로세스는 낡은 task(open)를 읽고 잠금을 기다린다.
+    const SLOW_CHECK_JS = `{const t=Date.now();while(Date.now()-t<1500){}}\n${CHECK_JS}`;
+    const r6 = mkRepo({ check: SLOW_CHECK_JS });
+    const t6 = laneDone(r6, work('TASK'));
+    write(path.join(r6, 'b.txt'), 'USER\n');
     git(r6, ['commit', '-qam', 'user moved ahead']);
     const main6 = git(r6, ['rev-parse', 'main']);
-    const slowMod = path.join(base, 'slow-resolver.js');
-    write(slowMod, `const fs=require('fs'),p=require('path');exports.run=async o=>{await new Promise(r=>setTimeout(r,1500));fs.writeFileSync(p.join(o.cwd,'a.txt'),'USER+TASK\\ntwo\\nthree\\n');return{ok:true,session_id:o.sessionId||o.newSessionId,final_text:'ok',cost_usd:0.1,is_error:false,error_kind:null,permission_denials:[]};};`);
-    const both = await Promise.all([0, 1].map(() => cliAsync(['accept', t6.id, '--root', r6], { HARNESS_RUNNER_MODULE: slowMod })));
+    const both = await Promise.all([0, 1].map(() => cliAsync(['accept', t6.id, '--root', r6])));
     const task6 = S.readTask(r6, t6.id);
     // main 의 첫 부모 사슬 위 병합 커밋 = accept 가 main 에 만든 병합(결과 브랜치 안의 "bring main up to date" 병합은 제외).
     const merges6 = git(r6, ['rev-list', '--merges', '--first-parent', `${main6}..main`]).split(/\r?\n/).filter(Boolean);
@@ -187,17 +200,17 @@ const parents = (cwd, ref) => git(cwd, ['rev-list', '--parents', '-n', '1', ref]
 
     // ── [M1] 병합이 커밋을 만들지 않으면(이미 들어 있음) 사용자 커밋을 merge_commit 으로 기록하지 않는다 ─
     const r7 = mkRepo();
-    const t7 = await L.go({ ...quiet, root: r7, goal: 'plain feature', checks: ['node check.js'], run: fake([o => { write(path.join(o.cwd, 'feature.txt'), 'feature\n'); }]) });
+    const t7 = laneDone(r7, wt => write(path.join(wt, 'feature.txt'), 'feature\n'), { goal: 'plain feature' });
     git(r7, ['merge', '--ff-only', '-q', t7.branch]);
     const head7 = git(r7, ['rev-parse', 'main']);
     const a7 = await I.accept({ ...quiet, root: r7, id: t7.id });
     const task7 = S.readTask(r7, t7.id);
-    R.check('[IN-09][M1] "Already up to date" 병합은 거부 · merge_commit 미기록 · 태그 없음 · main 그대로', t7.status === 'done' && a7.refused === true && /no merge commit|already contains/.test(a7.reason) && !task7.merge_commit && task7.status === 'done'
+    R.check('[IN-09][M1] "Already up to date" 병합은 거부 · merge_commit 미기록 · 태그 없음 · main 그대로', t7.status === 'open' && a7.refused === true && /no merge commit|already contains/.test(a7.reason) && !task7.merge_commit && task7.status === 'open'
       && git(r7, ['rev-parse', 'main']) === head7 && git(r7, ['tag', '--list', 'harness/*']) === '', `${t7.status} ${a7.status} ${a7.reason} mc=${task7.merge_commit}`);
 
     // ── [M2] 태그 생성이 실패해도 병합은 기록된다 ───────────────────────────
     const r8 = mkRepo();
-    const t8 = await goDone(r8, work(null));
+    const t8 = laneDone(r8, work(null));
     git(r8, ['tag', 'harness/merged', 'HEAD']);   // refs/tags/harness/merged 가 있으면 refs/tags/harness/merged/<id> 를 만들 수 없다
     let a8; try { a8 = await I.accept({ ...quiet, root: r8, id: t8.id }); } catch (e) { a8 = { threw: e.message }; }
     const task8 = S.readTask(r8, t8.id);
@@ -206,9 +219,11 @@ const parents = (cwd, ref) => git(cwd, ['rev-list', '--parents', '-n', '1', ref]
     const c8 = await I.cancel({ ...quiet, root: r8, id: t8.id });
     R.check('[IN-10][M2] 기록된 병합은 cancel 로 되돌릴 수 있다', c8.status === 'cancelled' && !c8.refused && read(path.join(r8, 'feature.txt')) === null, `${c8.status} ${c8.reason}`);
 
-    // ── [M3] done 이 아닌 작업은 --force 없이 accept 거부 ─────────────────
+    // ── [M3] done 이 아닌 작업은 --force 없이 accept 거부 — 예전 go 작업(full · stalled)으로 ─────────────────
     const r9 = mkRepo();
-    const t9 = await L.go({ ...quiet, mode: 'full', root: r9, goal: 'never works', checks: ['node check.js'], run: fake([o => { write(path.join(o.cwd, 'half.txt'), 'x\n'); }]) });
+    const FAIL_BRIEF = { ok: false, pass: 0, fail: 1, failed_tests: [], indeterminate: false, results: [{ command: 'node check.js', ok: false, pass: 0, fail: 1, exit_code: 1, timed_out: false, found: true }] };
+    const t9 = asOld(r9, laneDone(r9, wt => write(path.join(wt, 'half.txt'), 'x\n'), { goal: 'never works' }),
+      { mode: 'full', status: 'stalled', reason: 'the same check failure twice in a row: AssertionError: feature.txt missing or conflicted', last: FAIL_BRIEF });
     const main9 = git(r9, ['rev-parse', 'main']);
     const a9 = await I.accept({ ...quiet, root: r9, id: t9.id });
     R.check('[IN-11][M3] stalled 작업: 거부 · 이유가 상태와 실패 이유로 시작 · --force 안내 · main 그대로', t9.status === 'stalled' && a9.refused === true && a9.reason.startsWith(`task status is stalled (${t9.reason.slice(0, 20)}`) && /--force/.test(a9.reason) && git(r9, ['rev-parse', 'main']) === main9,
@@ -216,28 +231,13 @@ const parents = (cwd, ref) => git(cwd, ['rev-list', '--parents', '-n', '1', ref]
     const a9f = await I.accept({ ...quiet, root: r9, id: t9.id, force: true });
     R.check('[IN-11][M3] --force 면 병합 · 보고 첫 줄이 실패 이유를 앞세운다', a9f.status === 'accepted' && parents(r9, 'main') === 2 && /^pilot \S+ — ACCEPTED \(forced\) — the task was stalled: /.test(a9f.report), (a9f.report || a9f.reason).split('\n')[0]);
 
-    // ── [M13] 남은 예산이 없으면 충돌 해결을 시도하지 않고 거부 ────────────────
-    const r13 = mkRepo();
-    const t13 = await L.go({ ...quiet, root: r13, goal: 'budgeted', checks: ['node check.js'], budgetUsd: 0.1, run: work('TASK') });
-    write(path.join(r13, 'a.txt'), 'USER\ntwo\nthree\n');
-    git(r13, ['commit', '-qam', 'user moved ahead']);
-    const main13 = git(r13, ['rev-parse', 'main']);
-    const noBudget = fake([o => { write(path.join(o.cwd, 'a.txt'), 'USER+TASK\ntwo\nthree\n'); }]);
-    const a13 = await I.accept({ ...quiet, root: r13, id: t13.id, run: noBudget });
-    const wt13 = S.taskPaths(r13, t13.id).wt;
-    R.check('[IN-12][M13] 예산 소진 → 러너 호출 0 · 거부(budget) · 병합 중단 · main 그대로', t13.status === 'done' && a13.refused === true && noBudget.calls.length === 0 && /budget/.test(a13.reason) && /--budget-usd/.test(a13.reason)
-      && git(r13, ['rev-parse', 'main']) === main13 && spawnSync('git', ['rev-parse', '-q', '--verify', 'MERGE_HEAD'], { cwd: wt13 }).status !== 0, `${t13.status} calls=${noBudget.calls.length} ${a13.reason}`);
-    const withBudget = fake([o => { write(path.join(o.cwd, 'a.txt'), 'USER+TASK\ntwo\nthree\n'); }]);
-    const a13b = await I.accept({ ...quiet, root: r13, id: t13.id, run: withBudget, budgetUsd: 1 });
-    R.check('[IN-12][M13] --budget-usd 로 예산을 주면 그 한도 안에서 푼다', a13b.status === 'accepted' && withBudget.calls.length === 1 && withBudget.calls[0].budgetUsd > 0 && withBudget.calls[0].budgetUsd <= 1, `${a13b.status} ${a13b.reason} ${withBudget.calls.map(c => c.budgetUsd)}`);
-
     // ── [M4] accept 는 git 밖(무시된) 산출물이 있는 worktree 를 지우지 않는다 ─
     const r10 = mkRepo({ files: ENV_FILES, untracked: { '.env': 'TOKEN=1\n' } });
-    const t10 = await goDone(r10, work(null));
+    const t10 = laneDone(r10, work(null));
     const a10 = await I.accept({ ...quiet, root: r10, id: t10.id });
     R.check('[IN-13][M4] .worktreeinclude 복사분(.env)만 있으면 accept 뒤 worktree 는 지워진다', a10.status === 'accepted' && !fs.existsSync(S.taskPaths(r10, t10.id).wt) && !S.readTask(r10, t10.id).worktree_kept, `${a10.status} ${a10.reason} kept=${S.readTask(r10, t10.id).worktree_kept}`);
     const r11 = mkRepo({ files: ENV_FILES, untracked: { '.env': 'TOKEN=1\n' } });
-    const t11 = await goDone(r11, work(null));
+    const t11 = laneDone(r11, work(null));
     const P11 = S.taskPaths(r11, t11.id);
     if (!fs.existsSync(P11.wt)) git(r11, ['worktree', 'add', '-q', P11.wt, t11.branch]);
     write(path.join(P11.wt, 'out.log'), 'build output the user wants\n');
@@ -248,9 +248,10 @@ const parents = (cwd, ref) => git(cwd, ['rev-list', '--parents', '-n', '1', ref]
 
     // ── [M7] cancel/restore 의 임시 worktree 에도 .worktreeinclude 복사 · --skip-checks ─
     const r12 = mkRepo({ check: CHECK_ENV_JS, files: ENV_FILES, untracked: { '.env': 'TOKEN=1\n' } });
-    const t12 = await goDone(r12, work(null));
+    const t12 = laneDone(r12, work(null));
     const a12 = await I.accept({ ...quiet, root: r12, id: t12.id });
-    R.check('[IN-14] 준비: 의존성(.env) 검사 저장소에서 done → accepted', t12.status === 'done' && a12.status === 'accepted' && [null, undefined].includes(S.readTask(r12, t12.id).checks.baseline) || S.readTask(r12, t12.id).checks.baseline.fail === 1, `${t12.status} ${t12.reason} ${a12.reason}`);
+    const bl12 = S.readTask(r12, t12.id).checks.baseline;
+    R.check('[IN-14] 준비: 의존성(.env) 검사 저장소에서 칸(open) → accepted', t12.status === 'open' && a12.status === 'accepted' && ([null, undefined].includes(bl12) || bl12.fail === 1), `${t12.status} ${t12.reason} ${a12.reason}`);
     const c12 = await I.cancel({ ...quiet, root: r12, id: t12.id });
     R.check('[IN-14][M7] 병합 후 cancel: 임시 revert worktree 에 .env 가 복사되어 검사가 환경 탓으로 빨개지지 않는다', c12.status === 'cancelled' && !c12.refused && read(path.join(r12, 'feature.txt')) === null, `${c12.status} ${c12.reason}`);
     const rs12 = await I.restore({ ...quiet, root: r12, id: t12.id });
@@ -284,7 +285,8 @@ const parents = (cwd, ref) => git(cwd, ['rev-list', '--parents', '-n', '1', ref]
     //   재현: 작업을 멈춘 뒤 cancel → 등록은 지워지고 빈 폴더만 남음 → 다시 cancel 하면 그 폴더에서 git 이 메인 저장소를 보고
     //   사용자 브랜치의 남의 미커밋 변경을 하네스 이름으로 커밋할 수 있었다.
     const r16 = mkRepo();
-    const t16 = await goDone(r16, work());
+    const t16 = laneDone(r16, work());
+    dropWt(r16, t16);
     const P16 = S.taskPaths(r16, t16.id);
     const main16 = git(r16, ['rev-parse', 'HEAD']);
     // 상태를 "주인이 죽은 실행 중" 으로 되돌리고, 등록 없는 빈 폴더를 남기고, 메인 체크아웃에 남의 미커밋 변경을 둔다.
@@ -298,7 +300,8 @@ const parents = (cwd, ref) => git(cwd, ['rev-list', '--parents', '-n', '1', ref]
     R.check('[IN-16] 빈 폴더를 치우고 cancelled 로 닫는다(작업물은 태그에)', c16.status === 'cancelled' && !fs.existsSync(P16.wt) && git(r16, ['tag', '-l', `harness/cancelled/${t16.id}`]) === `harness/cancelled/${t16.id}`, JSON.stringify({ status: c16.status, reason: c16.reason, wt: fs.existsSync(P16.wt) }));
     // 비어 있지 않은 남은 폴더(등록 없음) — 사용자 브랜치에 커밋하지 않는다. 남은 파일은 지우지 않고 작업 기록에 보관한 뒤 치우고 닫는다(자동 이슈 #11).
     const r17 = mkRepo();
-    const t17 = await goDone(r17, work());
+    const t17 = laneDone(r17, work());
+    dropWt(r17, t17);
     const P17 = S.taskPaths(r17, t17.id), main17 = git(r17, ['rev-parse', 'HEAD']);
     write(path.join(P17.wt, 'stray.txt'), 'left behind\n');
     write(path.join(r17, 'b.txt'), 'dirty elsewhere\n');
@@ -315,45 +318,44 @@ const parents = (cwd, ref) => git(cwd, ['rev-list', '--parents', '-n', '1', ref]
     //   [적대 2026-10-02] accept · cancel 은 o.checkTimeoutMs 만 봐서 작업의 상한(예: 20분 저장소)을 버리고 기본 15분으로 돌았다.
     const SLOW_JS = `if(require('fs').existsSync('slow.flag')){const t=Date.now();while(Date.now()-t<4000){}}\n${CHECK_JS}`;
     const r19 = mkRepo({ check: SLOW_JS });
-    const t19 = await L.go({ ...quiet, root: r19, goal: 'add the feature', checks: ['node check.js'], run: work(), checkTimeoutMs: 1500 });
+    const t19 = laneDone(r19, work(), { goal: 'add the feature', checkTimeoutMs: 1500 });
     write(path.join(r19, 'slow.flag'), 'x\n'); git(r19, ['add', 'slow.flag']); git(r19, ['commit', '-qm', 'main moves on']);
     const a19 = await I.accept({ ...quiet, root: r19, id: t19.id });
-    R.check('[IN-19] accept 의 검사는 작업의 검사 상한(1.5초)을 쓴다 — 4초 걸리는 검사는 시간 초과로 거절',
-      t19.status === 'done' && a19.refused && /checks fail after bringing main/.test(a19.reason), `${t19.status} · ${a19.status} · ${a19.reason}`);
+    //   [Light 1단계] 시간 초과뿐인 실패는 "나빠짐" 이 아니라 판정 불가로 거절한다(예전 단언: /checks fail after bringing main/)
+    R.check('[IN-19] accept 의 검사는 작업의 검사 상한(1.5초)을 쓴다 — 4초 걸리는 검사는 시간 초과로 거절(판정 불가 · 다시 하거나 --force)',
+      t19.status === 'open' && S.readTask(r19, t19.id).checks.timeout_ms === 1500 && a19.refused && /checks undetermined on harness\/\S+ — every failing check timed out/.test(a19.reason) && /--force/.test(a19.reason) && !/worse than before/.test(a19.reason.replace('not "worse than before"', '')), `${t19.status} · ${a19.status} · ${a19.reason}`);
     // [2026-10-20 실측 · 작업 수치에서 발견] 거절 뒤 다시 accept 하면 이미 대상 브랜치를 들인 상태라 검사를 건너뛰어 실패 0 → 133 인 채로 병합됐다
     const main19 = git(r19, ['rev-parse', 'main']);
     const a19b = await I.accept({ ...quiet, root: r19, id: t19.id });
     R.check('[IN-19b] 검사 실패로 거절된 작업을 다시 accept 해도 검사를 다시 돌려 거절한다 — main 은 그대로',
-      a19b.refused === true && /checks fail/.test(a19b.reason) && git(r19, ['rev-parse', 'main']) === main19, `${a19b.status} · ${a19b.refused} · ${a19b.reason}`);
+      a19b.refused === true && /checks undetermined/.test(a19b.reason) && git(r19, ['rev-parse', 'main']) === main19, `${a19b.status} · ${a19b.refused} · ${a19b.reason}`);
 
-    // ── accept 도 린트를 다시 본다 — 대상 브랜치를 들인 뒤 린트가 깨지면 병합하지 않는다 ──
+    // ── accept 도 린트를 다시 본다 — 작업 뒤 결과 브랜치에 린트 위반이 들어오면 병합하지 않는다 ──
     const LINT = "const fs=require('fs');const bad=process.argv.slice(2).filter(f=>fs.existsSync(f)&&/TODO-SLOP/.test(fs.readFileSync(f,'utf8')));if(bad.length){console.log(bad.join(',')+': slop');process.exit(1)}";
     const r20 = mkRepo({ files: { 'lint.js': LINT, 'AGENTS.md': '```yaml\nlint_command: "node lint.js {files}"\n```\n' } });
-    const t20 = await L.go({ ...quiet, root: r20, goal: 'add the feature', checks: ['node check.js'], run: work() });
-    // 작업 뒤 사람이 결과 브랜치에 린트 위반을 넣었다(작업자가 아닌 경로)
-    git(r20, ['worktree', 'add', '-q', path.join(base, 'w20'), t20.branch]);
-    write(path.join(base, 'w20', 'feature.txt'), 'feature TODO-SLOP\n'); git(path.join(base, 'w20'), ['commit', '-qam', 'slop']);
-    git(r20, ['worktree', 'remove', path.join(base, 'w20')]);
+    const t20 = laneDone(r20, work(), { goal: 'add the feature' });
+    // 작업 뒤 결과 브랜치에 린트 위반이 커밋됐다
+    write(path.join(t20.worktree, 'feature.txt'), 'feature TODO-SLOP\n'); commitIn(t20.worktree, 'slop');
     const a20 = await I.accept({ ...quiet, root: r20, id: t20.id });
-    R.check('[IN-20] accept: 린트가 실패하면 병합하지 않는다(main 그대로)', t20.status === 'done' && a20.refused && /lint/.test(a20.reason) && git(r20, ['log', '-1', '--format=%s', 'main']) === 'init', `${a20.status} ${a20.reason}`);
+    R.check('[IN-20] accept: 린트가 실패하면 병합하지 않는다(main 그대로)', t20.status === 'open' && a20.refused && /lint/.test(a20.reason) && git(r20, ['log', '-1', '--format=%s', 'main']) === 'init', `${a20.status} ${a20.reason}`);
 
     // ── 한국어 작업의 accept · cancel 보고는 한국어 ──
     const r21 = mkRepo();
-    const t21 = await L.go({ ...quiet, root: r21, goal: '기능을 추가해 줘', checks: ['node check.js'], run: work() });
+    const t21 = laneDone(r21, work(), { goal: '기능을 추가해 줘' });
     const a21 = await I.accept({ ...quiet, root: r21, id: t21.id });
     const c21 = await I.cancel({ ...quiet, root: r21, id: t21.id });
     R.check('[IN-21] 한국어 작업: accept · cancel 보고가 한국어(명령 · 해시는 원문)', /받아들임/.test(a21.report) && /되돌리기: node harness\/cli\.js cancel/.test(a21.report) && /취소/.test(c21.report) && !/^(merged|reverted|undo)/m.test(a21.report + '\n' + c21.report), `${a21.report}\n--\n${c21.report}`);
 
-    // ── [2026-10-14 자동 이슈 #1 · #2] resume 직후 accept — Windows 에서 worktree 삭제가 끝나지 않았다(등록은 남고 .git 파일은 지워졌고
+    // ── [2026-10-14 자동 이슈 #1 · #2] Windows 에서 worktree 삭제가 끝나지 않았다(등록은 남고 .git 파일은 지워졌고
     //    파일 수천 개가 아직 지워지는 중). accept 가 NOT_WORKTREE_ROOT 예외로 죽었다(1분 뒤 다시 하면 성공). ──
     const halfRemoved = (r, t) => {
       const P = S.taskPaths(r, t.id);
-      git(r, ['worktree', 'add', '-q', P.wt, t.branch]);
+      if (!fs.existsSync(P.wt)) git(r, ['worktree', 'add', '-q', P.wt, t.branch]);
       fs.rmSync(path.join(P.wt, '.git'), { force: true });   // 등록은 남고 .git 파일만 먼저 사라진 상태
       return P;
     };
     const r22 = mkRepo();
-    const t22 = await goDone(r22, work());
+    const t22 = laneDone(r22, work());
     const P22 = halfRemoved(r22, t22);
     // 남은 파일은 1초 뒤 사라진다(다른 프로세스가 핸들을 놓는 것을 흉내)
     spawn(process.execPath, ['-e', `setTimeout(()=>require('fs').rmSync(${JSON.stringify(P22.wt)},{recursive:true,force:true}),1000)`], { stdio: 'ignore', windowsHide: true });
@@ -362,7 +364,7 @@ const parents = (cwd, ref) => git(cwd, ['rev-list', '--parents', '-n', '1', ref]
     // [2026-10-15 자동 이슈 #11] 남은 폴더가 사라지지 않으면 사람이 지워야 했다 — 브랜치와 같은 파일은 지우고, 다른 파일은 작업 기록 폴더에 보관한 뒤 진행한다.
     const leftoverOf = (r, id) => { const d = S.taskPaths(r, id).dir; return (fs.readdirSync(d).find(n => n.startsWith('leftover-')) || null) && path.join(d, fs.readdirSync(d).find(n => n.startsWith('leftover-'))); };
     const r23 = mkRepo();
-    const t23 = await goDone(r23, work());
+    const t23 = laneDone(r23, work());
     const P23 = halfRemoved(r23, t23);
     write(path.join(P23.wt, 'feature.txt'), 'changed after the task\n');   // 브랜치와 다른 파일
     write(path.join(P23.wt, 'stray.txt'), 'only here\n');                  // 브랜치에 없는 파일
@@ -374,37 +376,24 @@ const parents = (cwd, ref) => git(cwd, ['rev-list', '--parents', '-n', '1', ref]
       e23 ? String(e23.stack).slice(0, 400) : `${a23 && a23.status} ${a23 && a23.reason} | ${lo23}`);
 
     // ── [2026-10-14 자동 이슈 #3] accept 가 새로 만든 worktree 에서 린트를 복원 없이 돌려 거절 — 루프에서는 빌드 산출물(obj/)이 있어 통과했다.
-    //    작업 뒤 브랜치가 그대로이고 대상 브랜치를 들이지 않았으면 루프의 린트 통과를 그대로 쓴다. ──
+    //    작업 뒤 브랜치가 그대로이고 대상 브랜치를 들이지 않았으면 루프의 린트 통과를 그대로 쓴다 — 예전 go 작업(full · done · 루프 린트 통과)으로. ──
     const NEEDS_RESTORE = "if(!require('fs').existsSync('obj/restored.flag')){console.log('error: assets file not found; run restore');process.exit(1)}";
     const r24 = mkRepo({ files: { 'lint.js': NEEDS_RESTORE, '.gitignore': 'obj/\n', 'AGENTS.md': '```yaml\nlint_command: "node lint.js {files}"\n```\n' } });
-    const t24 = await L.go({ ...quiet, root: r24, goal: 'add the feature', checks: ['node check.js'], run: fake([o => {
-      write(path.join(o.cwd, 'obj', 'restored.flag'), 'x');   // 검사(빌드)가 남긴 복원 산출물 흉내
-      write(path.join(o.cwd, 'feature.txt'), 'feature\n');
-    }]) });
+    const t24 = asOld(r24, laneDone(r24, wt => {
+      write(path.join(wt, 'obj', 'restored.flag'), 'x');   // 검사(빌드)가 남긴 복원 산출물 흉내 — 무시되므로 커밋되지 않고 worktree 와 함께 사라진다
+      write(path.join(wt, 'feature.txt'), 'feature\n');
+    }, { goal: 'add the feature' }), { mode: 'full', status: 'done', lint: { baseline_ok: true, last: { ok: true, exit_code: 0 } } });
     const a24 = await I.accept({ ...quiet, root: r24, id: t24.id });
     R.check('[IN-24] 작업 뒤 바뀐 것이 없으면 accept 는 루프에서 통과한 린트를 다시 돌리지 않는다(복원 없는 새 worktree 에서 거절되지 않는다)',
-      t24.status === 'done' && a24.status === 'accepted' && !a24.refused, `${t24.status} ${t24.reason} | ${a24.status} ${a24.reason}`);
+      t24.status === 'done' && a24.status === 'accepted' && !a24.refused && S.readLog(r24, t24.id).some(e => e.event === 'lint' && e.phase === 'accept' && e.reused), `${t24.status} ${t24.reason} | ${a24.status} ${a24.reason}`);
 
-    // ── [2026-10-15 자동 이슈 #5] resume 도 같은 자리 — 예전 worktree 폴더(등록은 이미 지워짐 · 파일은 아직 지워지는 중)에
-    //    worktree add 를 해 "already exists" 예외로 죽었다. 기다렸다가 이어 가고, 끝내 남으면 interrupted 로 이유를 말한다. ──
-    const leftover = (r, t) => { const P = halfRemoved(r, t); git(r, ['worktree', 'prune']); const tk = S.readTask(r, t.id); tk.status = 'interrupted'; S.writeTask(r, tk); return P; };
-    const r25 = mkRepo();
-    const t25 = await goDone(r25, work());
-    const P25 = leftover(r25, t25);
-    write(path.join(P25.wt, 'wip.txt'), 'work in progress\n');   // 죽은 실행이 남긴 미커밋 변경
-    let e25 = null, s25 = null;
-    try { s25 = await L.resume({ ...quiet, root: r25, id: t25.id, run: work(), removalWaitMs: 500 }); } catch (e) { e25 = e; }
-    const lo25 = leftoverOf(r25, t25.id);
-    R.check('[IN-25] resume: 남은 폴더(등록 없음)는 치우고 이어 간다(done) — 미커밋 변경은 작업 기록에 보관(자동 이슈 #10 · #11)',
-      !e25 && s25 && s25.status === 'done' && !!lo25 && read(path.join(lo25, 'wip.txt')) === 'work in progress\n',
-      e25 ? String(e25.stack).slice(0, 400) : `${s25 && s25.status} ${s25 && s25.reason} | ${lo25}`);
-    // ── [2026-10-16 자동 이슈 #15] go --base harness/<앞 작업> 으로 쌓은 작업 — accept 의 기본 대상이 그 harness 브랜치라 거부됐다 ──
+    // ── [2026-10-16 자동 이슈 #15] --base harness/<앞 작업> 으로 쌓은 작업 — accept 의 기본 대상이 그 harness 브랜치라 거부됐다 ──
     const r28 = mkRepo();
-    const tA = await goDone(r28, work('ONE'));
-    const tB = await L.go({ ...quiet, root: r28, goal: 'more', checks: ['node check.js'], base: tA.branch, run: fake([o => write(path.join(o.cwd, 'b.txt'), 'bee two\n')]) });
+    const tA = laneDone(r28, work('ONE'));
+    const tB = laneDone(r28, wt => write(path.join(wt, 'b.txt'), 'bee two\n'), { goal: 'more', base: tA.branch });
     const aB1 = await I.accept({ ...quiet, root: r28, id: tB.id });
     R.check('[IN-28] 앞 작업이 아직 받아들여지지 않았으면 무엇을 먼저 할지(앞 작업 accept · --into) 알려 주며 거부한다',
-      tB.status === 'done' && aB1.refused && new RegExp(tA.id).test(aB1.reason) && /--into/.test(aB1.reason), `${tB.status} ${aB1.reason}`);
+      tB.status === 'open' && tB.base_branch === tA.branch && aB1.refused && new RegExp(tA.id).test(aB1.reason) && /--into/.test(aB1.reason), `${tB.status} ${aB1.reason}`);
     await I.accept({ ...quiet, root: r28, id: tA.id });
     const aB2 = await I.accept({ ...quiet, root: r28, id: tB.id });
     R.check('[IN-28] 앞 작업을 받아들인 뒤에는 --into 없이 그 대상(main)으로 들인다', aB2.status === 'accepted' && S.readTask(r28, tB.id).accepted_into === 'main' && read(path.join(r28, 'b.txt')) === 'bee two\n', `${aB2.status} ${aB2.reason}`);
@@ -412,7 +401,7 @@ const parents = (cwd, ref) => git(cwd, ['rev-list', '--parents', '-n', '1', ref]
     // ── [2026-10-16 자동 이슈 #16] 편집기 · 빌드 서버가 남은 폴더를 잠가 accept 가 반복 거부됐다 — 그 자리를 못 비우면 옆 경로에 worktree 를 만들어 진행 ──
     {
       const r29 = mkRepo();
-      const t29 = await goDone(r29, work());
+      const t29 = laneDone(r29, work());
       const P29 = halfRemoved(r29, t29);
       fs.mkdirSync(path.join(P29.wt, 'busy'), { recursive: true });
       // 이 폴더를 현재 디렉터리로 쓰는 프로세스(명령줄에는 경로가 없다 — 편집기 언어 서버처럼): Windows 에서는 폴더를 지울 수 없다
@@ -443,6 +432,25 @@ const parents = (cwd, ref) => git(cwd, ['rev-list', '--parents', '-n', '1', ref]
       const found = require('../../harness/lib/git').procsIn(p1);
       try { process.kill(other.pid); } catch { /* 끝났다 */ }
       R.check('[IN-26b] 프로세스 정리는 그 폴더만 — 이름이 접두어인 옆 폴더(<id> 대 <id>-2)의 프로세스는 잡지 않는다', !found.some(k => k.pid === other.pid), JSON.stringify(found));
+    }
+
+    // IN-30 [자동 이슈 #54] Windows: MAX_PATH 를 넘는 경로가 든 worktree — git 이 'Filename too long' 으로 등록만 지우고 폴더를 남겼다.
+    //   저장소 설정이 아니라 명령줄(-c core.longpaths=true)로만 긴 경로를 켜고 커밋해, 설정이 없는 저장소를 흉내 낸다.
+    if (process.platform === 'win32') {
+      const GL = require('../../harness/lib/git');
+      const rl = path.join(base, 'longpath'); fs.mkdirSync(rl, { recursive: true });
+      git(rl, ['init', '-q', '-b', 'main']); git(rl, ['config', 'user.name', 't']); git(rl, ['config', 'user.email', 't@example.invalid']); git(rl, ['config', 'commit.gpgsign', 'false']);
+      const deep = ['d'.repeat(60), 'e'.repeat(60), 'f'.repeat(60), 'g'.repeat(60), 'h'.repeat(60)].join('/') + '/long-file-name.txt';
+      write(path.join(rl, 'a.txt'), 'a\n'); write(path.join(rl, deep), 'deep\n');
+      git(rl, ['-c', 'core.longpaths=true', 'add', '-A']); git(rl, ['-c', 'core.longpaths=true', 'commit', '-qm', 'deep path']);
+      const lwt = path.join(rl, '.harness-worktrees', 't-20261029-000000-abcd');
+      git(rl, ['-c', 'core.longpaths=true', 'worktree', 'add', '-q', '-b', 'harness/t-20261029-000000-abcd', lwt, 'main']);
+      const before30 = fs.existsSync(path.join(lwt, deep));
+      const rm30 = GL.removeWorktree(rl, lwt);
+      R.check('[IN-30] (#54) 긴 경로(MAX_PATH 초과)가 든 깨끗한 worktree 도 지운다 — 등록 · 폴더 모두 · 브랜치는 남는다',
+        before30 && rm30.ok && !fs.existsSync(lwt) && !GL.worktreeRegistered(rl, lwt) && GL.branchExists(rl, 'harness/t-20261029-000000-abcd'), JSON.stringify({ before30, rm30, left: fs.existsSync(lwt) }));
+      const left = path.join(base, 'rdtree'); write(path.join(left, deep), 'x\n');
+      R.check('[IN-30] rdTree: 긴 경로가 섞인 폴더를 rd /s /q "\\\\?\\…" 로 지운다', GL.rdTree(left) === true && !fs.existsSync(left));
     }
   } catch (e) { R.check('예외 없이 끝난다', false, String(e && e.stack || e).slice(0, 800)); }
   finally { try { fs.rmSync(base, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }); } catch { /* 임시 디렉터리 정리 실패는 결과와 무관 */ } }

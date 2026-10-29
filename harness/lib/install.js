@@ -9,7 +9,7 @@
 //   심는 것: harness/ 사본(대상이 원본이면 생략) · AGENTS.md 관리 블록 · CLAUDE.md 의 `@AGENTS.md` ·
 //            .claude/settings.json 훅 · .codex/hooks.json 훅(저장소 것 — 전역 ~/.codex 는 절대 쓰지 않는다) ·
 //            스킬 harness(.claude/skills · .agents/skills) · .git/info/exclude 의 `.harness-worktrees/` ·
-//            (--track-docs 일 때만) .gitignore 관리 블록 — 기본은 관리 문서가 git 에서 무시되는지 보고만 한다.
+//            (예전 판 --track-docs 의 .gitignore 관리 블록은 uninstall 이 걷는다)
 //   기록: <git-common-dir>/harness/install.json — 무엇을 새로 만들었고 무엇을 어떻게 고쳤는지.
 //         uninstall 은 이것으로 원본을 바이트 그대로 되돌린다(사용자가 그 사이 고친 것은 보존하고 우리 것만 걷는다).
 const fs = require('node:fs');
@@ -18,9 +18,12 @@ const C = require('../hooks/_common');
 
 // 예전 템플릿(template/CLAUDE.md)의 줄 → 지금 문구. 글자 그대로 같은 줄만 바꾼다.
 //   [2026-10-20 사용자 보고] 대화형 세션이 "서브에이전트는 적게" 지침 때문에 독립적인 시험 · 검토 11개를 하나씩 차례로 돌렸다.
+//   [2026-10-25 Light] 나눈 일은 factory 가 아니라 각자 lane(`start`) — factory 를 가리키던 줄도 새 문구로.
+const SPLIT_LINE = '- 서로 독립적인 일(조사 · 시나리오 시험 · 검토 · 서로 다른 파일의 작업)은 서브에이전트로 나눠 한 메시지에서 동시에 띄운다. 같은 파일을 여러 에이전트가 고치게 나누지 않는다 — 그렇게 나눠야 하면 각자 레인(`start`).';
 const LEGACY_CLAUDE_LINES = [
-  ['- 서브에이전트는 정말 독립적인 큰 일에만, 적게 쓴다.',
-    '- 서로 독립적인 일(조사 · 시나리오 시험 · 검토 · 서로 다른 파일의 작업)은 서브에이전트로 나눠 한 메시지에서 동시에 띄운다. 같은 파일을 여러 에이전트가 고치게 나누지 않는다 — 그렇게 나눠야 하면 `factory` · `go --owns`.'],
+  ['- 서로 독립적인 일(조사 · 시나리오 시험 · 검토 · 서로 다른 파일의 작업)은 서브에이전트로 나눠 한 메시지에서 동시에 띄운다. 같은 파일을 여러 에이전트가 고치게 나누지 않는다 — 그렇게 나눠야 하면 각자 lane(`start`) · `go --owns`.', SPLIT_LINE],
+  ['- 서브에이전트는 정말 독립적인 큰 일에만, 적게 쓴다.', SPLIT_LINE],
+  ['- 서로 독립적인 일(조사 · 시나리오 시험 · 검토 · 서로 다른 파일의 작업)은 서브에이전트로 나눠 한 메시지에서 동시에 띄운다. 같은 파일을 여러 에이전트가 고치게 나누지 않는다 — 그렇게 나눠야 하면 `factory` · `go --owns`.', SPLIT_LINE],
   ['- 별도의 검증 단계나 검증용 서브에이전트를 두지 않는다 — 저장소 테스트 명령의 종료 코드가 판정이다.',
     '- 판정은 저장소 테스트 명령의 종료 코드다 — 에이전트의 의견으로 판정하지 않는다. 시험을 쓰고 돌리는 서브에이전트는 된다(그 시험이 판정이 된다).'],
 ];
@@ -33,7 +36,7 @@ const GI_END = '# harness:docs-end';
 const SKIP_DIRS = new Set(['tests', 'test', 'node_modules', '.git']);
 // 우리 훅 = 우리가 만드는 명령 문자열 그대로(리뷰 M11 — 경로 어디든 harness/hooks/ 가 들어간 사용자 훅을 지우지 않는다).
 //   Codex commandWindows 는 설치 때의 절대 경로다 — 저장소를 옮긴 뒤 재설치해도 옛 경로의 것을 알아보게 경로 부분은 열어 둔다.
-const HOOK_NAMES = '(?:guard|track|stop|session-end|lang)';
+const HOOK_NAMES = '(?:guard|track|stop|session-end|lang|board)';
 const OURS_CLAUDE = new RegExp(`^node "\\$\\{CLAUDE_PROJECT_DIR\\}/harness/hooks/${HOOK_NAMES}\\.js"$`);
 const OURS_CODEX = new RegExp(`^node "\\$\\(git rev-parse --show-toplevel\\)/harness/hooks/${HOOK_NAMES}\\.js" --codex$`);
 const OURS_CODEX_WIN = new RegExp(`^node "?(?:[^"]*[\\\\/])?harness[\\\\/]hooks[\\\\/]${HOOK_NAMES}\\.js"? --codex$`);
@@ -45,10 +48,14 @@ const MARKER_TEXT = 'harness 5\n# node harness/cli.js install 이 만든 사본�
 // Claude: ${CLAUDE_PROJECT_DIR} 는 세션 시작 루트에 고정된다 — cwd 가 하위 폴더나 worktree 로 옮겨도 경로가 깨지지 않는다(Claude 조사 §4 · §10.3).
 function claudeHooks() {
   const h = (x, timeout) => ({ type: 'command', command: `node "\${CLAUDE_PROJECT_DIR}/harness/hooks/${x}.js"`, timeout });
+  // [2026-10-25] mcp__.* — git · GitHub MCP 서버의 쓰기 도구가 guard 를 비켜 갔다. 파일 시스템 MCP 의 쓰기도 세션 파일에 기록한다.
+  //   board — 세션 게시판(같은 체크아웃의 다른 세션 · 같은 목표 알림 · 남의 미커밋 파일 편집 전 묻기 · 가벼운 길의 환경).
   return {
-    PreToolUse: [{ matcher: 'Bash|PowerShell', hooks: [h('guard', 10)] }],
-    PostToolUse: [{ matcher: 'Write|Edit|MultiEdit|NotebookEdit', hooks: [h('track', 10)] }],
-    UserPromptSubmit: [{ hooks: [h('lang', 10)] }],          // 응답 언어 — 매 턴 상기(2026-10-13)
+    // guard 는 실패(오류 · 시간 초과 · 셸 없음)해도 막는다 — [2026-10-29 Claude Code 문서] onFailure 가 없으면 Git for Windows 가 있을 때 실패가 통과로 끝난다(v2.1.295+ · 옛 판은 이 키를 무시)
+    PreToolUse: [{ matcher: 'Bash|PowerShell|mcp__.*', hooks: [{ ...h('guard', 10), onFailure: 'block' }] }, { matcher: 'Write|Edit|MultiEdit|NotebookEdit', hooks: [h('board', 10)] }],
+    PostToolUse: [{ matcher: 'Write|Edit|MultiEdit|NotebookEdit|mcp__.*__(write_file|edit_file|move_file|create_file)', hooks: [h('track', 10)] }],
+    UserPromptSubmit: [{ hooks: [h('lang', 10), h('board', 10)] }],          // 응답 언어 — 매 턴 상기(2026-10-13) · 게시판
+    SessionStart: [{ hooks: [h('board', 10)] }],
     Stop: [{ hooks: [h('stop', 30), h('lang', 10)] }],
     SessionEnd: [{ hooks: [h('session-end', 30)] }],     // 기본 예산 1.5초 → 커밋할 시간을 준다(최대 60)
   };
@@ -67,7 +74,7 @@ function codexHooks(root) {
   return {
     PreToolUse: [{ matcher: 'Bash|shell|local_shell|exec_command|unified_exec', hooks: [h('guard', 10)] }],
     PostToolUse: [{ matcher: 'apply_patch|Edit|Write', hooks: [h('track', 10)] }],
-    UserPromptSubmit: [{ hooks: [h('lang', 10)] }],
+    UserPromptSubmit: [{ hooks: [h('lang', 10), h('board', 10)] }],      // 게시판은 요청 때만(Codex 는 CLAUDE_ENV_FILE 이 없다)
     Stop: [{ hooks: [h('stop', 30), h('lang', 10)] }],
     SessionEnd: [{ hooks: [h('session-end', 3)] }],      // Codex SessionEnd 상한 3초
   };
@@ -204,7 +211,13 @@ function entry(ctx, key, init) {
 function apply(ctx) {
   if (ctx.opts.dryRun) return;
   for (const op of ctx.ops) {
-    if (op.content === null) { try { fs.unlinkSync(op.file); } catch (e) { if (e.code !== 'ENOENT') throw e; } continue; }
+    if (op.content === null) {
+      try { fs.unlinkSync(op.file); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+      // harness/ 안에서 지운 파일의 폴더가 비면 지운다(새 판에서 빠진 lib/gone/ 같은 것 — harness/ 자체는 남긴다)
+      const top = path.join(ctx.root, 'harness');
+      for (let d = path.dirname(op.file); d.length > top.length && d.startsWith(top + path.sep); d = path.dirname(d)) { try { fs.rmdirSync(d); } catch { break; } }
+      continue;
+    }
     fs.mkdirSync(path.dirname(op.file), { recursive: true });
     fs.writeFileSync(op.file, op.content);
   }
@@ -258,13 +271,21 @@ function install(opts) {
     const running = runningTasks(root);
     if (running.length && !opts.force) return refuse(ctx, `실행 중인 하네스 작업이 있다(${running.join(', ')}) — 끝난 뒤에 다시 설치한다`);
     if (foreign) ctx.notes.push(`--force: 기존 harness/ (${foreign}) 를 덮어썼다 — 같은 이름의 파일만 바뀌고 나머지는 남는다.`);
+    const copied = new Set();
     for (const r of walk(source, source)) {
       if (r === MARKER) continue;                                  // 마커는 아래에서 따로 쓴다
       const dest = path.join(destHarness, r);
       const key = rel(root, dest);
       const existed = fs.existsSync(dest);
+      copied.add(key);
       entry(ctx, key, () => ({ created: !existed }));
       put(ctx, dest, fs.readFileSync(path.join(source, r)));
+    }
+    // [v7] 새 판에서 빠진 하네스 파일(loop.js · factory.js …)은 지운다 — 설치 기록에 하네스가 깐 것으로 적힌 harness/ 파일만(사용자 파일은 기록에 없다)
+    for (const key of Object.keys(ctx.manifest.files)) {
+      if (!key.startsWith('harness/') || copied.has(key) || key === rel(root, path.join(destHarness, MARKER)) || !ctx.manifest.files[key].created) continue;
+      put(ctx, path.join(root, key), null);
+      delete ctx.manifest.files[key];
     }
     const marker = path.join(destHarness, MARKER);
     const markerExisted = fs.existsSync(marker);
@@ -337,9 +358,6 @@ function install(opts) {
     put(ctx, exFile, (ex || '') + added);
   }
 
-  // 7) 관리 문서(docs/prds · coordinations · designs · README.md)가 git 에서 무시되는지 — 기본은 보고만(.gitignore 를 건드리지 않는다).
-  //    docs/ 를 일부러 무시하는 저장소가 있다(프로젝트 정책). --track-docs 일 때만 관리 블록을 더한다.
-  const docsAfter = trackDocs(ctx, !!opts.trackDocs);
 
   ctx.notes.push(
     'Codex: 프로젝트 .codex/ 층은 신뢰된 프로젝트에서만 읽힌다(config.toml `[projects.\'<repo>\'] trust_level = "trusted"`). ' +
@@ -347,56 +365,11 @@ function install(opts) {
     'Claude Code: 대화형 세션은 워크스페이스를 신뢰한 뒤에만 .claude/settings.json 훅을 실행한다.',
   );
   apply(ctx);
-  if (docsAfter) docsAfter();
   saveManifest(ctx);
   return summary(ctx, 'install');
 }
 
-// ── 관리 문서와 .gitignore ──
-// 실측(git 2.53, 임시 저장소): 부모 폴더를 제외하는 줄(`docs/`)이 있으면 `!docs/prds/` 만으로는 다시 넣지 못한다.
-//   뒤에서 `!docs/` 로 폴더를 다시 열고 `docs/*` 로 나머지를 다시 무시하면 된다(사용자 줄은 그대로).
-//   `docs/*` 는 `!docs/prds/` 로, `docs/**` 는 `!docs/prds/**` 까지 있어야 풀린다 — 블록은 둘 다 적는다.
-//   하위 폴더의 .gitignore(예: docs/.gitignore)는 루트 블록보다 우선한다 — 그 줄은 사용자가 고쳐야 한다.
-function trackDocs(ctx, want) {
-  const D = require('./docs');
-  const { root } = ctx;
-  const giFile = path.join(root, '.gitignore');
-  const gi = readText(giFile);
-  const has = gi !== null && gi.includes(GI_BEGIN) && gi.includes(GI_END);
-  const plan = D.gitignorePlan(root);
-  const causes = hs => [...new Set(hs.map(D.causeOf))].join(' · ');
-  const targets = hs => hs.map(h => h.target).join(' · ');
-  if (!plan.needed) {
-    ctx.notes.push(has ? `관리 문서: .gitignore 관리 블록(${GI_BEGIN})이 있어 docs/prds · docs/coordinations · docs/designs · docs/README.md 를 git 이 추적할 수 있다.`
-      : '관리 문서(docs/prds · docs/coordinations · docs/designs · docs/README.md)는 git 이 무시하지 않는다 — 커밋할 수 있다.');
-    return null;
-  }
-  const where = `${targets(plan.hits)} — ${causes(plan.hits)}`;
-  // 블록이 이미 있는데도 무시된다 — 블록 뒤의 판정으로 블록을 다시 쓰면 `!docs/` 를 잃는다. 그대로 두고 원인만 알린다.
-  if (has) { ctx.notes.push(`.gitignore 관리 블록(${GI_BEGIN})이 있지만 여전히 무시된다: ${where} — 그 줄을 직접 고쳐야 한다.`); return null; }
-  if (!want) {
-    ctx.notes.push(`관리 문서가 git 에서 무시된다: ${where}. .gitignore 는 바꾸지 않았다 — 문서는 로컬 전용이고 바꿀 때마다 이전 판이 <git-common-dir>/harness/docs-history/ 에 남는다. ` +
-      'git 으로 추적하려면 install --track-docs (사용자 줄은 고치지 않고 관리 블록을 더한다).');
-    return null;
-  }
-  if (plan.nested.length) ctx.notes.push(`하위 폴더의 .gitignore 가 관리 문서를 무시한다: ${causes(plan.nested)} — 루트 .gitignore 블록보다 우선하므로 그 줄은 직접 고쳐야 한다.`);
-  if (plan.dirCauses.length) {
-    ctx.notes.push(`${causes(plan.dirCauses)} 는 docs/ 폴더 자체를 제외한다 — git 은 제외된 폴더 안을 \`!\` 로 다시 넣지 못하므로(\`!docs/prds/\` 만으로는 무효) ` +
-      '관리 블록이 `!docs/` 로 폴더를 다시 열고 `docs/*` 로 나머지는 계속 무시한다. 그 줄은 고치지 않았다 — docs/ 전체를 무시하는 것이 프로젝트 정책이면 --track-docs 를 쓰지 말고 uninstall 로 블록을 걷는다.');
-  }
-  const eol = eolOf(gi);
-  const block = withEol([GI_BEGIN, '# node harness/cli.js install --track-docs 가 관리한다 — 하네스 관리 문서를 git 이 추적하게 한다(uninstall 이 걷는다).', ...plan.lines, GI_END].join('\n'), eol);
-  const sep = gi === null || gi === '' ? '' : gi.endsWith(eol) ? eol : eol + eol;
-  ctx.manifest.gitignore_docs = { created: gi === null, sep };
-  put(ctx, giFile, (gi || '') + sep + block + eol);
-  // 쓴 뒤 실제로 풀렸는지 git 으로 다시 본다(dry run 이면 보지 않는다).
-  return () => {
-    if (ctx.opts.dryRun) return;
-    const left = D.gitignorePlan(root).hits;
-    ctx.notes.push(left.length ? `관리 블록을 더했지만 여전히 무시된다: ${targets(left)} — ${causes(left)}`
-      : '관리 블록을 더했다: docs/prds · docs/coordinations · docs/designs · docs/README.md 를 git 이 추적할 수 있다(git check-ignore 로 확인).');
-  };
-}
+// ── 예전 판(--track-docs)이 더한 .gitignore 블록 — uninstall 이 걷는다 ──
 function untrackDocs(ctx) {
   const giFile = path.join(ctx.root, '.gitignore');
   const gi = readText(giFile);

@@ -5,7 +5,7 @@ const fs = require('node:fs'), os = require('node:os'), path = require('node:pat
 const { spawnSync } = require('node:child_process');
 const { makeReporter } = require('../run.js');
 const S = require('../../harness/lib/state');
-const L = require('../../harness/lib/loop');
+const Ln = require('../../harness/lib/lane');
 const St = require('../../harness/lib/status');
 const R = makeReporter('v5 status · gc — 겹침 · 주인 · 정리');
 
@@ -17,8 +17,21 @@ const git = (cwd, args) => { const r = spawnSync('git', args, { cwd, encoding: '
 // 끝난 프로세스의 pid 는 부하가 크면 곧 재사용된다(Windows) — 어느 OS 에서도 배정되지 않는 큰 값(4의 배수).
 const deadPid = () => 99999996;
 const quiet = { log: () => {} };
-const edits = files => async o => { for (const [f, t] of Object.entries(files)) write(path.join(o.cwd, f), t); return { session_id: o.newSessionId, cost_usd: 0.2 }; };
-const goEdit = (root, files, goal) => L.go({ ...quiet, root, goal: goal || 'edit', run: edits(files) });
+// v7 Light: 작업은 작업 칸(lane.start)으로 연다 — 그 worktree 에서 자기 파일만 커밋한다(사람 · 대화형 세션이 하는 일).
+//   비용은 기록된 값(task.spent — v7 이전 작업 기록에 남은 것)을 status 가 그대로 더해 보인다 — 칸에는 작업자 비용이 없어 기록에 적어 둔다.
+const goEdit = (root, files, goal) => {
+  const r = Ln.start({ ...quiet, root, goal: goal || 'edit' });
+  for (const [f, t] of Object.entries(files)) write(path.join(r.worktree, f), t);
+  git(r.worktree, ['add', '--', ...Object.keys(files)]); git(r.worktree, ['commit', '-qm', 'work', '--', ...Object.keys(files)]);
+  const t = S.readTask(root, r.id); t.spent = { ...(t.spent || {}), cost_usd: 0.2 }; S.writeTask(root, t);
+  return r;
+};
+// 끝난 작업(v7 이전의 무인 작업이 남긴 done 기록과 같은 모양) — gc 가 worktree 를 치우는 대상
+const finish = (root, ...ids) => { for (const id of ids) { const t = S.readTask(root, id); t.status = 'done'; S.writeTask(root, t); } };
+// 진짜 `claude agents --json` 은 부르지 않는다 — 플랫폼 목록은 이 파일(없으면 last_seen 어림). CLI 자식도 물려받는다.
+const AGENTS_FILE = path.join(base, 'agents.json');
+process.env.HARNESS_AGENTS_JSON = AGENTS_FILE;
+delete process.env.HARNESS_AGENTS_CMD; delete process.env.HARNESS_AGENTS;
 
 (async () => {
   try {
@@ -34,13 +47,13 @@ const goEdit = (root, files, goal) => L.go({ ...quiet, root, goal: goal || 'edit
     const a = await goEdit(repo, { 'shared.txt': 'A\n', 'only-a.txt': 'a\n' }, 'task a');
     const b = await goEdit(repo, { 'shared.txt': 'B\n' }, 'task b');
     const c = await goEdit(repo, { 'z.txt': 'C\n' }, 'task c');
-    R.check('[SS-00] 준비: 작업 3개 done', [a, b, c].every(t => t.status === 'done'), [a, b, c].map(t => t.status).join());
+    R.check('[SS-00] 준비: 작업 칸 3개 open', [a, b, c].every(t => t.status === 'open'), [a, b, c].map(t => t.status).join());
     const s1 = St.status({ root: repo });
     const ov = s1.overlaps.find(o => o.file === 'shared.txt');
     R.check('[SS-01] 겹침: 두 작업이 shared.txt 를 바꿈 → 경고(두 id)', !!ov && ov.tasks.slice().sort().join() === [a.id, b.id].sort().join(), JSON.stringify(s1.overlaps));
     R.check('[SS-01] 한 작업만 바꾼 파일은 겹침이 아니다(z.txt · only-a.txt)', s1.overlaps.length === 1, JSON.stringify(s1.overlaps));
     const ta = s1.tasks.find(t => t.id === a.id);
-    R.check('[SS-01] 작업 목록: 상태 · 브랜치 · 바뀐 파일 수(.harness 제외) · 비용', ta && ta.status === 'done' && ta.branch === `harness/${a.id}` && ta.files_changed === 2 && ta.cost_usd === 0.2 && ta.branch_exists, JSON.stringify(ta));
+    R.check('[SS-01] 작업 목록: 상태 · 브랜치 · 바뀐 파일 수(.harness 제외) · 비용', ta && ta.status === 'open' && ta.mode === 'light' && ta.branch === `harness/${a.id}` && ta.files_changed === 2 && ta.cost_usd === 0.2 && ta.branch_exists, JSON.stringify(ta));
     const txt = St.formatStatus(s1);
     R.check('[SS-01] 사람용 출력에 겹침 경고', /overlaps/.test(txt) && txt.includes(`! shared.txt — `), txt);
     R.check('[SS-09] 사람용 출력에 작업 전체의 누적 비용', /spent across 3 tasks: \$0\.60/.test(txt), txt.split('\n').filter(l => /spent/.test(l)).join(' | '));
@@ -85,8 +98,7 @@ const goEdit = (root, files, goal) => L.go({ ...quiet, root, goal: goal || 'edit
 
     // ── gc ───────────────────────────────────────────────────────────
     const Pa = S.taskPaths(repo, a.id), Pb = S.taskPaths(repo, b.id);
-    git(repo, ['worktree', 'add', '-q', Pa.wt, `harness/${a.id}`]);
-    git(repo, ['worktree', 'add', '-q', Pb.wt, `harness/${b.id}`]);
+    finish(repo, a.id, b.id);   // 칸의 worktree 는 이미 있다(start) — 끝난 작업으로 만든다
     write(path.join(Pa.wt, 'dirty.txt'), 'uncommitted work\n');
     write(path.join(S.lockDir(repo, 'task-dead'), 'owner.json'), JSON.stringify({ pid: deadPid(), host: os.hostname(), at: new Date().toISOString(), token: 'x' }));
     const liveLock = S.acquire(repo, 'merge');
@@ -113,10 +125,9 @@ const goEdit = (root, files, goal) => L.go({ ...quiet, root, goal: goal || 'edit
     const d = await goEdit(g2, { 'd.txt': 'd\n' }, 'task d');
     const e = await goEdit(g2, { 'e.txt': 'e\n' }, 'task e');
     const f = await goEdit(g2, { 'f.txt': 'f\n' }, 'task f');
-    R.check('[SS-07] 준비: 작업 3개 done', [d, e, f].every(t => t.status === 'done'), [d, e, f].map(t => `${t.status} ${t.reason}`).join(' | '));
     const wtOf = t => S.taskPaths(g2, t.id).wt;
-    const G = require('../../harness/lib/git');
-    for (const t of [d, e, f]) if (!fs.existsSync(wtOf(t))) { git(g2, ['worktree', 'add', '-q', wtOf(t), t.branch]); G.copyWorktreeInclude(g2, wtOf(t)); }
+    R.check('[SS-07] 준비: 작업 칸 3개 open · .env 가 칸마다 복사됐다(.worktreeinclude)', [d, e, f].every(t => t.status === 'open' && read(path.join(wtOf(t), '.env')) === 'TOKEN=1\n'), [d, e, f].map(t => `${t.status} ${t.reason}`).join(' | '));
+    finish(g2, d.id, e.id, f.id);
     write(path.join(wtOf(e), 'build.log'), 'artifact outside git\n');
     // [L3] f 는 accept/cancel 이 진행 중(task-<id> 잠금이 산 주인) · f 의 임시 revert worktree 는 merge 잠금 아래
     const tmpF = path.join(S.paths(g2).worktreesDir, `${f.id}-cancel-abcd`);
@@ -158,6 +169,48 @@ const goEdit = (root, files, goal) => L.go({ ...quiet, root, goal: goal || 'edit
     const s9 = St.status({ root: repo });
     const txt9 = St.formatStatus(s9);
     R.check('[SS-11] 둘 다 깨지면 status 가 "손상" 줄로 보이고 기록(log.jsonl)의 위치와 목표를 알려 준다', (s9.broken || []).some(x => x.id === c.id && /task c/.test(x.goal)) && new RegExp(`${c.id}.*(BROKEN|손상)`).test(txt9) && /log\.jsonl/.test(txt9), txt9);
+
+    // ── [2026-10-25 Light] 게시판: 대화형 세션(플랫폼 목록 우선) · 가벼운 길 · 주인이 죽은 running 은 DEAD ─────
+    {
+      const br = path.join(base, 'brd');
+      fs.mkdirSync(br);
+      git(br, ['init', '-q', '-b', 'main']); git(br, ['config', 'user.name', 't']); git(br, ['config', 'user.email', 't@example.invalid']); git(br, ['config', 'commit.gpgsign', 'false']);
+      write(path.join(br, 'a.txt'), 'a\n'); git(br, ['add', '-A']); git(br, ['commit', '-qm', 'init']);
+      const ago = m => new Date(Date.now() - m * 60000).toISOString();
+      const sd = S.paths(br).sessionsDir;
+      const sess = (sid, o) => write(path.join(sd, sid + '.json'), JSON.stringify({ session_id: sid, runtime: 'claude', files: [], root: br, branch: 'main', ...o }));
+      sess('aaaa-live', { last_seen: ago(5), goal: '목록에 있는 세션의 목표' });
+      sess('bbbb-gone', { last_seen: ago(2) });
+      sess('cccc-gone-old', { last_seen: ago(120) });
+      sess('dddd-ended', { last_seen: ago(20), ended_at: ago(10) });
+      sess('eeee-ended-old', { last_seen: ago(200), ended_at: ago(120) });
+      sess('ffff-codex', { runtime: 'codex', last_seen: ago(3) });
+      sess('gggg-codex-quiet', { runtime: 'codex', last_seen: ago(180) });
+      sess('hhhh-old-format', {});
+      write(AGENTS_FILE, JSON.stringify([{ pid: 4242, cwd: br, kind: 'interactive', startedAt: 1, sessionId: 'aaaa-live', name: 'brd-proj-1', status: 'busy' }]));
+      const lid = 't-20261025-150000-1a2b', did = 't-20261025-150001-3c4d';
+      S.writeTask(br, { id: lid, status: 'open', mode: 'light', owner: null, goal: 'lane goal', branch: `harness/${lid}`, worktree: S.taskPaths(br, lid).wt, created_at: new Date().toISOString() });
+      S.writeTask(br, { id: did, status: 'running', owner: { pid: deadPid(), host: os.hostname(), heartbeat_at: ago(3) }, goal: 'dead worker', branch: `harness/${did}`, created_at: new Date().toISOString() });
+      const sb = St.status({ root: br });
+      const by = Object.fromEntries(sb.board.sessions.map(x => [x.session_id, x]));
+      R.check('[SS-13] 게시판: 플랫폼 목록이 있으면 liveness=platform · 목록의 세션은 이름 · busy · pid', sb.board.liveness === 'platform' && by['aaaa-live'] && by['aaaa-live'].state === 'busy' && by['aaaa-live'].name === 'brd-proj-1' && by['aaaa-live'].pid === 4242 && by['aaaa-live'].live === true, JSON.stringify(sb.board));
+      R.check('[SS-13] 목록에 없는 Claude 세션은 2분 전에 보였어도 gone(산 세션 아님) · 1시간 넘은 gone · ended 는 숨긴다',
+        by['bbbb-gone'] && by['bbbb-gone'].state === 'gone' && by['bbbb-gone'].live === false && !by['cccc-gone-old'] && by['dddd-ended'] && by['dddd-ended'].state === 'ended' && !by['eeee-ended-old'], JSON.stringify(Object.keys(by)));
+      R.check('[SS-13] Codex 세션은 last_seen 어림(30분 안 live · 밖 quiet) · 게시판 이전 기록(last_seen 없음)은 빠진다',
+        by['ffff-codex'] && by['ffff-codex'].state === 'live' && by['gggg-codex-quiet'] && by['gggg-codex-quiet'].state === 'quiet' && !by['hhhh-old-format'], JSON.stringify(sb.board.sessions.map(x => [x.session_id, x.state])));
+      R.check('[SS-13] 가벼운 길: id · open · worktree · 브랜치', sb.board.lanes.length === 1 && sb.board.lanes[0].id === lid && sb.board.lanes[0].status === 'open' && sb.board.lanes[0].worktree === S.taskPaths(br, lid).wt && sb.board.lanes[0].branch === `harness/${lid}`, JSON.stringify(sb.board.lanes));
+      const tb = St.formatStatus(sb), tbk = St.formatStatus({ ...sb, language: 'Korean' });
+      R.check('[SS-13] 사람용 출력: 세션 줄(sid8 · 플랫폼 이름 · busy · gone) · 가벼운 길 줄 · 주인이 죽은 running 은 DEAD',
+        /sessions \(\d+\):/.test(tb) && /aaaalive brd-proj-1 \(claude\) busy/.test(tb) && /bbbbgone \(claude\) gone/.test(tb) && new RegExp(`light lanes \\(1\\):\\n  ${lid}  open · `).test(tb) && new RegExp(`${did}  DEAD \\(running · OWNER DEAD`).test(tb)
+        && /세션 \(\d+\):/.test(tbk) && /가벼운 길 \(1\):/.test(tbk) && new RegExp(`${did}  DEAD`).test(tbk) && /사라짐/.test(tbk), tb + '\n---\n' + tbk);
+      fs.rmSync(AGENTS_FILE);
+      const sh = St.status({ root: br });
+      const by2 = Object.fromEntries(sh.board.sessions.map(x => [x.session_id, x.state]));
+      R.check('[SS-13] 목록을 못 얻으면 last_seen 어림: 30분 안 live · 밖 quiet(하루까지 보인다) · liveness=last_seen', sh.board.liveness === 'last_seen' && by2['aaaa-live'] === 'live' && by2['bbbb-gone'] === 'live' && by2['cccc-gone-old'] === 'quiet' && by2['dddd-ended'] === 'ended', JSON.stringify(by2));
+      const cliB = spawnSync(process.execPath, [CLI, 'status', '--json', '--root', br], { encoding: 'utf8', windowsHide: true, timeout: 30000 });
+      let jb = null; try { jb = JSON.parse(cliB.stdout); } catch { /* 없음 */ }
+      R.check('[SS-13] CLI status --json 에 board(더한 필드) · 기존 필드 그대로', cliB.status === 0 && jb && jb.board && Array.isArray(jb.board.sessions) && Array.isArray(jb.board.lanes) && Array.isArray(jb.tasks) && jb.uncommitted && jb.tasks.some(t => t.id === did && t.stale === true && t.mode === null) && jb.tasks.some(t => t.id === lid && t.mode === 'light'), `${cliB.status} ${cliB.stderr.slice(-300)}`);
+    }
   } catch (e) { R.check('예외 없이 끝난다', false, String(e && e.stack || e).slice(0, 800)); }
   finally { try { fs.rmSync(base, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }); } catch { /* 임시 디렉터리 정리 실패는 결과와 무관 */ } }
   R.done();

@@ -11,6 +11,15 @@ const R = makeReporter('버그 보고 — 기록 · 가림 · 묶음 · 이슈 �
 const base = fs.mkdtempSync(path.join(os.tmpdir(), 'harness-v5-bug-'));
 const CLI = path.resolve(__dirname, '..', '..', 'harness', 'cli.js');
 const git = (cwd, ...a) => (spawnSync('git', a, { cwd, encoding: 'utf8', windowsHide: true }).stdout || '').trim();
+// 예기치 못한 예외를 일부러 낸다 — 작업 기록은 멀쩡하고(status done) 그 작업의 로그 파일 자리에 폴더가 있으면 cancel 이 로그를 쓰다 EISDIR 로 실패한다.
+//   [v7 Light] 예전엔 go 에 없는 작업자 모듈(HARNESS_RUNNER_MODULE)을 줬다 — go 가 빠져 cancel 로 바꿨다. 다시 부를 때마다 함정을 새로 놓는다(같은 서명).
+const TID = 't-20261001-000000-abcd';
+const trap = r => {
+  const T = path.join(r, '.git', 'harness', 'tasks', TID);
+  fs.mkdirSync(path.join(T, 'log.jsonl'), { recursive: true });
+  fs.writeFileSync(path.join(T, 'task.json'), JSON.stringify({ id: TID, status: 'done' })); fs.rmSync(path.join(T, 'task.json.bak'), { force: true });
+  return ['cancel', TID, '--root', r];
+};
 function repo(name) {
   const d = path.join(base, name); fs.mkdirSync(d, { recursive: true });
   git(d, 'init', '-q', '-b', 'main'); git(d, 'config', 'user.name', 't'); git(d, 'config', 'user.email', 't@example.invalid');
@@ -29,7 +38,7 @@ function repo(name) {
 
     // 기록 · 묶음: 같은 결함이 다른 경로에서 두 번 → 하나 · count 2
     const r1 = repo('r1');
-    const mk = p => Object.assign(new Error(`git commit failed (128): fatal: pathspec '${p}' did not match`), { code: 'GIT_FAILED', stack: `Error: git commit failed\n    at commitAll (${harnessFrame})\n    at go (${harnessFrame.replace('git.js', 'loop.js')})` });
+    const mk = p => Object.assign(new Error(`git commit failed (128): fatal: pathspec '${p}' did not match`), { code: 'GIT_FAILED', stack: `Error: git commit failed\n    at commitAll (${harnessFrame})\n    at accept (${harnessFrame.replace('git.js', 'integrate.js')})` });
     B.record(r1, 'task', mk('A/secret1.cs'));
     B.record(r1, 'task', mk('B/other2.cs'));
     const ents = B.collect(r1);
@@ -49,11 +58,12 @@ function repo(name) {
 
     // CLI: 예기치 못한 예외 → 기록 · "하네스 버그로 보입니다" 안내
     const r2 = repo('r2');
-    const c1 = spawnSync(process.execPath, [CLI, 'go', 'x', '--root', r2], { encoding: 'utf8', windowsHide: true, timeout: 60000, env: { ...process.env, HARNESS_RUNNER_MODULE: path.join(base, 'no-such-runner.js') } });
-    R.check('[BR-06] CLI 의 예기치 못한 예외 → 결함 기록 · 출력에 report-bug 안내', /report-bug/.test(c1.stdout + c1.stderr) && B.collect(r2).length === 1, `${c1.status} ${c1.stdout.slice(-300)} ${c1.stderr.slice(-300)}`);
+    const c1 = spawnSync(process.execPath, [CLI, ...trap(r2)], { encoding: 'utf8', windowsHide: true, timeout: 60000 });
+    R.check('[BR-06] CLI 의 예기치 못한 예외 → 결함 기록 · 출력에 report-bug 안내 · exit 1', c1.status === 1 && /report-bug/.test(c1.stdout + c1.stderr) && B.collect(r2).length === 1 && B.collect(r2)[0].code === 'EISDIR', `${c1.status} ${c1.stdout.slice(-300)} ${c1.stderr.slice(-300)}`);
     // 사용자 실수(USAGE)는 결함이 아니다
-    spawnSync(process.execPath, [CLI, 'go', '--root', r2], { encoding: 'utf8', windowsHide: true, timeout: 60000 });
-    R.check('[BR-07] 사용자 실수(USAGE)는 기록하지 않는다', B.collect(r2).length === 1);
+    const u1 = spawnSync(process.execPath, [CLI, 'accept', '--root', r2], { encoding: 'utf8', windowsHide: true, timeout: 60000 });
+    const u2 = spawnSync(process.execPath, [CLI, 'cancel', '../../x', '--root', r2], { encoding: 'utf8', windowsHide: true, timeout: 60000 });
+    R.check('[BR-07] 사용자 실수(USAGE — id 없음 · 잘못된 id)는 exit 2 · 기록하지 않는다', u1.status === 2 && u2.status === 2 && B.collect(r2).length === 1 && B.collect(r2)[0].count === 1, `${u1.status} ${u2.status} ${JSON.stringify(B.collect(r2).map(e => [e.code, e.count]))}`);
 
     // report-bug: 목록 · 링크 · 보냄 표시 · 재발
     const env = { ...process.env, HARNESS_BUG_OFFLINE: '1' };
@@ -63,7 +73,7 @@ function repo(name) {
     spawnSync(process.execPath, [CLI, 'report-bug', '--root', r2, '--sent', sig], { encoding: 'utf8', windowsHide: true, timeout: 60000, env });
     const c3 = spawnSync(process.execPath, [CLI, 'report-bug', '--root', r2], { encoding: 'utf8', windowsHide: true, timeout: 60000, env });
     R.check('[BR-09] 보냄 표시한 결함은 다시 나오지 않는다', /보고할 하네스 결함이 없다/.test(c3.stdout), c3.stdout.slice(0, 300));
-    spawnSync(process.execPath, [CLI, 'go', 'x', '--root', r2], { encoding: 'utf8', windowsHide: true, timeout: 60000, env: { ...env, HARNESS_RUNNER_MODULE: path.join(base, 'no-such-runner.js') } });
+    spawnSync(process.execPath, [CLI, ...trap(r2)], { encoding: 'utf8', windowsHide: true, timeout: 60000, env });
     const c4 = spawnSync(process.execPath, [CLI, 'report-bug', '--root', r2], { encoding: 'utf8', windowsHide: true, timeout: 60000, env });
     R.check('[BR-10] 보낸 뒤 다시 생기면 "재발" 로 다시 보인다', /재발/.test(c4.stdout), c4.stdout.slice(0, 300));
 
@@ -84,24 +94,24 @@ function repo(name) {
     const apiEnv = { ...process.env, HARNESS_BUG_REPORT: 'on', HARNESS_GITHUB_API: `http://127.0.0.1:${srv.address().port}`, HARNESS_GITHUB_TOKEN: 'fake-token', HARNESS_GITHUB_TOKEN_ONLY_ENV: '1', HARNESS_BUG_REPO: 'o/r' };
     const cliA = (args, env) => new Promise(res => { const c = require('node:child_process').spawn(process.execPath, [CLI, ...args], { env, windowsHide: true }); let out = ''; c.stdout.on('data', d => { out += d; }); c.stderr.on('data', d => { out += d; }); c.on('close', code => res({ code, out })); });
     const r3 = repo('secret-plant-project');
-    await cliA(['go', 'x', '--root', r3], { ...apiEnv, HARNESS_RUNNER_MODULE: path.join(base, 'no-such-runner.js') });
+    await cliA(trap(r3), apiEnv);
     const created = reqs.filter(q => q.method === 'POST' && /\/issues$/.test(q.url));
     R.check('[BR-11] 켜져 있고 로그인이 있으면 결함이 생긴 그 실행에서 이슈가 자동으로 올라간다(토큰 · 라벨 auto-report · 가린 본문)',
       created.length === 1 && created[0].auth === 'Bearer fake-token' && created[0].body.labels.includes('auto-report') && !JSON.stringify(created[0].body).includes(base), JSON.stringify(reqs).slice(0, 500));
-    await cliA(['go', 'x', '--root', r3], { ...apiEnv, HARNESS_RUNNER_MODULE: path.join(base, 'no-such-runner.js') });
+    await cliA(trap(r3), apiEnv);
     R.check('[BR-12] 같은 결함이 재발하면 새 이슈 대신 열린 이슈에 댓글', reqs.filter(q => q.method === 'POST' && /\/issues$/.test(q.url)).length === 1 && reqs.some(q => /\/issues\/11\/comments$/.test(q.url)), JSON.stringify(reqs.map(q => `${q.method} ${q.url}`)));
     const c13 = await cliA(['report', '--root', r3, '--kind', 'improve', '--title', 'secret-plant-project 에서 accept 보고가 너무 길다', '--body', `C:\\work\\secret-plant-project\\src\\a.cs 를 고칠 때 보고가 40줄이었다`], apiEnv);
     const imp = reqs.filter(q => q.method === 'POST' && /\/issues$/.test(q.url)).pop();
     R.check('[BR-13] 작업자 · 세션의 건의(improve) — 자동으로 올라가고 프로젝트 이름 · 경로는 가린다', /이슈를 올렸다/.test(c13.out) && imp.body.labels.includes('improve') && !JSON.stringify(imp.body).includes('secret-plant-project') && !JSON.stringify(imp.body).includes('a.cs'), JSON.stringify(imp && imp.body).slice(0, 400));
     const before = reqs.length;
     const r4 = repo('r4');
-    await cliA(['go', 'x', '--root', r4], { ...process.env, HARNESS_GITHUB_API: apiEnv.HARNESS_GITHUB_API, HARNESS_GITHUB_TOKEN: 'fake', HARNESS_GITHUB_TOKEN_ONLY_ENV: '1', HARNESS_RUNNER_MODULE: path.join(base, 'no-such-runner.js'), HARNESS_BUG_REPORT: '' });
-    R.check('[BR-14] 원본 저장소(설치 사본이 아님)에서는 기본으로 꺼져 있다 — 테스트 · 개발이 실제 이슈를 올리지 않는다', reqs.length === before);
+    await cliA(trap(r4), { ...process.env, HARNESS_GITHUB_API: apiEnv.HARNESS_GITHUB_API, HARNESS_GITHUB_TOKEN: 'fake', HARNESS_GITHUB_TOKEN_ONLY_ENV: '1', HARNESS_BUG_REPORT: '' });
+    R.check('[BR-14] 원본 저장소(설치 사본이 아님)에서는 기본으로 꺼져 있다 — 테스트 · 개발이 실제 이슈를 올리지 않는다(결함은 기록된다)', reqs.length === before && B.collect(r4).length === 1);
     const c15 = await cliA(['report', '--root', r4], { ...apiEnv, HARNESS_GITHUB_TOKEN: '' });
     R.check('[BR-15] 로그인이 없으면 쌓아 두고 링크로 안내', /GitHub 로그인이 없다/.test(c15.out) && /issues\/new\?/.test(c15.out) && reqs.length === before, c15.out.slice(0, 300));
     const r5 = repo('r5'); fs.writeFileSync(path.join(r5, 'AGENTS.md'), '```yaml\nbug_report: off\n```\n');
-    await cliA(['go', 'x', '--root', r5], { ...apiEnv, HARNESS_RUNNER_MODULE: path.join(base, 'no-such-runner.js') });
-    R.check('[BR-16] 프로젝트 블록 bug_report: off 면 올리지 않는다', reqs.length === before);
+    await cliA(trap(r5), apiEnv);
+    R.check('[BR-16] 프로젝트 블록 bug_report: off 면 올리지 않는다(결함은 기록된다)', reqs.length === before && B.collect(r5).length === 1);
     srv.close();
   } catch (e) { R.check('예외 없이 끝난다', false, String(e && e.stack || e).slice(0, 800)); }
   finally { try { fs.rmSync(base, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }); } catch { /* 정리 실패는 결과와 무관 */ } }

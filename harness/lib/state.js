@@ -281,6 +281,79 @@ async function withLock(root, name, fn, opts) {
   const h = acquire(root, name, opts);
   try { return await fn(h); } finally { h.release(); }
 }
+// ── 줄 선 잠금 ────────────────────────────────────────────────────────
+// 같은 mkdir 잠금(acquire)을 쓰되 차례를 정한다 — 번호표 <locks>/<name>.queue/<우선순위>-<시각>-<pid>-<순번>.json {pid, host, at, priority, label}.
+//   가장 앞(우선순위 → 시각 → pid → 순번)의 산 번호표 주인만 잠금을 잡으러 간다. 0 = 사용자의 accept · 1 = 나머지.
+//   [2026-10-25 C++ 저장소 실측] 사용자의 accept 가 1초 폴링 잠금 뒤에서 무인 검사들을 2.5시간 기다렸다(그동안 merge 잠금을 쥔 채).
+//   옛 프로세스의 acquire 와도 서로 배제된다(같은 잠금). 죽은 pid 의 번호표는 지운다. 기다리는 동안 이벤트 루프를 막지 않는다.
+const TICKET_BEAT_MS = 10 * 60 * 1000;
+let TICKET_SEQ = 0;
+const TICKETS = new Map();   // 이 프로세스의 번호표 → 잡은 잠금(없으면 null) — 끝날 때 치운다
+let exitHooked = false;
+function hookExit() {
+  if (exitHooked) return; exitHooked = true;
+  process.on('exit', () => { for (const [file, h] of TICKETS) { try { if (h) h.release(); } catch { /* 무시 */ } try { fs.unlinkSync(file); } catch { /* 없음 */ } } TICKETS.clear(); });
+}
+function dropTicket(file) {
+  const h = TICKETS.get(file);
+  TICKETS.delete(file);
+  if (h) h.release();
+  try { fs.unlinkSync(file); } catch { /* 없음 */ }
+}
+const queueDir = (root, name) => path.join(paths(root).locksDir, `${name}.queue`);
+const pad = (n, w) => String(n).padStart(w, '0');
+// 차례대로의 산 번호표 [{file, pid, host, at, priority, label}]. prune: 죽은 주인 · 오래 못 읽는 번호표를 지운다.
+function liveTickets(dir, prune) {
+  let names = []; try { names = fs.readdirSync(dir); } catch { return []; }
+  const out = [];
+  for (const n of names.filter(x => x.endsWith('.json')).sort()) {
+    const file = path.join(dir, n), t = readJson(file, null);
+    if (!t) {   // 쓰는 중 · 잠깐 못 읽음 — 오래 그러면 버려진 것
+      let st = null; try { st = fs.statSync(file); } catch { continue; }
+      if (Date.now() - st.mtimeMs > ORPHAN_MS) { if (prune) try { fs.unlinkSync(file); } catch { /* 없음 */ } continue; }
+      out.push({ file, pid: null, host: null, at: null, priority: null, label: null });
+      continue;
+    }
+    if (!TICKETS.has(file) && !ownerAlive(t)) { if (prune) try { fs.unlinkSync(file); } catch { /* 없음 */ } continue; }
+    out.push({ file, ...t });
+  }
+  return out;
+}
+async function acquireQueued(root, name, opts) {
+  const o = opts || {}, pollMs = o.pollMs || 500;
+  const p = Number(o.priority == null ? 1 : o.priority), priority = Number.isFinite(p) ? Math.max(0, Math.min(9, Math.floor(p))) : 1;
+  const dir = queueDir(root, name);
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, `${priority}-${pad(Date.now(), 15)}-${pad(process.pid, 10)}-${pad(++TICKET_SEQ, 6)}.json`);
+  const ticket = { pid: process.pid, host: HOST, at: nowIso(), priority, label: o.label == null ? null : String(o.label) };
+  hookExit();
+  TICKETS.set(file, null);
+  writeJsonAtomic(file, ticket);
+  let beat = Date.now();
+  try {
+    for (;;) {
+      if (!fs.existsSync(file)) writeJsonAtomic(file, ticket);   // 남이 지웠다(폴더 정리) — 같은 자리로 다시
+      const head = liveTickets(dir, true)[0];
+      if (head && head.file === file) {
+        let h = null;
+        try { h = acquire(root, name, { pollMs: 25, meta: { priority, ...(ticket.label ? { label: ticket.label } : {}) } }); }
+        catch (e) { if (e.code !== 'LOCK_HELD') throw e; }   // 줄 밖의 옛 acquire 주인이 쥐고 있다 — 다음 차례에
+        if (h) {
+          TICKETS.set(file, h);
+          let released = false;
+          return { ...h, ticket: file, touch: () => h.touch(), release() { if (released) return; released = true; dropTicket(file); } };
+        }
+      }
+      if (Date.now() - beat > TICKET_BEAT_MS) { beat = Date.now(); try { writeJsonAtomic(file, { ...ticket, heartbeat_at: nowIso() }); } catch { /* 다음에 */ } }
+      await new Promise(r => setTimeout(r, pollMs));
+    }
+  } catch (e) { dropTicket(file); throw e; }
+}
+// 기다리는 줄(차례대로 · 맨 앞은 잡은 이일 수 있다) — 현황 표시용. 읽기만 한다.
+function queueOf(root, name) {
+  return liveTickets(queueDir(root, name), false).map(t => ({ pid: t.pid, priority: t.priority, label: t.label, at: t.at }));
+}
+
 function listLocks(root) {
   const { locksDir } = paths(root);
   let names = []; try { names = fs.readdirSync(locksDir); } catch { return []; }
@@ -307,22 +380,6 @@ function removeDeadLocks(root) {
   return removed;
 }
 
-// ── heartbeat ─────────────────────────────────────────────────────────
-// 작업 소유 잠금과 task.owner 를 주기적으로 갱신한다. 타이머는 프로세스를 붙잡지 않는다.
-//   task 객체를 주면 그 객체(루프가 들고 있는 것)를 갱신해 쓴다 — 파일을 읽고 덮어 루프의 최신 값을 지우지 않는다.
-function startHeartbeat(root, id, handle, everyMs, task) {
-  const beat = () => {
-    try {
-      const t = task || readTask(root, id);
-      if (t && t.owner && t.owner.pid === process.pid) { t.owner.heartbeat_at = nowIso(); writeTask(root, t); }
-      if (handle) handle.touch();
-    } catch { /* heartbeat 실패는 작업을 멈추지 않는다 */ }
-  };
-  const timer = setInterval(beat, everyMs || 30000);
-  if (timer.unref) timer.unref();
-  return { beat, stop() { clearInterval(timer); } };
-}
-const ownerRecord = () => ({ pid: process.pid, host: HOST, heartbeat_at: nowIso() });
 
 // ── 세션 기록 (A3 의 track 훅이 쓴다; 여기서는 읽기만) ────────────────────
 function readSessions(root) {
@@ -338,6 +395,6 @@ function readSessions(root) {
 module.exports = { retargetWorktree, taskPathsFor, listBrokenTasks,
   HOST, IS_WIN, sleepSync, nowIso, repoRoot, mainRoot, commonDir, paths, taskPaths, newId, validId, ID_RE,
   readJson, writeJsonAtomic, appendJsonl, readTask, writeTask, log, readLog, listTasks, newTask,
-  pidAlive, ownerAlive, isSelf, lockDir, lockOwner, takeOver, acquire, withLock, withLockSync, listLocks, removeDeadLocks, lockStale, staleInfo, lockLive,
-  startHeartbeat, ownerRecord, readSessions,
+  pidAlive, ownerAlive, isSelf, lockDir, lockOwner, takeOver, acquire, acquireQueued, queueOf, withLock, withLockSync, listLocks, removeDeadLocks, lockStale, staleInfo, lockLive,
+  readSessions,
 };

@@ -1,13 +1,14 @@
 'use strict';
-// 자원 장부(PRD R1) — 작업마다의 임시 폴더 · 데이터 구역 · compose 이름, 작업 끝 · accept · cancel · gc 때의 회수, 남은 것 보고.
+// 자원 장부(PRD R1) — 작업마다의 임시 폴더 · 데이터 구역 · compose 이름 · 포트 구역, accept · cancel · gc 때의 회수, 남은 것 보고.
 //   docker 는 가짜 실행기로 명령 모양만 잰다(실제 컨테이너를 만들지 않는다). 모델 호출 없음.
+//   v7 Light: 작업은 작업 칸(lane.start)으로 연다 — 무인 작업자의 작업 끝 정리(onTaskEnd · killStrays · 이미지 기록)는 지워졌다.
 const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
-const { spawnSync } = require('node:child_process');
+const { spawn, spawnSync } = require('node:child_process');
 const { makeReporter } = require('../run.js');
 const Res = require('../../harness/lib/resources');
 const P = require('../../harness/lib/proc');
 const S = require('../../harness/lib/state');
-const L = require('../../harness/lib/loop');
+const Ln = require('../../harness/lib/lane');
 const I = require('../../harness/lib/integrate');
 const St = require('../../harness/lib/status');
 const R = makeReporter('자원 장부 — 임시 폴더 · 데이터 구역 · 회수 · 남은 것');
@@ -94,102 +95,108 @@ function fakeDocker(state) {
     R.check('[RS-03] 치우기(release): 임시 폴더를 지우고 · 실패한 정리 명령은 남은 것으로 · 작업 기록에 회수 시각 · 이름들',
       !fs.existsSync(dirC) && rel.tmp.removed && rel.residue.some(x => /cleanup_command failed \(exit 3\)/.test(x)) && task.resources.release_at && task.resources.data_ns === 'harness_20261020_101010_abcd' && task.resources.compose_project === `harness-${ID}`, JSON.stringify({ rel, res: task.resources }));
 
-    // RS-04 — 실제 작업으로: 하네스 검사가 작업의 임시 폴더에서 돌고, 작업이 끝나면 그 폴더가 사라진다 · gc 가 정리 명령을 돌린다
+    // RS-04 — 실제 작업 칸으로: 하네스 검사(check <id>)가 작업의 임시 폴더에서 돌고, 끝난 작업을 gc 가 한 번 회수한다(임시 폴더 · 정리 명령)
+    //   v7 Light: 작업 끝 회수(onTaskEnd — 무인 루프)는 없다. 회수는 accept · cancel · gc(release) 때.
     const seen = path.join(base, 'seen.json'), cleaned = path.join(base, 'cleaned.txt');
     const CHECK = `const fs=require('fs'),p=require('path');fs.writeFileSync(${JSON.stringify(seen)},JSON.stringify({TEMP:process.env.TEMP,NS:process.env.HARNESS_DATA_NS}));fs.writeFileSync(p.join(process.env.TEMP,'garbage.log'),'x');console.log('# pass 1\\n# fail 0');\n`;
     const r5 = repo({ 'AGENTS.md': '# p\n\n```yaml\ntest_command: "node check.js"\ncleanup_command: "node cleanup.js"\n```\n', 'check.js': CHECK,
       'cleanup.js': `require('fs').writeFileSync(${JSON.stringify(cleaned)}, process.env.HARNESS_DATA_NS);\n` });
-    const run5 = async o => { write(path.join(o.cwd, 'feat.js'), 'module.exports = 1;\n'); return { ok: true, is_error: false, session_id: o.newSessionId || o.sessionId, final_text: 'ok', cost_usd: 0.01, permission_denials: [] }; };
-    const t5 = await L.go({ ...quiet, mode: 'full', root: r5, goal: 'add feat', run: run5 });
+    // 칸 worktree 에서 자기 파일만 커밋한다(사람 · 대화형 세션이 하는 일)
+    const commitIn = (wt, files) => { for (const [f, t] of Object.entries(files)) write(path.join(wt, f), t); git(wt, 'add', '--', ...Object.keys(files)); git(wt, 'commit', '-qm', 'work', '--', ...Object.keys(files)); };
+    const t5 = Ln.start({ ...quiet, root: r5, goal: 'add feat' });
+    commitIn(t5.worktree, { 'feat.js': 'module.exports = 1;\n' });
+    const ck5 = await I.check({ ...quiet, root: r5, id: t5.id });
     let s5 = {}; try { s5 = JSON.parse(fs.readFileSync(seen, 'utf8')); } catch { /* 검사가 돌지 않았다 */ }
     const tmp5 = Res.tmpDirFor(r5, t5.id);
-    R.check('[RS-04] 하네스 검사는 작업의 임시 폴더를 TEMP 로 · 데이터 구역 이름을 받는다', t5.status === 'done' && path.resolve(s5.TEMP || '') === path.resolve(tmp5) && s5.NS === Res.dataNs(t5.id), JSON.stringify({ status: t5.status, s5, tmp5 }));
-    const task5 = S.readTask(r5, t5.id);
-    R.check('[RS-04] 작업이 끝나면 임시 폴더(검사가 남긴 쓰레기 포함)가 사라지고 기록된다 · 비면 저장소 키 폴더도', !fs.existsSync(tmp5) && !fs.existsSync(path.dirname(tmp5)) && task5.resources && task5.resources.end_at && (task5.resources.residue || []).length === 0, JSON.stringify(task5.resources));
+    R.check('[RS-04] 하네스 검사는 작업의 임시 폴더를 TEMP 로 · 데이터 구역 이름을 받는다', ck5.status === 'checked' && path.resolve(s5.TEMP || '') === path.resolve(tmp5) && s5.NS === Res.dataNs(t5.id), JSON.stringify({ status: ck5.status, s5, tmp5 }));
+    // 끝난 작업(v7 이전의 무인 작업이 남긴 done 기록과 같은 모양)으로 만든 뒤 gc
+    const done5 = S.readTask(r5, t5.id); done5.status = 'done'; S.writeTask(r5, done5);
     const g5 = St.gc({ root: r5 });
     const task5b = S.readTask(r5, t5.id);
+    R.check('[RS-04] gc: 끝난 작업의 임시 폴더(검사가 남긴 쓰레기 포함)를 지운다 · 비면 저장소 키 폴더도 · 남은 것 없음으로 기록',
+      !fs.existsSync(tmp5) && !fs.existsSync(path.dirname(tmp5)) && task5b.resources && task5b.resources.release_at && (task5b.resources.residue || []).length === 0, JSON.stringify(task5b.resources));
     R.check('[RS-04] gc: 끝난 작업을 한 번 회수한다 — 프로젝트 정리 명령이 그 작업의 데이터 구역으로 돈다', fs.existsSync(cleaned) && fs.readFileSync(cleaned, 'utf8') === Res.dataNs(t5.id) && task5b.resources.release_at && (g5.released || []).some(x => x.id === t5.id && x.cleanup === true), JSON.stringify({ released: g5.released, res: task5b.resources }));
     fs.rmSync(cleaned, { force: true });
     St.gc({ root: r5 });
     R.check('[RS-04] gc 를 다시 해도 같은 작업을 또 회수하지 않는다', !fs.existsSync(cleaned));
 
     // RS-05 — accept · cancel 도 회수한다
-    const t6 = await L.go({ ...quiet, root: r5, goal: 'add feat 2', run: async o => { write(path.join(o.cwd, 'feat2.js'), 'module.exports = 2;\n'); return { ok: true, is_error: false, session_id: o.newSessionId || o.sessionId, final_text: 'ok', cost_usd: 0.01, permission_denials: [] }; } });
+    const t6 = Ln.start({ ...quiet, root: r5, goal: 'add feat 2' });
+    commitIn(t6.worktree, { 'feat2.js': 'module.exports = 2;\n' });
     const acc = await I.accept({ ...quiet, root: r5, id: t6.id });
-    R.check('[RS-05] accept 는 그 작업의 자원을 회수한다(정리 명령 포함)', acc.status === 'accepted' && S.readTask(r5, t6.id).resources.release_at && fs.readFileSync(cleaned, 'utf8') === Res.dataNs(t6.id), JSON.stringify({ status: acc.status, res: S.readTask(r5, t6.id).resources }));
-    const t7 = await L.go({ ...quiet, root: r5, goal: 'add feat 3', run: async o => { write(path.join(o.cwd, 'feat3.js'), 'module.exports = 3;\n'); return { ok: true, is_error: false, session_id: o.newSessionId || o.sessionId, final_text: 'ok', cost_usd: 0.01, permission_denials: [] }; } });
+    R.check('[RS-05] accept 는 그 작업의 자원을 회수한다(정리 명령 포함)', acc.status === 'accepted' && S.readTask(r5, t6.id).resources.release_at && fs.readFileSync(cleaned, 'utf8') === Res.dataNs(t6.id), JSON.stringify({ status: acc.status, report: acc.report, res: S.readTask(r5, t6.id).resources }));
+    const t7 = Ln.start({ ...quiet, root: r5, goal: 'add feat 3' });
+    commitIn(t7.worktree, { 'feat3.js': 'module.exports = 3;\n' });
     const can = await I.cancel({ ...quiet, root: r5, id: t7.id });
     R.check('[RS-05] cancel 도 회수한다', can.status === 'cancelled' && S.readTask(r5, t7.id).resources.release_at && fs.readFileSync(cleaned, 'utf8') === Res.dataNs(t7.id), JSON.stringify({ status: can.status, res: S.readTask(r5, t7.id).resources }));
-    // RS-07 — 쓰기 소유권(PRD R3): go --owns → 작업 기록 · 작업자 환경(HARNESS_OWNS) · 지시문 · 잘못된 경로 거부
-    let envSeen = null, promptSeen = '';
-    const t8 = await L.go({ ...quiet, root: r5, goal: 'billing only', owns: ['src/billing/**', 'tests/billing/**'], run: async o => { envSeen = P.isolationEnv(o.cwd); promptSeen = o.prompt; write(path.join(o.cwd, 'src', 'billing', 'b.js'), 'module.exports = 1;\n'); return { ok: true, is_error: false, session_id: o.newSessionId || o.sessionId, final_text: 'ok', cost_usd: 0.01, permission_denials: [] }; } });
-    R.check('[RS-07] --owns: 작업 기록에 남고 · 작업자 환경에 HARNESS_OWNS(JSON) · 지시문에 소유 경로와 "밖은 DECISIONS.md 에"',
-      t8.status === 'done' && JSON.stringify(S.readTask(r5, t8.id).owns) === JSON.stringify(['src/billing/**', 'tests/billing/**']) && envSeen && envSeen.HARNESS_OWNS === JSON.stringify(['src/billing/**', 'tests/billing/**']) && /You may change only these paths: `src\/billing\/\*\*`, `tests\/billing\/\*\*`/.test(promptSeen) && /DECISIONS\.md` what must change/.test(promptSeen),
-      JSON.stringify({ status: t8.status, env: envSeen && envSeen.HARNESS_OWNS }));
-    let bad = null; try { await L.go({ ...quiet, root: r5, goal: 'x', owns: ['../other/**'], run: async o => ({ ok: true, session_id: o.newSessionId }) }); } catch (e) { bad = e; }
-    let bad2 = null; try { await L.go({ ...quiet, root: r5, goal: 'x', owns: ['C:/abs/**'], run: async o => ({ ok: true, session_id: o.newSessionId }) }); } catch (e) { bad2 = e; }
+    // RS-07 — 쓰기 소유권(PRD R3): start --owns → 작업 기록 · 잘못된 경로 거부
+    const t8 = Ln.start({ ...quiet, root: r5, goal: 'billing only', owns: ['src/billing/**', 'tests\\billing\\**'] });
+    R.check('[RS-07] --owns: 작업 기록에 남는다(경로 구분자는 / 로)', t8.status === 'open' && JSON.stringify(S.readTask(r5, t8.id).owns) === JSON.stringify(['src/billing/**', 'tests/billing/**']), JSON.stringify({ status: t8.status, owns: S.readTask(r5, t8.id).owns }));
+    let bad = null; try { Ln.start({ ...quiet, root: r5, goal: 'x', owns: ['../other/**'] }); } catch (e) { bad = e; }
+    let bad2 = null; try { Ln.start({ ...quiet, root: r5, goal: 'x', owns: ['C:/abs/**'] }); } catch (e) { bad2 = e; }
     R.check('[RS-07] --owns 는 저장소 안의 상대 경로만(.. · 절대 경로는 거부)', bad && bad.code === 'USAGE' && bad2 && bad2.code === 'USAGE', String(bad && bad.message));
-    const op = require('../../harness/lib/policy').claudeSettings([], [], 'open');
-    R.check('[RS-07] 작업자 설정: guard 훅이 Edit · Write · MultiEdit · NotebookEdit 도 거친다(소유 경로 강제)', /Edit\|Write\|MultiEdit\|NotebookEdit/.test(op.hooks.PreToolUse[0].matcher), op.hooks.PreToolUse[0].matcher);
-    // RS-08 — 남은 프로세스: 이 작업 worktree 경로가 명령줄에 있고 작업 시작 뒤 생긴 것만 끝낸다(실제 프로세스) — 다른 작업 · 시작 전 · 편집기는 그대로
-    const { spawn } = require('node:child_process');
-    const PID8 = 't-20261020-121212-beef', OTHER = 't-20261020-121212-bee0';
-    const wt8 = path.join(base, 'r8', '.harness-worktrees', PID8, 'x'), wt8o = path.join(base, 'r8', '.harness-worktrees', OTHER, 'x');
-    const enc8 = `C--r8--harness-worktrees-${PID8}`;   // Claude Code 가 작업 폴더 경로로 만드는 임시 폴더 이름 꼴
-    const keepAlive = 'setInterval(() => {}, 1e6)';
-    const before = spawn(process.execPath, ['-e', keepAlive, wt8], { stdio: 'ignore', windowsHide: true });
-    await new Promise(r => setTimeout(r, 1500));
-    const since8 = Date.now();
-    await new Promise(r => setTimeout(r, 1500));
-    const mineA = spawn(process.execPath, ['-e', keepAlive, wt8], { stdio: 'ignore', windowsHide: true });
-    const mineB = spawn(process.execPath, ['-e', keepAlive, path.join(base, enc8, 'tasks', 'b1.output')], { stdio: 'ignore', windowsHide: true });
-    const other = spawn(process.execPath, ['-e', keepAlive, wt8o], { stdio: 'ignore', windowsHide: true });
-    await new Promise(r => setTimeout(r, 1500));
-    const alive = pid => { try { process.kill(pid, 0); return true; } catch { return false; } };
-    const offEnv = process.env.HARNESS_PROC_CLEANUP; delete process.env.HARNESS_PROC_CLEANUP;   // 테스트 러너가 끈 것을 이 단언에서만 켠다
-    const k8 = Res.killStrays(PID8, { since: since8 + 60000 });   // since 는 1분 여유를 빼고 쓰므로 +1분 = 정확히 since8
-    if (offEnv !== undefined) process.env.HARNESS_PROC_CLEANUP = offEnv;
-    await new Promise(r => setTimeout(r, 1500));
-    const killedPids = k8.killed.map(x => x.pid).sort();
-    R.check('[RS-08] 이 작업 worktree 경로(그대로 · Claude 임시 폴더 꼴)를 가진, 작업 시작 뒤의 프로세스만 끝낸다 — 다른 작업 · 시작 전 프로세스는 남는다',
-      JSON.stringify(killedPids) === JSON.stringify([mineA.pid, mineB.pid].sort()) && !alive(mineA.pid) && !alive(mineB.pid) && alive(other.pid) && alive(before.pid) && !k8.residue.length,
-      JSON.stringify({ killed: killedPids, want: [mineA.pid, mineB.pid], other: alive(other.pid), before: alive(before.pid), residue: k8.residue }));
-    for (const c of [before, other]) { try { c.kill(); } catch { /* 이미 끝남 */ } }
-    const fakeList = [{ pid: 11, started: Date.now(), cmd: `"C:\\Program Files\\Microsoft VS Code\\Code.exe" ${wt8}` }, { pid: 12, started: Date.now(), cmd: `tail -f ${wt8}/log` }];
-    const killedFake = [];
-    Res.killStrays(PID8, { since: Date.now() - 1000, procs: () => fakeList, kill: pid => killedFake.push(pid) });
-    R.check('[RS-08] 사용자가 그 폴더를 연 편집기(Code 등)는 끝내지 않는다', JSON.stringify(killedFake) === '[12]', JSON.stringify(killedFake));
-
-    // RS-10 — 작업자가 끝나면 남긴 자손을 거둔다(명령줄에 경로가 없어도) — 작업자 역할의 node 가 끝나지 않는 손자를 띄우고 먼저 끝난다
-    const worker = path.join(base, 'worker10.js');
-    write(worker, "const { spawn } = require('child_process'); const g = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1e6)'], { stdio: 'ignore', detached: process.platform !== 'darwin', windowsHide: true }); g.unref(); console.log('GRAND ' + g.pid);\n");
-    const bystander = spawn(process.execPath, ['-e', keepAlive], { stdio: 'ignore', windowsHide: true });
-    const off10 = process.env.HARNESS_PROC_CLEANUP; delete process.env.HARNESS_PROC_CLEANUP;
-    // 손자는 새 세션으로(setsid) 나가 그룹을 벗어난다 — Windows 는 부모-자식 기록 · Linux 는 환경의 HARNESS_TASK_ID 로 거둔다. macOS 는 /proc 가 없어 그룹 안의 손자만(한계)
-    const p10 = await P.spawnCapture({ exe: process.execPath, args: [worker], cwd: base, env: { HARNESS_TASK_ID: 't-20261020-131313-cafe' }, reapTree: true, timeoutMs: 60000 });
-    if (off10 !== undefined) process.env.HARNESS_PROC_CLEANUP = off10;
-    const grand = Number((/GRAND (\d+)/.exec(p10.stdout) || [])[1]);
-    await new Promise(r => setTimeout(r, 1500));
-    R.check('[RS-10] 작업자가 끝나면 남긴 손자(경로 없는 대기 루프 꼴)를 거둔다 · 무관한 프로세스는 그대로',
-      grand > 0 && !alive(grand) && (p10.reaped || []).some(x => x.pid === grand) && alive(bystander.pid), JSON.stringify({ grand, alive: grand && alive(grand), reaped: p10.reaped, bystander: alive(bystander.pid) }));
-    try { bystander.kill(); } catch { /* 이미 끝남 */ }
-    if (grand && alive(grand)) { try { process.kill(grand); } catch { /* 이미 끝남 */ } }
 
     // RS-09 — CLI 는 할 일을 마치면 남은 핸들이 있어도 끝난다(분리된 go 가 done 뒤 24분 살아 있던 실측) — 새는 타이머를 미리 심어 재현
     const leak = path.join(base, 'leak.js'); write(leak, 'setInterval(() => {}, 1000);\n');
     const r9 = repo({ 'a.txt': 'x\n' }), t9 = Date.now();
     const cli9 = spawnSync(process.execPath, ['-r', leak, path.join(__dirname, '..', '..', 'harness', 'cli.js'), 'status', '--root', r9], { encoding: 'utf8', windowsHide: true, timeout: 40000 });
     R.check('[RS-09] 남은 핸들(타이머)이 있어도 CLI 는 일을 마치고 몇 초 안에 끝난다(종료 코드 유지)', !cli9.error && cli9.status === 0 && Date.now() - t9 < 25000, JSON.stringify({ err: cli9.error && cli9.error.code, status: cli9.status, ms: Date.now() - t9, out: (cli9.stdout || '').slice(0, 120) }));
-    R.check('[RS-06] 작업자 지시문: 쓰레기를 남기지 않는 곳($TEMP · $HARNESS_DATA_NS)을 알려 준다', /\$HARNESS_DATA_NS/.test(require('../../harness/lib/prompts').AUTONOMY || '') || /\$HARNESS_DATA_NS/.test(JSON.stringify(require('../../harness/lib/prompts'))), 'AUTONOMY');
-    // RS-11 — [자동 이슈 #34] 작업 시작 때 이미지 목록을 찍고, 끝날 때 원래 있던 이미지가 사라졌으면 알아본다(작업이 만든 새 이미지는 빼고)
-    { const imgs = ['app:latest@aaa', 'db:16@bbb'];
-      const run11 = (cmd, args) => args[0] === 'version' ? { code: 0, out: '27.0', err: '' } : args[0] === 'images' ? { code: 0, out: imgs.join('\n') + '\n', err: '' } : { code: 0, out: '', err: '' };
-      const task11 = {}; Res.snapshotImages(task11, { run: run11 });
-      imgs.splice(0, 1); imgs.push('harness-t-1-built:latest@ccc');   // 작업 중: app 이 사라지고 작업이 새 이미지를 만들었다
-      const gone11 = Res.removedImages(task11, { run: run11 });
-      R.check('[RS-11] (#34) 작업 전부터 있던 이미지가 사라지면 알아본다 — app:latest 만(작업이 만든 새 이미지는 아님)', JSON.stringify(gone11) === JSON.stringify(['app:latest@aaa']) && (task11.images_before || []).length === 2, JSON.stringify({ gone11, before: task11.images_before }));
-      const P11 = require('../../harness/lib/prompts');
-      R.check('[RS-11] (#34) 작업자 지시문: 이 작업이 만들지 않은 이미지 · 컨테이너 · 볼륨은 도구 · 스크립트를 거쳐서라도 지우지 마라', /Never remove Docker images, containers or volumes this task did not create/.test(P11.AUTONOMY)); }
+
+    // RS-12 — 작업마다의 포트 구역: 장부(<common>/harness/ports.json) · 같은 작업은 같은 구역 · 다른 작업은 겹치지 않음 · 끝난/없는 작업은 회수
+    { const r12 = repo({ 'a.txt': 'x\n' });
+      const A = 't-20261025-090000-aaaa', B = 't-20261025-090000-bbbb', C = 't-20261025-090000-cccc', D = 't-20261025-090000-dddd';
+      const mk = (id, status) => S.writeTask(r12, S.newTask({ id, status }));
+      mk(A, 'open'); mk(B, 'done');
+      const a1 = Res.portBlock(r12, A), b1 = Res.portBlock(r12, B), a2 = Res.portBlock(r12, A);
+      const ledgerFile = path.join(S.paths(r12).harnessDir, 'ports.json');
+      const disjoint = (x, y) => x.base + x.count <= y.base || y.base + y.count <= x.base;
+      R.check('[RS-12] 기본 구역: 20000 부터 20개씩 · 같은 작업은 다시 물어도 같은 구역 · 다른 작업은 겹치지 않는 다음 구역',
+        a1.base === 20000 && a1.count === 20 && JSON.stringify(a2) === JSON.stringify(a1) && b1.base === 20020 && b1.count === 20 && disjoint(a1, b1), JSON.stringify({ a1, a2, b1 }));
+      const led = JSON.parse(fs.readFileSync(ledgerFile, 'utf8'));
+      R.check('[RS-12] 장부는 <git-common-dir>/harness/ports.json 의 { id: { base, count, at } } · portsOf 가 그대로 보인다',
+        led[A] && led[A].base === 20000 && led[A].count === 20 && typeof led[A].at === 'string' && led[B].base === 20020 && JSON.stringify(Object.keys(Res.portsOf(r12)).sort()) === JSON.stringify([A, B]), JSON.stringify(led));
+      // A 가 받아들여지면(accepted) · 기록이 없는 작업(D)의 구역은 다음 잡기 때 풀린다 — 가장 낮은 빈 구역(20000)을 C 가 받는다
+      const raw = JSON.parse(fs.readFileSync(ledgerFile, 'utf8')); raw[D] = { base: 20040, count: 20, at: 'x' }; fs.writeFileSync(ledgerFile, JSON.stringify(raw));
+      mk(A, 'accepted'); mk(C, 'open');
+      const c1 = Res.portBlock(r12, C), led2 = Res.portsOf(r12);
+      R.check('[RS-12] 끝난(accepted) 작업 · 기록이 없는 작업의 구역은 회수되고 가장 낮은 빈 구역을 준다 · 살아 있는(done) 작업은 그대로',
+        c1.base === 20000 && !led2[A] && !led2[D] && led2[B] && led2[B].base === 20020 && led2[C].base === 20000, JSON.stringify({ c1, led2 }));
+      // envFor: 작업 worktree 경로면 포트 변수 · 아니면 없음
+      const e12 = Res.envFor(path.join(r12, '.harness-worktrees', C, 'src')), en = Res.envFor(r12);
+      R.check('[RS-12] envFor: worktree 안이면 HARNESS_PORT_BASE · HARNESS_PORT_COUNT(그 작업의 구역) · 밖이면 아무것도 없다',
+        e12.HARNESS_PORT_BASE === '20000' && e12.HARNESS_PORT_COUNT === '20' && e12.HARNESS_TASK_ID === C && !('HARNESS_PORT_BASE' in en) && JSON.stringify(en) === '{}', JSON.stringify({ e12, en }));
+      const eNoRepo = Res.envFor(path.join(base, 'not-a-repo', '.harness-worktrees', C));
+      R.check('[RS-12] 장부를 쓸 수 없는 곳(git 저장소 아님)이면 포트 변수만 빠진다 — 던지지 않는다', eNoRepo.HARNESS_TASK_ID === C && !('HARNESS_PORT_BASE' in eNoRepo), JSON.stringify(eNoRepo));
+      // 열린 작업의 구역은 장부에 남고(accept 때 검사가 쓴다) · 치울 때(release)는 풀린다
+      const tC = S.readTask(r12, C);
+      const held = Res.portsOf(r12)[C];
+      const relC = Res.release(r12, tC, { run: fakeDocker({ up: false }).run, cleanup: { command: '' } });
+      R.check('[RS-12] 열린 작업의 구역은 장부에 남고 · release 가 푼다 · 다시 풀어도 null',
+        held && held.base === 20000 && !Res.portsOf(r12)[C] && relC.ports && relC.ports.base === 20000 && Res.freePorts(r12, C) === null, JSON.stringify({ held, ports: relC.ports, led: Res.portsOf(r12) }));
+      // 프로젝트 설정: port_range · port_block — 구역이 다 차면 PORTS_EXHAUSTED · envFor 는 포트 변수만 뺀다
+      const r13 = repo({ 'AGENTS.md': '# p\n\n```yaml\nport_range: "30000-30059"\nport_block: 30\n```\n' });
+      const X = 't-20261025-091000-0001', Y = 't-20261025-091000-0002', Z = 't-20261025-091000-0003';
+      for (const id of [X, Y, Z]) S.writeTask(r13, S.newTask({ id, status: 'open' }));
+      const x1 = Res.portBlock(r13, X), y1 = Res.portBlock(r13, Y);
+      let ex = null; try { Res.portBlock(r13, Z); } catch (e) { ex = e; }
+      const eZ = Res.envFor(path.join(r13, '.harness-worktrees', Z));
+      R.check('[RS-12] yaml port_range · port_block 을 따른다 · 다 차면 PORTS_EXHAUSTED · envFor 는 그때 포트 변수만 뺀다',
+        x1.base === 30000 && x1.count === 30 && y1.base === 30030 && ex && ex.code === 'PORTS_EXHAUSTED' && eZ.HARNESS_TASK_ID === Z && !('HARNESS_PORT_BASE' in eZ), JSON.stringify({ x1, y1, ex: ex && ex.code, eZ: eZ.HARNESS_PORT_BASE }));
+      // 두 프로세스가 동시에 잡아도 겹치지 않는다(잠금 아래 장부 쓰기)
+      const r14 = repo({ 'a.txt': 'x\n' });
+      const idsP = n => Array.from({ length: 6 }, (_, i) => `t-20261025-092000-${n}${String(i).padStart(3, '0')}`);
+      const ids1 = idsP('a'), ids2 = idsP('b');
+      for (const id of [...ids1, ...ids2]) S.writeTask(r14, S.newTask({ id, status: 'open' }));
+      const script = path.join(base, 'ports-child.js');
+      write(script, `const Res = require(${JSON.stringify(path.join(__dirname, '..', '..', 'harness', 'lib', 'resources.js'))});\nconst out = {}; for (const id of process.argv.slice(3)) out[id] = Res.portBlock(process.argv[2], id);\nconsole.log(JSON.stringify(out));\n`);
+      const runChild = list => new Promise(res => { const c = spawn(process.execPath, [script, r14, ...list], { windowsHide: true }); let o = ''; c.stdout.on('data', d => { o += d; }); c.on('close', code => res({ code, o })); });
+      const [p1, p2] = await Promise.all([runChild(ids1), runChild(ids2)]);
+      let got = {}; try { got = { ...JSON.parse(p1.o), ...JSON.parse(p2.o) }; } catch { /* 아래에서 실패로 */ }
+      const blocks = Object.values(got), ledP = Res.portsOf(r14);
+      const allDisjoint = blocks.every((x, i) => blocks.every((y, j) => i === j || disjoint(x, y)));
+      R.check('[RS-12] 두 프로세스가 동시에 12개 작업의 구역을 잡아도 서로 겹치지 않고 장부에 모두 남는다',
+        p1.code === 0 && p2.code === 0 && blocks.length === 12 && allDisjoint && Object.keys(ledP).length === 12 && Object.entries(got).every(([id, b]) => ledP[id] && ledP[id].base === b.base),
+        JSON.stringify({ c1: p1.code, c2: p2.code, got, led: Object.keys(ledP).length })); }
   } catch (e) { R.check('예외 없이 끝난다', false, String(e && e.stack || e).slice(0, 900)); }
   finally { try { fs.rmSync(base, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }); } catch { /* 정리 실패는 결과와 무관 */ } }
   R.done();

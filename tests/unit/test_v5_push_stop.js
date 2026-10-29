@@ -1,13 +1,12 @@
 'use strict';
-// push · stop — 버그 2026-10-01(Python 서비스 저장소) 두 건의 공식 경로.
+// push — 버그 2026-10-01(Python 서비스 저장소)의 공식 경로.
 //   push: guard 가 에이전트의 git push 를 무조건 막는데 AGENTS.md 는 "명시한 뒤에만" 이라 적었다 → 좁힌 하네스 명령으로 허락의 길.
-//   stop: 실행 중 작업을 멈출 공식 방법이 없어 셸을 죽였고, 작업이 OWNER DEAD 로 남았다.
+//   [v7 Light] stop(무인 작업 멈추기)은 무인 작업자와 함께 빠졌다 — ST-* 를 빼고, 뺀 명령이 exit 2 와 대체 명령을 알리는지(RM-*)를 본다.
 const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
-const { spawn, spawnSync } = require('node:child_process');
+const { spawnSync } = require('node:child_process');
 const { makeReporter } = require('../run.js');
-const Push = require('../../harness/lib/push.js'), Stop = require('../../harness/lib/stop.js');
-const S = require('../../harness/lib/state'), I = require('../../harness/lib/integrate');
-const R = makeReporter('push · stop — 허락의 길과 멈추는 길');
+const Push = require('../../harness/lib/push.js');
+const R = makeReporter('push — 허락의 길 · v7 에서 뺀 명령');
 const base = fs.mkdtempSync(path.join(os.tmpdir(), 'harness-v5-pushstop-'));
 const CLI = path.resolve(__dirname, '..', '..', 'harness', 'cli.js');
 const git = (cwd, ...a) => { const r = spawnSync('git', a, { cwd, encoding: 'utf8', windowsHide: true }); return (r.stdout || '').trim(); };
@@ -63,43 +62,15 @@ const cfg = d => { git(d, 'config', 'user.name', 't'); git(d, 'config', 'user.em
     let e11 = null; try { Push.push({ root: a, remote: 'origin', tag: 'v9.9.9' }); } catch (e) { e11 = e; }
     R.check('[PS-11] 로컬에 없는 태그 → USAGE', e11 && e11.code === 'USAGE' && /no such tag/.test(e11.message), e11 && e11.message);
 
-    // ── stop ──
-    const r = path.join(base, 'repo');
-    fs.mkdirSync(r); git(r, 'init', '-q', '-b', 'main'); cfg(r);
-    write(path.join(r, 'a.txt'), 'a\n'); git(r, 'add', '-A'); git(r, 'commit', '-qm', 'init');
-    const id = 't-20261001-000001-beef', P = S.taskPaths(r, id);
-    git(r, 'worktree', 'add', '-q', '-b', P.branch, P.wt, 'main');
-    write(path.join(P.wt, 'wip.txt'), 'half done\n');
-    const owner = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { stdio: 'ignore', windowsHide: true });
-    await new Promise(res => setTimeout(res, 300));
-    S.writeTask(r, S.newTask({ id, goal: 'g', runtime: 'claude', model: 'opus', base_branch: 'main', base_commit: git(r, 'rev-parse', 'HEAD'), branch: P.branch, worktree: P.wt,
-      owner: { pid: owner.pid, host: os.hostname(), heartbeat_at: new Date().toISOString() }, caps: { budget_usd: 1, wall_min: 10, max_continuations: 1 } }));
-    const t0 = S.readTask(r, id); t0.status = 'running'; S.writeTask(r, t0);
-    const refusedCancel = await I.cancel({ log: () => {}, root: r, id });
-    R.check('[ST-01] 주인이 살아 있으면 cancel 은 거부하고 stop 을 안내한다', refusedCancel.refused && /harness\/cli\.js stop/.test(refusedCancel.reason), refusedCancel.reason);
-    const st = spawnSync(process.execPath, [CLI, 'stop', id, '--root', r], { encoding: 'utf8', windowsHide: true, timeout: 60000 });
-    const t1 = S.readTask(r, id);
-    R.check('[ST-02] stop: 주인 프로세스 트리를 끝내고 interrupted 로 · exit 0', st.status === 0 && !S.pidAlive(owner.pid) && t1.status === 'interrupted' && !t1.owner, `${st.status} ${st.stdout} ${st.stderr}`);
-    R.check('[ST-03] stop: 진행 중 작업을 결과 브랜치에 커밋한다(메인 브랜치는 그대로)', /wip\.txt/.test(git(r, 'show', '--name-only', '--format=', P.branch)) && git(r, 'log', '-1', '--format=%s', 'main') === 'init', git(r, 'log', '-2', '--format=%s', P.branch));
-    const c2 = await I.cancel({ log: () => {}, root: r, id });
-    R.check('[ST-04] stop 뒤 cancel 은 평소처럼 된다(작업물은 태그에)', c2.status === 'cancelled' && !fs.existsSync(P.wt) && !!git(r, 'tag', '-l', `harness/cancelled/${id}`), JSON.stringify({ s: c2.status, r: c2.reason }));
-
-    // ── stop 은 작업자까지 끝낸다 — POSIX 에서 작업자(claude)는 detached(자기 프로세스 그룹)로 뜬다 ──
-    //   [Linux 실측 2026-10-02] go 의 pid 만 죽이면 작업자는 살아남아 worktree 를 계속 고쳤다.
-    const id5 = 't-20261001-000002-cafe', P5 = S.taskPaths(r, id5);
-    git(r, 'worktree', 'add', '-q', '-b', P5.branch, P5.wt, 'main');
-    const kidFile = path.join(base, 'kid.pid');
-    const owner5 = spawn(process.execPath, ['-e', `const c=require('child_process').spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{detached:process.platform!=='win32',stdio:'ignore',windowsHide:true});require('fs').writeFileSync(${JSON.stringify(kidFile)},String(c.pid));setInterval(()=>{},1000)`], { stdio: 'ignore', windowsHide: true });
-    for (let i = 0; i < 50 && !fs.existsSync(kidFile); i++) await new Promise(res => setTimeout(res, 100));
-    const kid = Number(fs.readFileSync(kidFile, 'utf8'));
-    S.writeTask(r, { ...S.newTask({ id: id5, goal: 'g', runtime: 'claude', model: 'opus', base_branch: 'main', base_commit: git(r, 'rev-parse', 'HEAD'), branch: P5.branch, worktree: P5.wt,
-      owner: { pid: owner5.pid, host: os.hostname(), heartbeat_at: new Date().toISOString() }, caps: { budget_usd: 1, wall_min: 10, max_continuations: 1 } }), status: 'running' });
-    const st5 = spawnSync(process.execPath, [CLI, 'stop', id5, '--root', r], { encoding: 'utf8', windowsHide: true, timeout: 60000 });
-    let kidAlive = S.pidAlive(kid);
-    for (let i = 0; i < 20 && kidAlive; i++) { await new Promise(res => setTimeout(res, 200)); kidAlive = S.pidAlive(kid); }
-    R.check('[ST-05] stop 은 주인의 자손(따로 그룹을 만든 작업자 포함)까지 끝낸다', st5.status === 0 && !kidAlive, `${st5.status} kid ${kid} alive=${kidAlive} ${st5.stdout}`);
-    if (kidAlive) { try { process.kill(kid, 'SIGKILL'); } catch { /* 이미 끝남 */ } }
-    try { owner.kill(); } catch { /* 이미 끝남 */ }
+    // ── v7 에서 뺀 명령: exit 2 · 무엇으로 바뀌었는지 알린다(옛 안내를 따르는 세션이 있다) ──
+    const removedCli = (...args) => spawnSync(process.execPath, [CLI, ...args, '--root', a], { encoding: 'utf8', windowsHide: true, timeout: 60000 });
+    const go = removedCli('go', 'x');
+    R.check('[RM-01] CLI go x: exit 2 · 뺐다고 알리고 대체 명령(start · claude --bg)을 적는다 · 작업을 만들지 않는다',
+      go.status === 2 && /pilot go: removed in v7/.test(go.stderr) && /use start "<goal>"/.test(go.stderr) && /claude --bg/.test(go.stderr) && !fs.existsSync(path.join(a, '.harness-worktrees')),
+      `${go.status} ${go.stderr.slice(0, 300)}`);
+    const gone = [['resume', /use start --from <id>/], ['stop', /pilot stop: removed in v7/], ['factory', /use several lanes \(start\) \+ batch/], ['cleanup-legacy', /use gc/], ['metrics', /pilot metrics: removed in v7/]]
+      .map(([cmd, re]) => { const r = removedCli(cmd, 't-20261001-000000-abcd'); return [cmd, r.status === 2 && re.test(r.stderr), r.status]; });
+    R.check('[RM-02] resume · stop · factory · cleanup-legacy · metrics 도 exit 2 · 뺐다는 말과(있으면) 대체 명령', gone.every(x => x[1]), JSON.stringify(gone));
   } catch (e) { R.check('예외 없이 끝난다', false, String(e && e.stack || e).slice(0, 800)); }
   finally { try { fs.rmSync(base, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }); } catch { /* 무시 */ } }
   R.done();

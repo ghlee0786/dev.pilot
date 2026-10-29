@@ -1,6 +1,7 @@
 'use strict';
 // v5 상태 — 경로 · id · 원자 쓰기 · mkdir 잠금(죽은 주인 빼앗기 · 산 주인 거부 · 고아 잠금) · 동시 worktree 생성 직렬화
-//   · heartbeat · .worktreeinclude 복사 · exclude · 커밋 신원 폴백 · index.lock 경합 재시도.
+//   · .worktreeinclude 복사 · exclude · 커밋 신원 폴백 · index.lock 경합 재시도.
+//   [v7 Light] heartbeat(무인 작업자의 주인 갱신 · startHeartbeat · ownerRecord)가 빠져 ST-07 을 뺐다.
 const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
 const { spawn, spawnSync } = require('node:child_process');
 const { makeReporter } = require('../run.js');
@@ -160,19 +161,6 @@ function runChildren(n, script, env) {
     const ex = fs.readFileSync(path.join(repoC, '.git', 'info', 'exclude'), 'utf8');
     R.check('[ST-06] .harness-worktrees/ 가 .git/info/exclude 에 한 번만 등록된다', (ex.match(/^\.harness-worktrees\/$/gm) || []).length === 1, ex);
     R.check('[ST-06] 메인 체크아웃 git status 에 worktree 폴더가 보이지 않는다', git(repoC, ['status', '--porcelain']) === '');
-
-    // ── heartbeat ─────────────────────────────────────────────────────
-    const hbTask = S.newTask({ id: S.newId(), goal: 'hb', owner: { ...S.ownerRecord(), heartbeat_at: '2000-01-01T00:00:00.000Z' } });
-    S.writeTask(repo, hbTask);
-    const hl = S.acquire(repo, `task-${hbTask.id}`);
-    const firstAt = S.lockOwner(repo, `task-${hbTask.id}`).at;
-    await wait(20);
-    const hb = S.startHeartbeat(repo, hbTask.id, hl, 60, hbTask);
-    await wait(250);
-    hb.stop();
-    const hbBack = S.readTask(repo, hbTask.id);
-    R.check('[ST-07] heartbeat 가 task.owner.heartbeat_at 과 잠금 at 을 갱신한다', hbBack.owner.heartbeat_at > '2020' && S.lockOwner(repo, `task-${hbTask.id}`).at > firstAt, JSON.stringify(hbBack.owner));
-    hl.release();
 
     // ── .worktreeinclude ─────────────────────────────────────────────
     const repoI = mkRepo('inc', { '.gitignore': '.env\nsecret/\n*.log\n', '.worktreeinclude': '# copy these\n.env\nsecret/\ntracked.txt\n', 'tracked.txt': 'tracked\n' });

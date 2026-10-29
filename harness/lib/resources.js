@@ -20,13 +20,82 @@ const dataNs = id => `harness_${String(id).replace(/^t-/, '').replace(/[^0-9a-z]
 const composeProject = id => `harness-${id}`;
 
 // 작업 worktree 안에서 도는 프로세스(작업자 · 하네스 검사)의 환경 — worktree 밖이면 빈 객체
+//   + 작업마다의 포트 구역(HARNESS_PORT_BASE · HARNESS_PORT_COUNT) — 처음 쓸 때 잡는다. 못 잡으면 포트 변수만 뺀다(던지지 않는다).
 function envFor(cwd) {
   const m = WT_RE.exec(String(cwd || ''));
   if (!m) return {};
-  const id = m[2], dir = tmpDirFor(m[1], id);
-  try { fs.mkdirSync(dir, { recursive: true }); } catch { /* 못 만들면 TEMP 를 바꾸지 않는다 */ return { COMPOSE_PROJECT_NAME: composeProject(id), HARNESS_TASK_ID: id, HARNESS_DATA_NS: dataNs(id) }; }
-  return { COMPOSE_PROJECT_NAME: composeProject(id), TEMP: dir, TMP: dir, TMPDIR: dir, HARNESS_TMP_BASE: baseTmp(), HARNESS_TASK_ID: id, HARNESS_DATA_NS: dataNs(id), ...BUILD_NO_SERVERS };
+  const id = m[2], dir = tmpDirFor(m[1], id), ports = portEnv(m[1], id);
+  try { fs.mkdirSync(dir, { recursive: true }); } catch { /* 못 만들면 TEMP 를 바꾸지 않는다 */ return { COMPOSE_PROJECT_NAME: composeProject(id), HARNESS_TASK_ID: id, HARNESS_DATA_NS: dataNs(id), ...ports }; }
+  return { COMPOSE_PROJECT_NAME: composeProject(id), TEMP: dir, TMP: dir, TMPDIR: dir, HARNESS_TMP_BASE: baseTmp(), HARNESS_TASK_ID: id, HARNESS_DATA_NS: dataNs(id), ...ports, ...BUILD_NO_SERVERS };
 }
+function portEnv(root, id) {
+  try { const b = portBlock(root, id); return { HARNESS_PORT_BASE: String(b.base), HARNESS_PORT_COUNT: String(b.count) }; }
+  catch { return {}; }
+}
+
+// ── 포트 구역 ────────────────────────────────────────────────────────────────
+//   [2026-10-25 사용자 "구조적으로 막을 수 있다"] 병렬 작업이 같은 포트(개발 서버 · 시험 DB)를 잡아 서로 깨뜨렸다 — 작업마다 겹치지 않는
+//   구역(기본 20000-39999 에서 20개씩)을 장부(<git-common-dir>/harness/ports.json)에 잡아 준다. 장부 쓰기는 잠금 아래 · 원자적으로.
+//   잡기 전에 기록이 없거나 끝난(accepted · cancelled) 작업의 구역을 푼다. 작업 끝(onTaskEnd)에는 남긴다 — done 작업은 accept 때 다시 검사한다.
+//   프로젝트 yaml: port_range: "20000-39999" · port_block: 20 (없거나 이상하면 기본).
+const PORT_FINAL = new Set(['accepted', 'cancelled']);
+const portsFile = root => path.join(require('./state').paths(root).harnessDir, 'ports.json');
+const okEntry = e => !!e && typeof e === 'object' && Number.isInteger(e.base) && Number.isInteger(e.count) && e.count > 0;
+function readLedger(file) {
+  const raw = require('./state').readJson(file, null), led = {};
+  if (raw && typeof raw === 'object' && !Array.isArray(raw)) for (const [k, v] of Object.entries(raw)) if (okEntry(v)) led[k] = v;
+  return led;
+}
+function portConf(root) {
+  let lo = 20000, hi = 39999, count = 20;
+  try {
+    const K = require('./checks');
+    const r = /^\s*(\d+)\s*-\s*(\d+)\s*$/.exec(K.yamlString(root, 'port_range') || '');
+    if (r && +r[1] >= 1024 && +r[2] <= 65535 && +r[1] < +r[2]) { lo = +r[1]; hi = +r[2]; }
+    const b = parseInt(K.yamlString(root, 'port_block') || '', 10);
+    if (b >= 1 && b <= hi - lo + 1) count = b;
+  } catch { /* 설정을 못 읽으면 기본 */ }
+  return { lo, hi, count };
+}
+// → { base, count } — 이 작업의 구역(있으면 그대로 · 없으면 가장 낮은 빈 구역). 빈 구역이 없으면 PORTS_EXHAUSTED.
+function portBlock(root, id) {
+  const S = require('./state');
+  if (!S.validId(id)) throw Object.assign(new Error(`invalid task id: ${id}`), { code: 'USAGE' });
+  const file = portsFile(root), have = readLedger(file)[id];
+  if (have) return { base: have.base, count: have.count };   // 이미 잡았으면 잠그지 않는다(작업자 · 검사가 띄울 때마다 불린다)
+  return S.withLockSync(root, 'ports', () => {
+    const led = readLedger(file);
+    if (led[id]) return { base: led[id].base, count: led[id].count };
+    let changed = false;
+    for (const k of Object.keys(led)) {
+      if (k === id) continue;
+      const t = S.validId(k) ? S.readTask(root, k) : null;
+      if (!t || PORT_FINAL.has(t.status)) { delete led[k]; changed = true; }
+    }
+    const { lo, hi, count } = portConf(root);
+    const taken = Object.values(led).map(e => [e.base, e.base + e.count]);
+    for (let b = lo; b + count - 1 <= hi;) {
+      const hit = taken.find(([s, e]) => b < e && s < b + count);
+      if (!hit) { led[id] = { base: b, count, at: S.nowIso() }; S.writeJsonAtomic(file, led); return { base: b, count }; }
+      b = Math.max(hit[1], b + 1);
+    }
+    if (changed) S.writeJsonAtomic(file, led);
+    throw Object.assign(new Error(`no free port block of ${count} in ${lo}-${hi} (${Object.keys(led).length} tasks hold blocks)`), { code: 'PORTS_EXHAUSTED' });
+  }, { waitMs: 15000 });
+}
+// 이 작업의 구역을 푼다 — 풀었으면 그 구역, 없었으면 null
+function freePorts(root, id) {
+  const S = require('./state'), file = portsFile(root);
+  if (!readLedger(file)[id]) return null;
+  return S.withLockSync(root, 'ports', () => {
+    const led = readLedger(file), had = led[id];
+    if (!had) return null;
+    delete led[id]; S.writeJsonAtomic(file, led);
+    return { base: had.base, count: had.count };
+  }, { waitMs: 15000 });
+}
+// 장부 그대로(상태 표시용) — { "<id>": { base, count, at } }
+const portsOf = root => { try { return readLedger(portsFile(root)); } catch { return {}; } };
 // [2026-10-21 자동 이슈 #25 · #26] 작업자 · 검사의 dotnet test/build 가 MSBuild 작업 노드(/nodemode:1)를 수백 개씩 띄우고, 부모가 끝나면
 //   고아로 남아 1,000개 · 수십 GB 까지 쌓였다(작업 끝 점검은 부모를 잃은 노드를 작업 소속으로 알아보지 못한다). 처음부터 띄우지 않게 한다:
 //   노드 재사용 끔 · MSBuild 서버 끔 · Roslyn 컴파일러 서버(VBCSCompiler) 끔. 빌드는 조금 느려지지만 남는 프로세스가 없다.
@@ -118,102 +187,19 @@ function defaultProcs() {
   if (r.error || r.status !== 0) return null;
   return String(r.stdout || '').split(/\r?\n/).map(l => /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(\S+)\s+(.*)$/.exec(l)).filter(m => m && !/^Z/.test(m[4])).map(m => { const e = etimeSec(m[5]); return { pid: Number(m[1]), ppid: Number(m[2]), pgid: Number(m[3]), started: e == null ? null : now - e * 1000, cmd: m[6] }; });
 }
-// 끝난 작업자(모델 세션)의 남은 자손을 거둔다 — [2026-10-20 실측 · 평가] 작업자 세션이 띄운 bash 대기 루프(Windows 에 없는 pgrep 을 기다림)가
-//   세션이 끝난 뒤에도 남아 worktree 를 현재 폴더로 붙들었다(명령줄에 경로가 없어 경로로는 못 잡는다).
-//   Windows: 부모가 죽어도 자식의 ParentProcessId 는 남는다 — 작업자 pid 에서 부모-자식으로 따라간다(작업자가 시작된 뒤 생긴 것만 · pid 재사용 방지).
-//   POSIX: 작업자는 자기 프로세스 그룹으로 띄운다(proc.spawnCapture detached) — 그룹째 끝낸 뒤, 부모-자식으로 남은 것도.
-function reapDescendants(rootPid, sinceMs, o) {
-  const res = { killed: [], residue: [] };
-  if (!rootPid || (!(o && o.procs) && process.env.HARNESS_PROC_CLEANUP === 'off')) return res;
-  const kill = (o && o.kill) || defaultKill;
-  const list = (o && o.procs ? o.procs() : defaultProcs()) || [];   // 먼저 뜬다 — 그룹째 끝내면 누가 있었는지 기록할 수 없다
-  const since = (sinceMs || 0) - 2000, tree = new Set([rootPid]);
-  for (const p of list) if (p.pgid === rootPid && p.pid !== process.pid) tree.add(p.pid);   // POSIX: 작업자의 프로세스 그룹
-  if (!IS_WIN && !(o && o.procs)) { try { process.kill(-rootPid, 'SIGKILL'); } catch { /* 그룹이 이미 없다 */ } }
-  for (let grew = true; grew;) {
-    grew = false;
-    for (const p of list) if (!tree.has(p.pid) && tree.has(p.ppid) && p.pid !== process.pid && (p.started == null || p.started >= since)) { tree.add(p.pid); grew = true; }
-  }
-  // Linux: 새 세션으로 나가(setsid) 그룹을 벗어나고 init 에 맡겨진 것도 — 환경의 HARNESS_TASK_ID(그 작업 고유)는 물려받는다. macOS 는 /proc 가 없어 그룹 · 부모 관계까지만.
-  const taskId = o && o.taskId && /^t-\d{8}-\d{6}-[0-9a-f]{4}$/.test(o.taskId) ? o.taskId : null;
-  if (taskId && !IS_WIN && !(o && o.procs)) {
-    let pids = []; try { pids = fs.readdirSync('/proc').filter(x => /^\d+$/.test(x)).map(Number); } catch { /* /proc 없음(macOS) */ }
-    const byPid = new Map(list.map(p => [p.pid, p]));
-    for (const pid of pids) {
-      if (pid === process.pid || pid === process.ppid || tree.has(pid)) continue;
-      let env = ''; try { env = fs.readFileSync(`/proc/${pid}/environ`, 'latin1'); } catch { continue; }
-      const p = byPid.get(pid);
-      if (env.split('\0').includes(`HARNESS_TASK_ID=${taskId}`) && (!p || p.started == null || p.started >= since)) tree.add(pid);
-    }
-  }
-  const byPid = new Map(list.map(p => [p.pid, p]));
-  for (const pid of tree) if (pid !== rootPid) { kill(pid); res.killed.push({ pid, cmd: String((byPid.get(pid) || {}).cmd || '').slice(0, 160) }); }
-  return res;
-}
 function defaultKill(pid) {
   if (IS_WIN) spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true, timeout: 30000 });
   else { try { process.kill(pid, 'SIGKILL'); } catch { /* 이미 끝남 */ } }
 }
-// → { killed: [{ pid, cmd }], residue: [] } — o.since: 작업 시작 시각(ms) · o.procs() · o.kill(pid): 테스트가 끼우는 가짜
-function killStrays(id, o) {
-  const res = { killed: [], residue: [] };
-  if (!(o && o.procs) && process.env.HARNESS_PROC_CLEANUP === 'off') return res;
-  const got = o && o.procs ? o.procs() : defaultProcs();
-  if (!got) { res.residue.push('process list unavailable — leftover processes of this task were not checked'); return res; }
-  const list = got;
-  const mine = new RegExp(`harness-worktrees(?:[\\\\/]|-+)${String(id).replace(/[^\w-]/g, '')}(?![0-9A-Za-z])`, 'i');
-  const since = o && o.since ? o.since - 60000 : null;   // 시계 오차 1분
-  const hits = list.filter(p => p.pid !== process.pid && p.pid !== process.ppid && mine.test(p.cmd || '') && !USER_APPS.test(`${p.cmd} `)
-    && (since == null || (p.started != null && p.started >= since)));
-  for (const p of hits) { (o && o.kill ? o.kill : defaultKill)(p.pid); res.killed.push({ pid: p.pid, cmd: String(p.cmd).slice(0, 160) }); }
-  if (hits.length) {
-    // 끝나는 데 걸리는 시간 — [2026-10-21 실측] 부하가 큰 Windows 에서 taskkill 뒤 0.5초 안에 사라지지 않아 남은 것으로 잘못 셌다.
-    //   Windows 는 최대 5초까지 존재 확인(process.kill 0)으로 기다린다. POSIX 는 좀비가 남아 보이므로 목록(좀비 제외)으로 다시 본다.
-    const sleep = ms => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-    const exists = pid => { try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } };
-    if (!(o && o.procs)) {
-      if (IS_WIN) { for (let i = 0; i < 20 && hits.some(p => exists(p.pid)); i++) sleep(250); }
-      else sleep(500);
-    }
-    const after = new Set(((o && o.procs ? o.procs() : (IS_WIN ? hits.filter(p => exists(p.pid)) : defaultProcs())) || []).map(p => p.pid));
-    for (const p of hits) if (after.has(p.pid)) res.residue.push(`process ${p.pid}: ${String(p.cmd).slice(0, 120)}`);
-  }
-  return res;
-}
 
-// 작업이 끝날 때(done · blocked · error · interrupted): 돌던 컨테이너 · 네트워크를 내리고 임시 폴더를 지운다(worktree 도 이때 지워진다).
-//   볼륨 · 이미지 · 프로젝트 정리 명령은 accept · cancel · gc 때 — 끝난 작업을 확인하거나 이어 갈 수 있게.
-// [2026-10-21 자동 이슈 #34] 작업자가 시뮬레이션 도구 자신의 정리 경로(이름으로 지우기)를 거쳐 메인 체크아웃의 이미지를 지웠다 —
-//   guard 는 명령 문자열만 보므로 도구 안쪽의 삭제는 막지 못한다. 작업 시작 때 이미지 목록(저장소:태그 · id)을 찍어 두고, 끝날 때
-//   원래 있던 것이 사라졌으면 기록 · 보고한다(되살리지는 못한다 — 다시 빌드할 것을 알린다).
-function imageList(run) {
-  run = run || defaultRun;
-  if (!dockerAvailable(run)) return null;
-  const r = run('docker', ['images', '--format', '{{.Repository}}:{{.Tag}}@{{.ID}}'], 30000);
-  return r.code === 0 ? ids(r.out).filter(x => !/^<none>:<none>@/.test(x)) : null;
-}
-function snapshotImages(task, o) { try { const l = imageList(o && o.run); if (l) task.images_before = l; } catch { /* docker 를 못 보면 비교하지 않는다 */ } }
-function removedImages(task, o) {
-  if (!Array.isArray(task.images_before)) return [];
-  const now = imageList(o && o.run); if (!now) return [];
-  const have = new Set(now);
-  return task.images_before.filter(x => !have.has(x));
-}
-function onTaskEnd(root, task, o) {
-  const gone = removedImages(task, o);
-  if (gone.length) task.images_removed = gone;
-  const p = killStrays(task.id, { since: Date.parse(task.created_at) || null, ...(o || {}) });   // 먼저 — 남은 프로세스가 임시 폴더 · 컨테이너를 붙들고 있으면 지워지지않는다
-  const d = teardownCompose(task.id, 'runtime', o && o.run);
-  const t = removeTmp(root, task.id);
-  return record(task, { at: 'end', procs: p, docker: d, tmp: t, residue: [...p.residue, ...d.residue, ...t.residue] });
-}
-// 작업을 치울 때(accept · cancel · gc): 전부 회수한다.
+// 작업을 치울 때(accept · cancel · gc): 전부 회수한다(포트 구역 포함).
 function release(root, task, o) {
   const d = teardownCompose(task.id, 'all', o && o.run);
   const c = runCleanupCommand(root, task.id, o && o.cleanup);
   const t = removeTmp(root, task.id);
+  let ports = null; try { ports = freePorts(root, task.id); } catch { /* 장부를 못 쓰면 다음 잡기가 끝난 작업으로 보고 푼다 */ }
   const residue = [...d.residue, ...t.residue, ...(c && !c.ok ? [`cleanup_command failed (exit ${c.exit_code}): ${c.command}`] : [])];
-  return record(task, { at: 'release', docker: d, cleanup: c, tmp: t, residue });
+  return record(task, { at: 'release', docker: d, cleanup: c, tmp: t, ports, residue });
 }
 function record(task, r) {
   task.resources = { tmp: null, ...(task.resources || {}), compose_project: composeProject(task.id), data_ns: dataNs(task.id), [`${r.at}_at`]: new Date().toISOString(), residue: r.residue };
@@ -221,4 +207,5 @@ function record(task, r) {
   return r;
 }
 
-module.exports = { snapshotImages, removedImages, envFor, tmpDirFor, dataNs, composeProject, repoKey, teardownCompose, killStrays, reapDescendants, listProcesses: defaultProcs, killProcess: defaultKill, runCleanupCommand, removeTmp, onTaskEnd, release, WT_RE };
+module.exports = { envFor, tmpDirFor, dataNs, composeProject, repoKey, teardownCompose, listProcesses: defaultProcs, killProcess: defaultKill, runCleanupCommand, removeTmp, release, WT_RE,
+  portBlock, freePorts, portsOf };

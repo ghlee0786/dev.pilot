@@ -5,6 +5,7 @@
 // 세션 파일(설계 §2 · §6): <git-common-dir>/harness/sessions/<session_id>.json
 //   { session_id, runtime: 'claude'|'codex', files: [저장소 상대 · 슬래시], updated_at, ...훅 전용 필드 }
 //   engine 의 status 는 앞의 네 필드만 읽는다. 나머지(stop_blocks 등)는 훅끼리의 기록이다.
+//   게시판(board.js): cwd · root(작업 트리 루트) · branch · goal(첫 요청 ≤ 200자) · last_seen · warned_sessions — 끝나면 ended_at(session-end).
 const fs = require('node:fs');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
@@ -219,6 +220,89 @@ function isHarnessWorktree(root) {
   return /[\\/]\.harness-worktrees[\\/]/i.test(root + path.sep);
 }
 
+// 가벼운 길(light lane) — `cli.js start` 가 만든 worktree 에서 **사람이 모는** 세션이 일한다(무인 작업자 없음 · task.mode 'light').
+//   그 세션은 메인 체크아웃의 세션처럼 기록하고 자기 파일을 커밋한다. → { id, task } 또는 null.
+const LANE_RE = /[\\/]\.harness-worktrees[\\/](t-\d{8}-\d{6}-[0-9a-f]{4})(?:-\d+)?[\\/]*$/i;
+function laneOf(info) {
+  if (!info || !info.root || !info.common) return null;
+  const m = LANE_RE.exec(String(info.root));
+  if (!m) return null;
+  const f = path.join(harnessDir(info.common), 'tasks', m[1], 'task.json');
+  let task = null;
+  for (const x of [f, f + '.bak']) { try { task = JSON.parse(fs.readFileSync(x, 'utf8')); break; } catch { /* 없거나 깨졌다 — 직전 판 */ } }
+  return task && typeof task === 'object' && task.mode === 'light' ? { id: m[1], task } : null;
+}
+// 대화형 훅이 손대지 않는 곳 — 무인 작업자의 worktree(가벼운 길은 아니다).
+function harnessOwned(info) { return !!info && isHarnessWorktree(info.root) && !laneOf(info); }
+
+// 세션 파일 전부를 그대로(훅 전용 필드 포함). state.readSessions 는 엔진용 네 필드만 남긴다 — 게시판(board · status)은 이것을 읽는다.
+function listSessions(common) {
+  const dir = path.join(harnessDir(common), 'sessions');
+  let names = []; try { names = fs.readdirSync(dir); } catch { return []; }
+  const out = [];
+  for (const n of names) {
+    if (!n.endsWith('.json')) continue;
+    let s = null; try { s = JSON.parse(fs.readFileSync(path.join(dir, n), 'utf8')); } catch { continue; }
+    if (!s || typeof s !== 'object' || Array.isArray(s)) continue;
+    if (!s.session_id) s.session_id = n.slice(0, -5);
+    if (!Array.isArray(s.files)) s.files = [];
+    out.push(s);
+  }
+  return out;
+}
+
+// ── 플랫폼이 아는 산 세션 ──
+//   `claude agents --json`(Claude Code ≥ 2.1.302 · 약 0.4초 · TTY 불필요) → [{ pid, cwd, kind, startedAt, sessionId, name, status: busy|idle }].
+//   게시판(board · status)은 "어느 세션이 살아 있나" 를 이것으로 먼저 본다 — last_seen 어림은 이것이 없을 때(명령 없음 · 실패 · 3초 초과)만.
+//   30초 캐시(<common>/harness/agents-cache.json · 실패도 기억한다) — PreToolUse 쓰기 검사가 매번 띄우지 않게.
+//   시험은 진짜 claude 를 부르지 않는다: HARNESS_AGENTS_JSON=<파일>(캐시 없이 그 내용 · 없거나 깨졌으면 실패로) ·
+//   HARNESS_AGENTS_CMD='["node","x.js"]'(대신 돌릴 argv — 캐시를 거친다) · HARNESS_AGENTS=off(쓰지 않는다).
+const AGENTS_TTL_MS = 30 * 1000, AGENTS_TIMEOUT_MS = 3000, LIVE_MS = 30 * 60 * 1000;
+function parseAgents(text) {
+  let v; try { v = JSON.parse(String(text || '').replace(/^﻿/, '')); } catch { return null; }
+  if (!Array.isArray(v)) return null;
+  return v.filter(a => a && typeof a === 'object' && a.sessionId)
+    .map(a => ({ sessionId: String(a.sessionId), pid: a.pid == null ? null : a.pid, cwd: a.cwd || null, kind: a.kind || null, name: a.name || null, status: a.status || null, startedAt: a.startedAt || null }));
+}
+function agentsArgv() {
+  const o = process.env.HARNESS_AGENTS_CMD;
+  if (o) { try { const v = JSON.parse(o); return Array.isArray(v) && v.length && v.every(x => typeof x === 'string') ? v : null; } catch { return null; } }
+  try { return [require('../lib/exe').resolve('claude'), 'agents', '--json']; } catch { return null; }   // 설치 안 됨 · .exe 아님
+}
+function platformAgents(common) {
+  const env = process.env;
+  if (env.HARNESS_AGENTS_JSON) { try { return parseAgents(fs.readFileSync(env.HARNESS_AGENTS_JSON, 'utf8')); } catch { return null; } }
+  if (/^(off|0|false|no)$/i.test(env.HARNESS_AGENTS || '')) return null;
+  const src = env.HARNESS_AGENTS_CMD || 'claude';
+  const file = common ? path.join(harnessDir(common), 'agents-cache.json') : null;
+  const now = Date.now();
+  if (file) {
+    try {
+      const c = JSON.parse(fs.readFileSync(file, 'utf8')), age = now - Date.parse(c.at);
+      if (c.source === src && age >= 0 && age < AGENTS_TTL_MS) return Array.isArray(c.agents) ? c.agents : null;
+    } catch { /* 캐시 없음 · 깨짐 — 다시 묻는다 */ }
+  }
+  let agents = null;
+  const argv = agentsArgv();
+  if (argv) {
+    const r = spawnSync(argv[0], argv.slice(1), { encoding: 'utf8', windowsHide: true, timeout: AGENTS_TIMEOUT_MS, maxBuffer: 8 * 1024 * 1024 });
+    if (!r.error && r.status === 0) agents = parseAgents(r.stdout);
+  }
+  if (file) { try { writeJsonAtomic(file, { at: new Date(now).toISOString(), source: src, agents }); } catch { /* 캐시를 못 써도 결과는 쓴다 */ } }
+  return agents;
+}
+// 세션 파일 s 에 맞는 플랫폼 항목(sessionId 가 같다) — 목록이 없거나 없으면 null.
+function agentOf(s, agents) { return Array.isArray(agents) && s ? agents.find(a => a.sessionId === String(s.session_id)) || null : null; }
+// 산 세션인가. Claude 세션은 플랫폼 목록이 있으면 그것만 믿는다 — 목록에 없으면 last_seen 과 무관하게 산 세션이 아니다.
+//   Codex 세션(claude agents 에 나오지 않는다) · 목록이 없을 때: ended_at 없음 · last_seen 30분 안.
+function sessionLive(s, agents, now) {
+  if (!s) return false;
+  if (Array.isArray(agents) && (s.runtime || 'claude') === 'claude') return !!agentOf(s, agents);
+  if (s.ended_at) return false;
+  const t = Date.parse(s.last_seen || '');
+  return !!t && (now || Date.now()) - t <= LIVE_MS;
+}
+
 // git status --porcelain -z 로 미커밋 경로(스테이징 · 수정 · 삭제 · 추적 안 됨). key: 비교용(Windows 는 소문자) → git 표기.
 //   files 를 주면 그 경로만 본다 — 큰 저장소에서 전체 status 는 Codex SessionEnd 상한(3초)을 넘긴다.
 //   경로는 문자 그대로(literal) · Windows 는 대소문자 무시(icase). 명령줄이 너무 길어지면 전체를 본다.
@@ -300,5 +384,5 @@ function listForReason(files, max) {
 module.exports = {
   real, IS_WIN, readStdinJson, git, repoInfo, harnessDir, safeId, sessionPath, sid8, sleepMs,
   loadSession, updateSession, writeJsonAtomic, logError, detectRuntime, isSecretPath, samePath, repoRel,
-  isHarnessWorktree, dirtyPaths, uncommittedOf, commitFiles, listForReason, LOCK,
+  isHarnessWorktree, laneOf, harnessOwned, listSessions, platformAgents, parseAgents, agentOf, sessionLive, LIVE_MS, dirtyPaths, uncommittedOf, commitFiles, listForReason, keyOf, LOCK,
 };
