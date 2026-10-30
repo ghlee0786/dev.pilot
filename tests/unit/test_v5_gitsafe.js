@@ -32,8 +32,14 @@ const write = (f, t) => { fs.mkdirSync(path.dirname(f), { recursive: true }); fs
     fs.mkdirSync(path.dirname(editorExe), { recursive: true }); fs.copyFileSync(process.execPath, editorExe);
     const editor = spawn(editorExe, ['-e', 'setTimeout(()=>{},60000)', hold], { stdio: 'ignore', windowsHide: true }); kids.push(editor);
     const orphan = spawn(process.execPath, [path.join(hold, 'sleep.js')], { stdio: 'ignore', windowsHide: true }); kids.push(orphan);
-    await new Promise(r => setTimeout(r, 800));
-    const seen = G.procsIn(hold);
+    // 두 프로세스가 목록에 보일 때까지(상한 30초) — [2026-10-30 릴리스 CI] 부하 속에서 0.8초 뒤 목록에 아직 없었다(복사한 실행 파일 기동이 늦음)
+    let seen = [];
+    for (const until = Date.now() + 30000; Date.now() < until;) {
+      seen = G.procsIn(hold);
+      if (seen.some(p => p.pid === editor.pid) && seen.some(p => p.pid === orphan.pid)) break;
+      await new Promise(r => setTimeout(r, 500));
+    }
+    if (!seen.some(p => p.pid === editor.pid)) console.log(`  (GS-03 대기: 30초 안에 편집기 pid ${editor.pid} 가 목록에 보이지 않았다 — ${JSON.stringify(seen)})`);
     const killed = G.killProcsIn(hold);
     await new Promise(r => setTimeout(r, 800));
     R.check('[GS-03] killProcsIn: 폴더를 연 편집기(Code)는 끝내지 않는다', seen.some(p => p.pid === editor.pid) && !killed.some(p => p.pid === editor.pid) && S.pidAlive(editor.pid), JSON.stringify({ seen, killed }));
