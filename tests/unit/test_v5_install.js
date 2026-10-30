@@ -338,6 +338,11 @@ try {
     fs.mkdirSync(tdir, { recursive: true }); fs.writeFileSync(path.join(tdir, 'sess-1.jsonl'), '{}\n');
     const rt = install({ target: t13, source: SOURCE });
     R.check('[BUSY] 레인 세션이 20분 안에 기록했으면 갈아 끼우지 않는다(세션 id 를 알린다)', rt.ok === false && /sess-1/.test(rt.report) && !changedBack(), rt.report);
+    // [2026-10-30 실측 · .NET 저장소] 쉬는 세션의 기록 파일 시각만 계속 새로 바뀌었다(내용 · 크기는 그대로) — 12시간 동안 갱신이 미뤄졌다.
+    //   시각이 최근이어도 마지막 기록의 timestamp 가 오래됐으면 일하는 중이 아니다
+    fs.writeFileSync(path.join(tdir, 'sess-1.jsonl'), `{"type":"user","timestamp":"${ago(5 * 3600000).toISOString()}"}\n{"type":"system","timestamp":"${ago(4 * 3600000).toISOString()}"}\n`);
+    const rtouch = install({ target: t13, source: SOURCE, dryRun: true });
+    R.check('[BUSY] 기록 파일 시각만 새로 바뀌고 마지막 기록이 오래됐으면(4시간 전) 일하는 중이 아니다', rtouch.ok !== false && !/sess-1/.test(rtouch.report), rtouch.report);
     fs.utimesSync(path.join(tdir, 'sess-1.jsonl'), ago(40 * 60000), ago(40 * 60000));
     const rq = install({ target: t13, source: SOURCE });
     R.check('[BUSY] 모두 조용하면(열린 v7 레인이 있어도) 설치한다', rq.ok === true && changedBack(), rq.report);

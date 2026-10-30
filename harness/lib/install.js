@@ -576,10 +576,20 @@ function newestTranscript(wts) {
     let list = []; try { list = fs.readdirSync(d); } catch { continue; }
     for (const n of list) {
       if (!n.endsWith('.jsonl')) continue;
-      try { const m = fs.statSync(path.join(d, n)).mtimeMs; if (!best || m > best.mtimeMs) best = { id: n.slice(0, -6), mtimeMs: m }; } catch { /* 사라짐 */ }
+      try { const f = path.join(d, n), m = fs.statSync(f).mtimeMs; if (!best || m > best.mtimeMs) best = { id: n.slice(0, -6), mtimeMs: m, file: f }; } catch { /* 사라짐 */ }
     }
   }
-  return best;
+  // [2026-10-30 실측 · .NET 저장소] 쉬는 세션의 기록 파일 시각만 계속 새로 바뀌었다(내용 · 크기 그대로) — 12시간 동안 갱신이 미뤄졌다.
+  //   시각이 최근이면 끝부분의 마지막 기록 시각(timestamp)으로 고쳐 본다 · 없으면 파일 시각 그대로.
+  if (best && Date.now() - best.mtimeMs < QUIET_MS) {
+    try {
+      const fd = fs.openSync(best.file, 'r'), size = fs.fstatSync(fd).size, len = Math.min(size, 64 * 1024), buf = Buffer.alloc(len);
+      fs.readSync(fd, buf, 0, len, size - len); fs.closeSync(fd);
+      const stamps = [...buf.toString('utf8').matchAll(/"timestamp":"([^"]+)"/g)].map(x => Date.parse(x[1])).filter(Number.isFinite);
+      if (stamps.length) best.mtimeMs = Math.min(best.mtimeMs, Math.max(...stamps));
+    } catch { /* 못 읽으면 파일 시각으로 */ }
+  }
+  return best && { id: best.id, mtimeMs: best.mtimeMs };
 }
 // → { live: [이유 문장], v6: [{id, status, goal, branch, worktree, session}] }. 상태를 못 읽으면(처음 설치 등) 둘 다 비어 있다.
 function busy(root0, now) {
