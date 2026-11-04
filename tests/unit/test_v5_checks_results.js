@@ -190,6 +190,13 @@ const GO = ['=== RUN   TestParse', '--- FAIL: TestParse (0.00s)', '=== RUN   Tes
     hold2.release();
     await p2;
     R.check('[CR-09] runJudged 결과', res2 && res2.judged.ok === true && eq(res2.judged.failed_tests, []));
+
+    // ── [자동 이슈 #75] 긴 출력의 가운데(앞 · 끝 256 KiB 밖)에 있던 dotnet 프로젝트 요약 줄도 더한다 ─
+    {
+      const dn = mkRepo('dotnet-long', { 'gen.js': `const pad='.'.repeat(200);for(let i=1;i<=30;i++){for(let k=0;k<150;k++)console.log('build noise '+i+' '+pad);console.log((i===15?'Failed!  - Failed:     1, Passed:     9':'Passed!  - Failed:     0, Passed:    10')+', Skipped:     0, Total:    10, Duration: 1 s - P'+i+'.Tests.dll (net8.0)');}` });
+      const r = await K.runCheck(dn, ['node', 'gen.js'], { timeoutMs: 60000 });
+      R.check('[CR-11] (#75) 가운데가 잘린 긴 dotnet 출력도 프로젝트 30개의 요약을 모두 더한다(299 통과 / 1 실패) · 생략 표시는 그대로', r.found && r.pass === 299 && r.fail === 1 && !r.ok && /bytes omitted/.test(r.output), JSON.stringify({ pass: r.pass, fail: r.fail, found: r.found, len: r.output.length }));
+    }
   } catch (e) { R.check('예외 없이 끝난다', false, String(e && e.stack || e).slice(0, 800)); }
   finally { try { fs.rmSync(base, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }); } catch { /* 임시 디렉터리 정리 실패는 결과와 무관 */ } }
   R.done();
