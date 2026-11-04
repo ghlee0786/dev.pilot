@@ -399,6 +399,19 @@ const claudeWrite = (repo, sid, file, tool) => hook('track', { hook_event_name: 
       hook('session-end', { hook_event_name: 'SessionEnd', session_id: 'LANE1', cwd: lwt, reason: 'other' });
       const le = readSession(lr, 'LANE1');
       R.check('[lane] session-end: 남은 자기 파일을 그 길의 브랜치에 커밋 · ended_at', git(lwt, 'log', '-1', '--format=%s') === 'wip(session LANE1): auto-commit at session end' && git(lwt, 'show', '--name-only', '--format=', 'HEAD') === 'c.js' && le && le.ended_at && git(lr, 'rev-parse', 'main') === mainHead, JSON.stringify(le));
+      // [자동 이슈 #80] 같은 세션이 레인에서 고쳐 커밋한 a.js 와 메인 체크아웃의 남의 미커밋 a.js — 상대 경로가 같아도 메인의 Stop 은 그 파일을 커밋하지 않는다
+      write(path.join(lwt, 'a.js'), 'A2\n'); claudeWrite(lwt, 'XWT1', path.join(lwt, 'a.js'));
+      git(lwt, 'commit', '-qam', 'lane a.js');
+      write(path.join(lr, 'a.js'), 'a by someone else\n');
+      const mstop = active => hook('stop', { hook_event_name: 'Stop', session_id: 'XWT1', cwd: lr, prompt_id: 'p', stop_hook_active: active, last_assistant_message: 'done' });
+      const xm1 = mstop(false), xm2 = mstop(true), xm3 = mstop(true);
+      R.check('[lane] (#80) 레인에서 고친 파일과 같은 상대 경로의 메인 체크아웃 미커밋 파일은 메인의 Stop 이 막지도 커밋하지도 않는다', isAllow(xm1) && isAllow(xm2) && isAllow(xm3)
+        && git(lr, 'rev-parse', 'main') === mainHead && /^ M a\.js$/m.test(status(lr)) && !((readSession(lr, 'XWT1') || {}).last_commit), `${xm1.stdout} | ${status(lr)} | ${JSON.stringify(readSession(lr, 'XWT1'))}`);
+      write(path.join(lr, 'd.js'), 'd\n'); claudeWrite(lr, 'XWT1', path.join(lr, 'd.js'));
+      const xm4 = mstop(false);
+      R.check('[lane] (#80) 메인 체크아웃에서 고친 파일은 그대로 막는다(그 파일만 · 레인의 a.js 는 아님)', xm4.json && xm4.json.decision === 'block' && /`d\.js`/.test(xm4.json.reason) && !/`a\.js`/.test(xm4.json.reason), xm4.stdout);
+      hook('session-end', { hook_event_name: 'SessionEnd', session_id: 'XWT1', cwd: lr, reason: 'other' });
+      R.check('[lane] (#80) session-end 도 메인에서 고친 d.js 만 커밋한다(남의 a.js 는 미커밋 그대로)', git(lr, 'show', '--name-only', '--format=', 'HEAD') === 'd.js' && /^ M a\.js$/m.test(status(lr)), git(lr, 'show', '--name-only', '--format=', 'HEAD') + ' | ' + status(lr));
     }
 
     // ── 리뷰 수정: _common ─────────────────────────────────

@@ -37,7 +37,7 @@ function main() {
     const sess = C.loadSession(info.common, sid);
     if (!sess) return;
     const runtime = C.detectRuntime(input);
-    const files = Array.isArray(sess.files) ? sess.files : [];
+    const files = C.filesIn(sess, info.root);   // [자동 이슈 #80] 이 체크아웃에서 고친 것만
     const { mine, secrets } = files.length ? C.uncommittedOf(info.root, files) : { mine: [], secrets: [] };
     const now = new Date().toISOString();
     let res = { ok: true, sha: null };
@@ -48,7 +48,7 @@ function main() {
     C.updateSession(info.common, sid, runtime, s => {
       s.ended_at = now;
       s.end_reason = input.reason || null;
-      if (res.ok && !secrets.length) s.files = [];           // 깨끗하게 끝났다 — 파일 기록을 비운다
+      if (res.ok && !secrets.length) { s.files = []; delete s.roots; }   // 깨끗하게 끝났다 — 파일 기록을 비운다
       if (res.sha) s.last_commit = { sha: res.sha, files: mine, at: now, by: 'session-end' };
       if (!res.ok) s.commit_error = { error: res.error, files: mine, at: now };
       if (secrets.length) s.secrets_left = secrets;

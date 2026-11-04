@@ -337,6 +337,17 @@ function dirtyPaths(root, files) {
 }
 function keyOf(p) { return IS_WIN ? p.toLowerCase() : p; }
 
+// 세션이 이 체크아웃(root)에서 고친 파일 — [자동 이슈 #80] 세션 파일은 공통 git 디렉터리에 하나라서, 레인 worktree 에서 고쳐 커밋한 파일과
+//   메인 체크아웃의 남의 미커밋 파일이 같은 상대 경로면 Stop 이 그 파일을 「이 세션 것」으로 보고 커밋했다. track 이 파일마다 고친 worktree 루트를
+//   s.roots[파일] 에 남긴다. 루트 기록이 없는 파일(예전 기록) · '*' 는 예전처럼 어느 체크아웃에서든 이 세션 것으로 본다.
+function filesIn(sess, root) {
+  const files = Array.isArray(sess && sess.files) ? sess.files : [];
+  const roots = sess && sess.roots && typeof sess.roots === 'object' ? sess.roots : null;
+  if (!roots) return files;
+  const rk = keyOf(path.resolve(root));
+  return files.filter(f => { const list = roots[keyOf(f)]; return !Array.isArray(list) || list.some(r => r === '*' || keyOf(path.resolve(String(r))) === rk); });
+}
+
 // 세션이 기록한 파일 중 지금 미커밋인 것 — git 표기로. 비밀 파일은 따로 나눈다.
 function uncommittedOf(root, files) {
   const dirty = dirtyPaths(root, files);
@@ -389,6 +400,6 @@ function listForReason(files, max) {
 
 module.exports = {
   real, IS_WIN, readStdinJson, git, repoInfo, harnessDir, safeId, sessionPath, sid8, sleepMs,
-  loadSession, updateSession, writeJsonAtomic, logError, detectRuntime, isSecretPath, samePath, repoRel,
+  loadSession, updateSession, writeJsonAtomic, filesIn, logError, detectRuntime, isSecretPath, samePath, repoRel,
   isHarnessWorktree, laneOf, harnessOwned, listSessions, platformAgents, parseAgents, agentOf, sessionLive, LIVE_MS, dirtyPaths, uncommittedOf, commitFiles, listForReason, keyOf, LOCK,
 };
