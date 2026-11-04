@@ -44,10 +44,17 @@ function main() {
     const runtime = C.detectRuntime(input);
     C.updateSession(info.common, sid, runtime, s => {
       const have = new Set(s.files.map(f => C.IS_WIN ? f.toLowerCase() : f));
+      // [자동 이슈 #80] 파일마다 고친 worktree 루트를 남긴다 — Stop · SessionEnd 는 지금 체크아웃에서 고친 것만 커밋한다(C.filesIn)
+      const roots = s.roots && typeof s.roots === 'object' ? s.roots : {};
+      const rk = C.IS_WIN ? info.root.toLowerCase() : info.root;
       for (const rel of rels) {
         const k = C.IS_WIN ? rel.toLowerCase() : rel;
         if (!have.has(k)) { s.files.push(rel); have.add(k); }
+        else if (!Array.isArray(roots[k])) roots[k] = ['*'];   // 루트 없이 기록된 예전 항목 — 예전처럼 어디서든 이 세션 것
+        if (!Array.isArray(roots[k])) roots[k] = [];
+        if (!roots[k].some(r => r === '*' || (C.IS_WIN ? String(r).toLowerCase() : r) === rk)) roots[k].push(info.root);
       }
+      s.roots = roots;
       return s;
     });
   } catch (e) {

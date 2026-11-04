@@ -80,13 +80,14 @@ function main() {
       if (why) { process.stdout.write(JSON.stringify({ decision: 'block', reason: why }) + '\n'); return; }
     }
     const sess = C.loadSession(info.common, sid);
-    if (!sess || !sess.files || !sess.files.length) return;
+    const files = sess ? C.filesIn(sess, info.root) : [];   // [자동 이슈 #80] 이 체크아웃에서 고친 것만
+    if (!files.length) return;
     const runtime = C.detectRuntime(input);
     // [2026-09-30 실측 · 이 저장소에서 v5 를 쓰다가] 백그라운드 서브에이전트가 아직 파일을 고치는 중인데 Stop 이 발화해
     //   "그 파일들을 커밋하라" 고 막았다 — 그대로 커밋하면 반쯤 된 작업이 들어가고, 한 번 더 멈추면 훅이 대신 커밋한다.
     //   백그라운드 작업이 남아 있으면 막지도 커밋하지도 않는다(그 작업이 끝난 뒤의 Stop 이 처리한다).
     if (Array.isArray(input.background_tasks) && input.background_tasks.some(t => !t || !/^(completed|done|failed|killed|stopped)$/i.test(String(t.status || '')))) return;
-    const { mine, secrets } = C.uncommittedOf(info.root, sess.files);
+    const { mine, secrets } = C.uncommittedOf(info.root, files);
     const now = new Date().toISOString();
 
     if (runtime === 'codex') {
