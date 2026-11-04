@@ -188,6 +188,7 @@ const ANSI = /\x1b\[[0-9;?]*[A-Za-z]/g;
 function lastNum(s, re) { let m, v = null; const g = new RegExp(re.source, 'gim'); while ((m = g.exec(s))) v = Number(m[1]); return v; }
 // node:test(tap `# pass` · spec `ℹ pass`) · `결과: N PASS / M FAIL` · pytest `== 2 failed, 3 passed in 0.1s ==` · dotnet `Failed: 1, Passed: 3` · jest `Tests: 1 failed, 3 passed` · vitest `Tests  1 failed | 3 passed (4)`.
 //   [2026-10-29 감사 G2 #16] FORCE_COLOR · pytest --color=yes 의 색 코드 때문에 요약을 못 읽어 원래 빨간 저장소의 accept 가 모두 "나빠짐" 이 됐다 — 색을 먼저 벗긴다.
+const DOTNET_LINE = /(?:Failed|실패):\s*(\d+),\s*(?:Passed|통과):\s*(\d+)/;
 function parseSummary(text) {
   const s = String(text || '').replace(ANSI, '');
   const p = lastNum(s, /^[ \t]*(?:#|ℹ)[ \t]*pass[ \t]+(\d+)[ \t]*\r?$/), f = lastNum(s, /^[ \t]*(?:#|ℹ)[ \t]*fail[ \t]+(\d+)[ \t]*\r?$/);
@@ -200,7 +201,7 @@ function parseSummary(text) {
   const pyq = [...s.matchAll(/^[ \t]*((?:\d+ (?:failed|passed|skipped|deselected|xfailed|xpassed|warnings?|errors?)(?:, )?)+) in [\d.]+s(?: \([^)]*\))?[ \t]*\r?$/gm)].pop();
   if (pyq && /\b(passed|failed|errors?)\b/.test(pyq[1])) { const n = w => { const m = new RegExp(`(\\d+) ${w}\\b`).exec(pyq[1]); return m ? Number(m[1]) : 0; }; return { found: true, pass: n('passed'), fail: n('failed') + n('errors?') }; }
   // dotnet(VSTest): 테스트 프로젝트마다 한 줄 — 모두 더한다. 한국어 Windows 에서는 "실패!  - 실패: 1, 통과: 9, …"(2026-10-03 실측).
-  const dn = [...s.matchAll(/(?:Failed|실패):\s*(\d+),\s*(?:Passed|통과):\s*(\d+)/g)];
+  const dn = [...s.matchAll(new RegExp(DOTNET_LINE.source, 'g'))];
   if (dn.length) return { found: true, pass: dn.reduce((a, m) => a + Number(m[2]), 0), fail: dn.reduce((a, m) => a + Number(m[1]), 0) };
   const mtp = [...s.matchAll(/^\s*Test summary: total: \d+, failed: (\d+), succeeded: (\d+)/gm)].pop();   // dotnet 10 Microsoft.Testing.Platform
   if (mtp) return { found: true, pass: Number(mtp[2]), fail: Number(mtp[1]) };
@@ -248,12 +249,23 @@ function runCheck(cwd, argv, o) {
   return new Promise(resolve => {
     const t0 = Date.now(), spec = spawnSpec(argv, opt.shell);
     let out = '', total = 0, tail = '', timedOut = false, stalled = false, done = false, child, timer, stallTimer;
+    // [자동 이슈 #75] 앞(CAP) · 끝(CAP) 사이에서 버려지는 출력에서 dotnet(VSTest) 프로젝트별 요약 줄만 따로 남긴다 — parseSummary 는 그 줄을 모두 더하므로
+    //   가운데 프로젝트의 요약이 잘리면 통과 · 실패 수가 실제보다 적게 기록됐다. 끝 조각은 줄 경계에서 자른다(요약 줄이 반으로 갈리지 않게).
+    const kept = []; let keptLen = 0;
+    const keepFrom = d => { for (const l of d.split('\n')) { if (keptLen >= CAP) return; if (DOTNET_LINE.test(l.replace(ANSI, ''))) { const x = l.replace(/\r$/, ''); kept.push(x); keptLen += x.length + 1; } } };
     const stop = why => { if (done || timedOut) return; timedOut = true; stalled = why === 'stall'; killTree(child.pid); setTimeout(() => finish(null), 5000).unref(); };
     const arm = () => { if (!stallMs) return; clearTimeout(stallTimer); stallTimer = setTimeout(() => stop('stall'), stallMs); };
-    const push = b => { arm(); total += b.length; const s = b.toString('utf8'); if (out.length < CAP) out += s; else tail = (tail + s).slice(-CAP); };
+    const push = b => {
+      arm(); total += b.length; const s = b.toString('utf8');
+      if (out.length < CAP) { out += s; return; }
+      tail += s;
+      if (tail.length <= CAP) return;
+      let cut = tail.length - CAP; const nl = tail.indexOf('\n', cut); if (nl >= 0 && nl + 1 < tail.length) cut = nl + 1;
+      keepFrom(tail.slice(0, cut)); tail = tail.slice(cut);
+    };
     const finish = (code, err) => {
       if (done) return; done = true; clearTimeout(timer); clearTimeout(stallTimer);
-      const output = out + (tail ? `\n…[${total - out.length - tail.length} bytes omitted]…\n` + tail : '') + (err ? `\n[spawn error] ${err}` : '');
+      const output = out + (tail ? `\n…[${total - out.length - tail.length} bytes omitted]…\n` + (kept.length ? `[test summary lines kept from the omitted part]\n${kept.join('\n')}\n…\n` : '') + tail : '') + (err ? `\n[spawn error] ${err}` : '');
       const s = parseSummary(output);
       const ok = code === 0 && !timedOut && !(s.found && s.fail > 0);
       resolve({ command: opt.label || display(argv), argv, exit_code: code, timed_out: timedOut, ...(stalled ? { stalled: true } : {}), found: s.found, pass: s.found ? s.pass : (ok ? 1 : 0), fail: s.found ? s.fail : (ok ? 0 : 1), ok, output, ms: Date.now() - t0 });

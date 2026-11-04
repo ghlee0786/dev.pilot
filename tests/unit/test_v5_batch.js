@@ -242,6 +242,29 @@ const parents = (cwd, ref) => git(cwd, ['rev-list', '--parents', '-n', '1', ref]
       const bz2 = await B.create({ ...quiet, root: Z.dir, ids: [zl.id], checkTimeoutMs: 2500 });
       const rz2 = B.readBatch(Z.dir, bz2.id);
       R.check('[BA-21] 시간 초과로 잰 기준선은 캐시에 남기지 않고 다음 묶음은 다시 잰다', cached === 0 && rz2.baseline && rz2.baseline.cached === false, JSON.stringify({ cached, base: rz2.baseline }));
+      // [자동 이슈 #76] 후보의 실패(bad1)는 대상 끝에도 있을 수 있는데 대상 끝은 시간 초과라 재지 못했다 — fail(나빠짐)이 아니라 판정 불가 · 기준선 진단 칸을 남긴다
+      const r0 = (rz2.baseline && rz2.baseline.results || [])[0] || {};
+      R.check('[BA-22] (#76) 대상 끝을 시간 초과로 재지 못하면 verdict indeterminate(fail 아님) · 기준선에 명령별 exit_code · timed_out · found · 보고에 시간 초과',
+        bz2.verdict === 'indeterminate' && rz2.baseline_unmeasured === 'timeout' && r0.timed_out === true && 'exit_code' in r0 && 'found' in r0 && Array.isArray(rz2.baseline.failed_tests)
+        && /재지 못해/.test(bz2.report) && /check_timeout_min/.test(bz2.report), JSON.stringify({ v: bz2.verdict, u: rz2.baseline_unmeasured, base: rz2.baseline }));
+      R.check('[BA-22] (#76) 판정 불가 묶음도 --force 없이는 받아들이지 않는다', (await B.accept({ root: Z.dir, bid: bz2.id })).refused === true);
+    }
+
+    // ── [자동 이슈 #74] 검사가 도는 동안 디스크의 묶음 기록에 명령 · 단계 · 시작 시각 · 상한이 있다 ─
+    {
+      const snap = path.join(base, 'snap-74.json');
+      const P = mkRepo({ 'check.js': `const fs=require('fs'),path=require('path'),cp=require('child_process');
+const common=path.resolve(cp.execSync('git rev-parse --git-common-dir',{encoding:'utf8'}).trim());
+const dir=path.join(common,'harness','batches');
+const recs=fs.readdirSync(dir).filter(f=>f.endsWith('.json')).map(f=>JSON.parse(fs.readFileSync(path.join(dir,f),'utf8')));
+fs.writeFileSync(${JSON.stringify(snap)},JSON.stringify(recs.map(r=>({status:r.status,commands:r.commands,phase:r.phase,started:r.phase_started_at,timeout:r.check_timeout_ms}))));
+console.log('# pass 1\\n# fail 0');` });
+      const pl = lane(P, 'lane p', { 'p.txt': 'p\n' });
+      const bp = await B.create({ ...quiet, root: P.dir, ids: [pl.id] });
+      const seen = JSON.parse(read(snap) || '[]')[0] || {};
+      R.check('[BA-23] (#74) 검사 중 기록: status building · commands 에 검사 명령 · phase checks · 시작 시각 · 상한 — 끝나면 ready 이고 phase 는 지운다',
+        seen.status === 'building' && (seen.commands || []).includes('node check.js') && seen.phase === 'checks' && !!seen.started && seen.timeout > 0
+        && bp.verdict === 'pass' && B.readBatch(P.dir, bp.id).status === 'ready' && !('phase' in B.readBatch(P.dir, bp.id)), JSON.stringify({ seen, v: bp.verdict }));
     }
   } catch (e) { R.check('예외 없이 끝난다', false, String(e && e.stack || e).slice(0, 800)); }
   finally { try { fs.rmSync(base, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }); } catch { /* 임시 디렉터리 정리 실패는 결과와 무관 */ } }

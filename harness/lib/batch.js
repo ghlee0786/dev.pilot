@@ -22,6 +22,7 @@ function listBatches(root) {
   return names.filter(n => BID_RE.test(n.replace(/\.json$/, ''))).sort().map(n => S.readJson(path.join(dirOf(root), n), null)).filter(Boolean);
 }
 const needBid = bid => { if (!BID_RE.test(String(bid || ''))) throw usage(`expected a batch id b-yyyymmdd-HHMMss-xxxx, got ${JSON.stringify(String(bid || '')).slice(0, 80)}`); return bid; };
+const PHASE_KO = { checks: '검사', baseline: '대상 끝 기준선', lint: '린트' };
 const VERDICT_KO = { pass: '통과', 'not-worse': '나빠지지 않음 — 대상 브랜치도 원래 같은 실패', fail: '실패 — 대상 브랜치보다 나빠졌다', indeterminate: '판정 불가 — 실패한 검사가 모두 시간 초과' };
 // 묶을 수 있는 작업: done, 또는 열린 light 칸(받아들이거나 취소한 것 · 돌고 있는 것은 아니다)
 const eligible = t => !!t && (t.status === 'done' || (t.mode === 'light' && t.status === 'open'));
@@ -219,9 +220,13 @@ async function build(root, b, o, log) {
   const runOn = (dir, cmds) => K.runJudged(dir, cmds, { timeoutMs, rerun, serialRoot, priority: 1 });
   b.commands = found.commands.map(K.display);
   b.checks_source = found.source;
+  // [자동 이슈 #74] 긴 검사에 들어가기 전에 무엇을 언제부터 돌리는지 기록에 남긴다 — 예전에는 끝난 뒤에만 저장해, 도는 중이거나
+  //   중간에 끊긴 묶음의 기록이 commands=[] 로 남아 무엇이 돌았는지 알 수 없었다.
+  const phase = p => { b.phase = p; b.phase_started_at = S.nowIso(); b.check_timeout_ms = timeoutMs; saveBatch(root, b); };
   if (!found.commands.length) { b.verdict = 'pass'; b.no_checks = true; }
   else {
     log(`[pilot] batch ${bid} — ${merged.length}개를 합쳤다 · 검사: ${b.commands.join(' ; ')}`);
+    phase('checks');
     const rj = await runOn(wt, found.commands);
     let j = rj.judged;
     if (rj.flaky && rj.flaky.length) b.flaky = rj.flaky;
@@ -230,12 +235,23 @@ async function build(root, b, o, log) {
     // [2026-10-29 감사] 사용자가 준 검사는 그 기능을 묘사한다 — 원래부터 실패여도 not-worse 로 넘기지 않는다(accept 와 같다 · 대상 끝은 재지 않는다)
     else if (found.source === 'user') b.verdict = 'fail';
     else {
+      phase('baseline');
       const base = await targetBaseline(root, b, found.commands, include, runOn, log, timeoutMs);
       // 캐시된 기준선이 멈춘 테스트를 떼어 낸 명령이면 같은 명령으로 다시 잰다(판정은 명령마다 짝지어 비교한다)
       if (base && Array.isArray(base.commands) && JSON.stringify(base.commands) !== JSON.stringify(found.commands)) j = (await runOn(wt, base.commands)).judged;
-      if (base) b.baseline = { ok: base.ok, pass: base.pass, fail: base.fail, cached: !!base.cached };
+      // [자동 이슈 #76] 기준선의 명령별 exit_code · timed_out · found 와 실패 시험 id 도 남긴다 — 「후보가 나빠짐」과 「기준선을 재지 못함」을 기록으로 가른다
+      if (base) { const bb = K.brief(base); b.baseline = { ok: base.ok, pass: base.pass, fail: base.fail, cached: !!base.cached, indeterminate: bb.indeterminate, failed_tests: bb.failed_tests.slice(0, 50), results: bb.results }; }
       const v = K.judge(j, base);
       b.verdict = v.verdict === 'pass' ? 'pass' : v.verdict === 'not_worse' ? 'not-worse' : 'fail';
+      // [자동 이슈 #76] 나빠짐의 근거가 모두 대상 끝에서 시간 초과로 재지 못한 명령뿐이면(또는 대상 끝을 아예 재지 못했으면) fail 이 아니라 판정 불가 —
+      //   accept 의 unverified 와 같다. 새로 실패한 시험 이름이 보이면 그대로 fail.
+      if (b.verdict === 'fail' && !(v.newly_failing || []).length) {
+        if (!base) { if (b.baseline_error) { b.verdict = 'indeterminate'; b.baseline_unmeasured = 'error'; } }
+        else if (Array.isArray(base.results) && base.results.length === j.results.length) {
+          const worse = j.results.map((r, i) => i).filter(i => K.worseThan(j.results[i], base.results[i]));
+          if (worse.length && worse.every(i => base.results[i] && base.results[i].timed_out)) { b.verdict = 'indeterminate'; b.baseline_unmeasured = 'timeout'; }
+        }
+      }
     }
     b.checks = K.brief(j);
     b.failed_tests = ((j.failed_tests) || []).slice(0, 50);
@@ -245,6 +261,7 @@ async function build(root, b, o, log) {
   //   [2026-10-29 감사] batch 는 lint_command 를 돌리지 않아 accept 가 린트로 거절한 변경이 묶음으로는 사용자 브랜치에 들어갔다.
   const lintCmd = K.yamlString(proj, 'lint_command') || K.yamlString(wt, 'lint_command');
   if (lintCmd) {
+    phase('lint');
     const changed = G.diffNames(wt, b.target_commit, 'HEAD').filter(f => !f.startsWith('.harness/') && fs.existsSync(path.join(wt, f)));
     const argv = K.lintArgv(lintCmd, /{files}/.test(lintCmd) ? changed : []);
     if (argv) {
@@ -253,7 +270,7 @@ async function build(root, b, o, log) {
       if (!lr.ok && b.verdict !== 'fail') { b.verdict = 'fail'; b.failing = [...(b.failing || []), b.lint.command]; }
     } else b.lint = { command: lintCmd, ok: true, skipped: 'no changed files' };
   }
-  b.status = 'ready';
+  b.status = 'ready'; delete b.phase;
   saveBatch(root, b);
   return result(root, b);
 }
@@ -268,7 +285,8 @@ function format(b) {
   const cli = 'node harness/cli.js';
   const merged = b.members.filter(m => m.status === 'merged'), skipped = b.members.filter(m => m.status === 'skipped');
   const head = b.status === 'empty' ? '합친 것이 없다' : b.status === 'accepted' ? `받아들임 — ${b.target} 에 ${String(b.merge_commit).slice(0, 10)} 로 병합했다`
-    : b.status === 'dropped' ? '버림' : b.status === 'error' ? `오류: ${b.error}` : b.status === 'building' ? '만드는 중(또는 중간에 끝남)' : `판정: ${VERDICT_KO[b.verdict] || b.verdict}`;
+    : b.status === 'dropped' ? '버림' : b.status === 'error' ? `오류: ${b.error}` : b.status === 'building' ? `만드는 중(또는 중간에 끝남)${b.phase ? ` — 단계 ${PHASE_KO[b.phase] || b.phase} · ${b.phase_started_at} 부터${b.check_timeout_ms ? ` · 명령당 상한 ${Math.round(b.check_timeout_ms / 60000)}분` : ''}` : ''}`
+      : b.baseline_unmeasured ? `판정: 판정 불가 — 대상 끝(${String(b.target_commit).slice(0, 10)})의 같은 검사를 ${b.baseline_unmeasured === 'timeout' ? '시간 초과로 ' : ''}재지 못해 나빠졌는지 알 수 없다` : `판정: ${VERDICT_KO[b.verdict] || b.verdict}`;
   const L = [`pilot batch ${b.id} — ${head}`,
     `대상: ${b.target} @ ${String(b.target_commit).slice(0, 10)} · 묶음 브랜치: ${b.branch}${b.status !== 'accepted' && b.status !== 'dropped' ? ` · 작업 폴더: ${b.worktree}` : ''}`];
   L.push(`합침 ${merged.length}개${merged.length ? ':' : ''}`);
@@ -280,6 +298,7 @@ function format(b) {
   if (b.no_checks) L.push('검사: 찾지 못했다 — 검사 없이 판정했다(직접 확인하세요)');
   else if (b.checks) {
     L.push(`검사(한 번): ${b.commands.join(' ; ')} — ${b.checks.pass} 통과 / ${b.checks.fail} 실패${b.baseline ? ` · 대상 끝: ${b.baseline.pass} 통과 / ${b.baseline.fail} 실패${b.baseline.cached ? '(캐시)' : ''}` : ''}`);
+    if (b.baseline_unmeasured === 'timeout') L.push(`  대상 끝에서 시간 초과: ${(b.baseline.results || []).filter(r => r.timed_out).map(r => r.command).join(' ; ')} — 부하가 줄었을 때 다시 묶거나 프로젝트 블록 check_timeout_min 을 늘린다`);
     if ((b.flaky || []).length) L.push(`  불안정(실패했다가 다시 돌리니 통과): ${b.flaky.join(' ; ')}`);
     if ((b.failing || []).length) L.push(`  실패한 검사: ${b.failing.join(' ; ')}`);
     if ((b.failed_tests || []).length) L.push(`  실패한 시험: ${b.failed_tests.slice(0, 10).join(', ')}${b.failed_tests.length > 10 ? ` … (+${b.failed_tests.length - 10})` : ''}`);
