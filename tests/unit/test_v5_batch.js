@@ -211,6 +211,7 @@ const parents = (cwd, ref) => git(cwd, ['rev-list', '--parents', '-n', '1', ref]
       const bv = await B.create({ ...quiet, root: V.dir, all: true });
       const mv = (B.readBatch(V.dir, bv.id).members || []).find(m => m.id === va.id) || {};
       R.check('[BA-20] 산 세션이 일하는 칸은 batch(--all)가 건너뛴다(why: live session)', mv.status === 'skipped' && /live session live1111/.test(mv.why), JSON.stringify(mv));
+      R.check('[BA-20c] (#88) 산 세션으로 건너뛴 이유에 기록상 cwd · 기록 시각이 있다(낡은 기록인지 알아볼 수 있게)', /recorded cwd .+ at \d{4}-\d\d-\d\dT/.test(mv.why || '') && (mv.why || '').includes(va.wt), JSON.stringify(mv.why));
       // [자동 이슈 #67] 부른 세션 자신이 그 칸을 가리키면(예전에 cd 했다) 건너뛰지 않는다
       const hadSid = process.env.CLAUDE_CODE_SESSION_ID;
       process.env.CLAUDE_CODE_SESSION_ID = 'live1111-aaaa';

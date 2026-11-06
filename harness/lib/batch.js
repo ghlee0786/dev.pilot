@@ -72,7 +72,9 @@ function liveSessionIn(root, wt) {
   let agents = null; try { agents = Ch.platformAgents(common); } catch { agents = null; }
   const now = Date.now(), live = cand.filter(s => Ch.sessionLive(s, agents, now));
   if (!live.length) return null;
-  return `live session ${live.map(s => Ch.sid8(s.session_id)).join(', ')} is working in ${wt} — let it finish (or end it), then batch again; --force bundles it anyway`;
+  // [자동 이슈 #88] 기록상 cwd · 기록 시각 · 플랫폼 cwd 를 실어 낡은 세션 기록인지 알아볼 수 있게(integrate.sessionWhere 와 같다)
+  const who = live.map(s => { const a = Ch.agentOf(s, agents); return `${Ch.sid8(s.session_id)}${I.sessionWhere({ cwd: s.cwd || s.root || null, last_seen: s.last_seen || null, platform_cwd: a && a.cwd || null })}`; });
+  return `live session ${who.join(', ')} is working in ${wt} — let it finish (or end it), then batch again; --force bundles it anyway`;
 }
 
 // 칸의 작업 폴더를 묶어도 되는가 → 안 되면 이유(문자열). accept(integrate.js)와 같은 보호 —
