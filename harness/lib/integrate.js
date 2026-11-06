@@ -134,13 +134,22 @@ function liveLaneSessions(root, task) {
   try { cand = Ch.listSessions(common).filter(s => String(s.session_id) !== self && (inside(s.root) || inside(s.cwd))); } catch { return []; }
   if (!cand.length) return [];
   let agents = null; try { agents = Ch.platformAgents(common); } catch { agents = null; }
-  return cand.filter(s => Ch.sessionLive(s, agents)).map(s => { const a = Ch.agentOf(s, agents); return { session_id: s.session_id, name: a && a.name || null, status: a && a.status || null }; });
+  return cand.filter(s => Ch.sessionLive(s, agents)).map(s => { const a = Ch.agentOf(s, agents); return { session_id: s.session_id, name: a && a.name || null, status: a && a.status || null, cwd: s.cwd || s.root || null, last_seen: s.last_seen || null, platform_cwd: a && a.cwd || null }; });
+}
+// [자동 이슈 #88] 세션 기록의 cwd 는 UserPromptSubmit 때만 갱신된다 — 그 세션이 레인에서 나간 뒤에도 낡은 기록으로 거부될 수 있다.
+//   거부 이유에 기록상 cwd · 기록 시각 · (다르면) 플랫폼 목록의 cwd 를 실어 낡은 기록인지 알아볼 수 있게 한다.
+function sessionWhere(s) {
+  const bits = [];
+  if (s.cwd) bits.push(`recorded cwd ${s.cwd}${s.last_seen ? ` at ${s.last_seen}` : ''}`);
+  const k = p => { const r = path.resolve(p); return S.IS_WIN ? r.toLowerCase() : r; };
+  if (s.platform_cwd && (!s.cwd || k(s.platform_cwd) !== k(s.cwd))) bits.push(`platform cwd ${s.platform_cwd}`);
+  return bits.length ? ` · ${bits.join(' · ')}` : '';
 }
 function liveSessionWhy(root, task, o, cmd) {
   if (o.force) return null;
   const live = liveLaneSessions(root, task);
   if (!live.length) return null;
-  const who = live.slice(0, 3).map(s => `${s.name || String(s.session_id).slice(0, 8)}${s.status ? ` ${s.status}` : ''}`).join(', ');
+  const who = live.slice(0, 3).map(s => `${s.name || String(s.session_id).slice(0, 8)}${s.status ? ` ${s.status}` : ''}${sessionWhere(s)}`).join(', ');
   return `a live session is working in this lane's worktree ${S.taskPathsFor(root, task).wt} (${who}) — finish and commit the work in that session (or end it), then run ${cmd} again; --force to ${cmd} anyway`;
 }
 // merge 잠금 → task 잠금 → 잠금 아래에서 task 를 **다시 읽고** 선행 조건을 다시 본다.
@@ -755,4 +764,4 @@ async function check(o) {
   });
 }
 
-module.exports = { accept, cancel, restore, check, dirtyOverlap, archivePlan, acceptTarget, result, releaseResources, commitLeftovers, copyDir, isIndeterminate, serialRootOf, docsOnly, refuseKo, liveLaneSessions, MERGE_WAIT_MS };
+module.exports = { accept, cancel, restore, check, dirtyOverlap, archivePlan, acceptTarget, result, releaseResources, commitLeftovers, copyDir, isIndeterminate, serialRootOf, docsOnly, refuseKo, liveLaneSessions, sessionWhere, MERGE_WAIT_MS };
