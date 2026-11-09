@@ -504,6 +504,14 @@ const claudeWrite = (repo, sid, file, tool) => hook('track', { hook_event_name: 
     R.check('[lang] 한국어 답(코드 · 명령 · 경로가 섞여도)은 통과', isAllow(lang('Stop', { last_assistant_message: KO, stop_hook_active: false })));
     const enUp = lang('UserPromptSubmit', { prompt: 'please add the lint rules' }, 'L2');
     R.check('[lang] 영어로 묻는 세션에는 아무것도 하지 않는다(덧붙임 · 되돌림 없음)', isAllow(enUp) && isAllow(lang('Stop', { last_assistant_message: EN, stop_hook_active: false }, 'L2')));
+    // [#93] 세션 기록 잠금을 다른 프로세스가 쥐고 있어 기록이 시간 초과로 실패해도, 이번 턴의 언어 규칙은 싣고 실패는 기록한다.
+    const langLock = sessionFile(lrepo, 'L3') + '.lock';
+    fs.mkdirSync(langLock, { recursive: true }); fs.writeFileSync(path.join(langLock, 'owner'), 'someone-else');
+    const upLocked = lang('UserPromptSubmit', { prompt: '테스트를 고쳐 줘' }, 'L3');
+    const langErrLog = () => { try { return fs.readFileSync(path.join(lrepo, '.git', 'harness', 'hook-errors.log'), 'utf8'); } catch { return ''; } };
+    R.check('[lang][#93] 세션 잠금 시간 초과에도 한국어 질문이면 이번 턴 문맥에 언어 규칙을 덧붙인다', upLocked.status === 0 && upLocked.json && upLocked.json.hookSpecificOutput && /한국어로 쓴다/.test(upLocked.json.hookSpecificOutput.additionalContext), upLocked.stdout);
+    R.check('[lang][#93] 잠금 실패는 hook-errors.log 에 남는다', /session lock timeout/.test(langErrLog()), langErrLog().slice(-300));
+    fs.rmSync(langLock, { recursive: true, force: true });
     R.check('[lang] 저장소 밖 · 깨진 입력은 조용히 통과', isAllow(hook('lang', { hook_event_name: 'Stop', session_id: 'x', cwd: base, last_assistant_message: EN })) && isAllow(hook('lang', 'not json')) && fs.existsSync(path.join(hookTmp, 'harness', 'hook-errors.log')));
 
     R.check('[격리] 가짜 HOME 에 .claude · .codex 가 생기지 않았다', !fs.existsSync(path.join(home, '.claude')) && !fs.existsSync(path.join(home, '.codex')));

@@ -254,12 +254,13 @@ function ignoredChanged(root, wt, include) {
   }
   return out;
 }
-const ignoredWhy = files => `ignored files changed (outside git; removing the worktree would delete them): ${files.slice(0, 10).join(', ')}${files.length > 10 ? ` … (+${files.length - 10})` : ''} — copy what you need, then remove it with git worktree remove --force`;
+// [#91] 안내는 --force 없는 remove 다 — guard 가 강제 제거를 막는다. 무시된 파일만 남았으면 이것으로 지워지고, 미커밋 변경이 있으면 git 이 거절한다.
+const ignoredWhy = (files, wt) => `ignored files changed (outside git; removing the worktree would delete them): ${files.slice(0, 10).join(', ')}${files.length > 10 ? ` … (+${files.length - 10})` : ''} — copy what you need, then remove it with git worktree remove "${wt || '<worktree>'}" (no --force: git still refuses if tracked or untracked changes remain)`;
 
 // 작업 worktree 를 지워도 되면 지우고 {ok:true}, 아니면 {ok:false, why}. 무시된 파일이 바뀌었으면 남긴다.
 function removeIfSafe(root, wt, include) {
   const ign = fs.existsSync(wt) ? ignoredChanged(root, wt, include) : [];
-  if (ign.length) return { ok: false, why: ignoredWhy(ign), ignored: ign };
+  if (ign.length) return { ok: false, why: ignoredWhy(ign, wt), ignored: ign };
   const rm = G.removeWorktree(root, wt);
   return rm.ok ? { ok: true } : { ok: false, why: rm.error };
 }

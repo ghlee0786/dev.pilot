@@ -245,6 +245,14 @@ const hasMergeHead = cwd => spawnSync('git', ['rev-parse', '-q', '--verify', 'ME
     const task11 = S.readTask(r11, t11.id);
     R.check('[IN-13][M4] 무시된 파일(out.log)이 바뀐 worktree 는 accept 뒤에도 남는다 · 파일 그대로', a11.status === 'accepted' && read(path.join(P11.wt, 'out.log')) === 'build output the user wants\n', `${a11.status} ${a11.reason}`);
     R.check('[IN-13][M4] 남긴 이유(worktree_kept)에 파일 이름 · 보고에도', /out\.log/.test(task11.worktree_kept || '') && /out\.log/.test(a11.report || ''), `${task11.worktree_kept} | ${a11.report}`);
+    // [#91] 남긴 이유가 권하는 명령은 guard 가 막지 않아야 한다(--force 는 막힌다) — 그대로 실행하면 무시된 파일만 남은 worktree 가 지워진다.
+    const cmd11 = ((task11.worktree_kept || '').match(/git worktree remove "[^"]+"/) || [])[0] || '';
+    const GD11 = require('../../harness/hooks/guard.js');
+    const guard11 = c => GD11.decide({ hook_event_name: 'PreToolUse', session_id: 'g11', cwd: r11, tool_name: 'Bash', tool_input: { command: c } }, 'claude');
+    R.check('[IN-13b][#91] 남긴 이유는 --force 없이 그 worktree 경로로 git worktree remove 를 권한다', !!cmd11 && cmd11.includes(P11.wt) && !/remove --force/.test(task11.worktree_kept || ''), task11.worktree_kept);
+    R.check('[IN-13b][#91] 권하는 명령은 guard 가 통과시킨다(같은 명령의 --force 는 막힌다)', !!cmd11 && guard11(cmd11) === null && guard11(`git worktree remove --force "${P11.wt}"`) !== null, `${cmd11} → ${JSON.stringify(guard11(cmd11))}`);
+    const rm11 = spawnSync('git', ['worktree', 'remove', P11.wt], { cwd: r11, encoding: 'utf8', windowsHide: true });
+    R.check('[IN-13b][#91] 권하는 명령(--force 없음)으로 무시된 파일만 남은 worktree 가 지워진다', rm11.status === 0 && !fs.existsSync(P11.wt), `${rm11.status} ${rm11.stderr}`);
 
     // ── [M7] cancel/restore 의 임시 worktree 에도 .worktreeinclude 복사 · --skip-checks ─
     const r12 = mkRepo({ check: CHECK_ENV_JS, files: ENV_FILES, untracked: { '.env': 'TOKEN=1\n' } });
