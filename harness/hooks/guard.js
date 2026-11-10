@@ -265,12 +265,22 @@ function analyzeTexts(texts, mode, ctx) {
 }
 
 // $NAME · ${NAME} · $env:NAME · %NAME% → 같은 명령에서 정한 값 · 환경 변수(없으면 그대로 — 풀 수 없는 경로로 남는다)
+//   [자동 이슈 #95 #96] 값은 정한 그대로(`x='$x$x$x$x$x$x'`) 기억하므로, 명령 자리에서 거듭 풀면 자기 참조가 지수로 불어나
+//   `Invalid string length` 로 죽었다(그 전에 수 초를 쓴다). 결과가 상한을 넘으면 풀지 않는다(풀 수 없는 값과 같다).
+const EXPAND_MAX = 1 << 20;
 function expandVars(s, ctx) {
+  const src = String(s);
+  let size = src.length;
+  const cap = (m, val) => { size += String(val).length - m.length; return size > EXPAND_MAX ? m : val; };
+  const r = expandVarsRaw(src, ctx, cap);
+  return size > EXPAND_MAX || r.length > EXPAND_MAX ? src : r;
+}
+function expandVarsRaw(s, ctx, cap) {
   const v = name => { const k = String(name).toLowerCase(); if (ctx && ctx.vars && ctx.vars[k] != null) return ctx.vars[k]; const e = Object.keys(process.env).find(x => x.toLowerCase() === k); return e ? process.env[e] : null; };
   return String(s)
-    .replace(/\$env:([A-Za-z_]\w*)/gi, (m, n) => v(n) != null ? v(n) : m)
-    .replace(/%([A-Za-z_]\w*)%/g, (m, n) => v(n) != null ? v(n) : m)
-    .replace(/\$\{([A-Za-z_]\w*)\}|\$([A-Za-z_]\w*)/g, (m, a, b) => { const n = a || b; if (/^pwd$/i.test(n) && ctx && ctx.cwd) return ctx.cwdUnknown ? m : ctx.cwd; if (/^(home|null)$/i.test(n)) return m; return v(n) != null ? v(n) : m; });
+    .replace(/\$env:([A-Za-z_]\w*)/gi, (m, n) => v(n) != null ? cap(m, v(n)) : m)
+    .replace(/%([A-Za-z_]\w*)%/g, (m, n) => v(n) != null ? cap(m, v(n)) : m)
+    .replace(/\$\{([A-Za-z_]\w*)\}|\$([A-Za-z_]\w*)/g, (m, a, b) => { const n = a || b; if (/^pwd$/i.test(n) && ctx && ctx.cwd) return ctx.cwdUnknown ? m : ctx.cwd; if (/^(home|null)$/i.test(n)) return m; return v(n) != null ? cap(m, v(n)) : m; });
 }
 // 단어 하나가 통째로 변수면($p · ${p}) 따옴표 없는 확장처럼 공백으로 나눈다.
 function expandWord(word, ctx) {
