@@ -190,6 +190,18 @@ try {
     const u = C.uncommittedOf(lp, [rel]);
     R.check('[longpaths] uncommittedOf 도 그 파일을 세션 파일로 잡는다', u.mine.length === 1 && u.mine[0] === rel, JSON.stringify(u));
   } else R.check('[longpaths] 긴 경로 파일을 만들 수 있다(시험 준비)', false, 'fs 쓰기 실패');
+
+  // [자동 이슈 #95 #96] 자기 참조 변수(`x='$x$x$x$x$x$x'`)를 명령 자리에서 거듭 풀면 지수로 불어나 Invalid string length 로 죽었다.
+  {
+    const bomb = "x='$x$x$x$x$x$x'; $x status";
+    const t0 = Date.now(), r = decide(repo, bomb), ms = Date.now() - t0;
+    R.check('[#95] 자기 참조 변수 확장이 예외 없이 끝난다', r === null, String(r).slice(0, 200));
+    R.check('[#95] 오래 걸리지 않는다(< 3초)', ms < 3000, `${ms}ms`);
+    const alone = decide(repo, 'git push --force origin main');
+    const after = decide(repo, bomb.replace(' status', '') + '; git push --force origin main');
+    R.check('[#95] 뒤따르는 명령은 그대로 판정한다', typeof alone === 'string' && after === alone, `${after} / ${alone}`);
+    R.check('[#95] 보통 변수 확장은 그대로다', decide(repo, "g=git; $g push --force origin main") === alone, String(decide(repo, "g=git; $g push --force origin main")));
+  }
 } catch (e) { R.check('예외 없이 끝난다', false, String(e && e.stack || e).slice(0, 800)); }
 finally { try { fs.rmSync(base, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }); } catch { /* 임시 폴더 정리 실패는 결과와 무관 */ } }
 R.done();
