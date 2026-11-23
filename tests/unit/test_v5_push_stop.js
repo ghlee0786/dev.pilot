@@ -202,6 +202,8 @@ const cfg = d => { git(d, 'config', 'user.name', 't'); git(d, 'config', 'user.em
         process.env.HARNESS_PUSH_TIMEOUT_MS = '2000';
         // 시간은 쓰기 확인(probe) 구간만 잰다 — fetch(로컬 bare) · 진단 git 호출은 넣지 않는다. 서버는 10초 뒤 스스로 닫으므로 9.5초를 넘기면 상한이 듣지 않은 것이다
         const t0 = Date.now(), pr5 = Push.probe(w, 'origin', 'refs/heads/main:refs/heads/main'), ms5 = Date.now() - t0;
+        // push --dry-run 은 먼저 로컬 bare 에서 fetch 하고 같은 상한을 쓴다 — 부하 속 Windows 에서 그 fetch 가 2초를 넘겨 쓰기 확인 전에 끝났다(전체 실행). 5초여도 10초 서버보다 짧다
+        process.env.HARNESS_PUSH_TIMEOUT_MS = '5000';
         const d5 = Push.push({ root: w, dryRun: true });
         delete process.env.HARNESS_PUSH_TIMEOUT_MS;
         R.check('[PS-16] 응답 없는 원격 — 쓰기 확인이 상한(2초) 근처에서 timeout 으로 끝난다(10초 서버를 기다리지 않는다) · push --dry-run 보고에 timeout 과 힌트',

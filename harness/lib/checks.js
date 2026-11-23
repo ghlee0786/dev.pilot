@@ -252,7 +252,8 @@ function runCheck(cwd, argv, o) {
     let out = '', total = 0, tail = '', timedOut = false, stalled = false, done = false, child, timer, stallTimer;
     const stop = why => { if (done || timedOut) return; timedOut = true; stalled = why === 'stall'; killTree(child.pid); setTimeout(() => finish(null), 5000).unref(); };
     const arm = () => { if (!stallMs) return; clearTimeout(stallTimer); stallTimer = setTimeout(() => stop('stall'), stallMs); };
-    const push = b => { arm(); total += b.length; const s = b.toString('utf8'); if (out.length < CAP) out += s; else tail = (tail + s).slice(-CAP); };
+    // 앞부분은 CAP 에서 자른다 — 파이프가 큰 조각 하나(Windows · Node 20 에서 700KB)를 넘기면 앞부분이 상한을 넘고 꼬리가 비었다(BA-26 · CI)
+    const push = b => { arm(); total += b.length; let s = b.toString('utf8'); if (out.length < CAP) { const room = CAP - out.length; out += s.slice(0, room); s = s.slice(room); } if (s) tail = (tail + s).slice(-CAP); };
     const finish = (code, err) => {
       if (done) return; done = true; clearTimeout(timer); clearTimeout(stallTimer);
       const output = out + (tail ? `\n…[${total - out.length - tail.length} bytes omitted]…\n` + tail : '') + (err ? `\n[spawn error] ${err}` : '');

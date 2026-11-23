@@ -339,12 +339,12 @@ console.log('# pass 1\\n# fail 0');` });
       const lbig = lane(BIG, 'big output', { 'bad.txt': 'x\n' });
       const bbig = await B.create({ ...quiet, root: BIG.dir, ids: [lbig.id] });
       const rbig = B.readBatch(BIG.dir, bbig.id), fb = (rbig.failures || [])[0] || {};
-      // runCheck 는 앞부분을 CAP(256KB)에 닿을 때까지 읽은 조각째 붙이고(마지막 조각만큼 넘을 수 있다 — 파이프 조각은 64KB 이하) 꼬리는 정확히 CAP 로 자른다
+      // runCheck 는 앞부분을 정확히 CAP(256KB)에서 자르고 남는 것은 꼬리로 보낸다(파이프 조각 크기와 무관 — Windows · Node 20 CI 는 700KB 조각 하나를 넘겼다) · 꼬리도 정확히 CAP
       const CAP = 256 * 1024, bigLog = read(fb.log) || '';
       const parts = bigLog.split(/\n…\[\d+ bytes omitted\]…\n/);
       const headLen = parts.length === 2 ? parts[0].length : -1, tailLen = parts.length === 2 ? parts[1].length : -1;
-      R.check('[BA-26] 큰 출력 — 로그는 앞부분(CAP 이상 · CAP + 64KB 이하) + 생략 표시 한 번 + 꼬리(정확히 CAP) · 발췌는 4000자 이하 · 기록 JSON 은 작다 · 재실행 끔이면 final 하나',
-        bbig.verdict === 'fail' && (rbig.failures || []).length === 1 && fb.run === 'final' && parts.length === 2 && headLen >= CAP && headLen <= CAP + 64 * 1024 && tailLen === CAP && fb.excerpt.length <= 4000 && (fb.tests || []).includes('Big.Out') &&
+      R.check('[BA-26] 큰 출력 — 로그는 앞부분(정확히 CAP) + 생략 표시 한 번 + 꼬리(정확히 CAP) · 발췌는 4000자 이하 · 기록 JSON 은 작다 · 재실행 끔이면 final 하나',
+        bbig.verdict === 'fail' && (rbig.failures || []).length === 1 && fb.run === 'final' && parts.length === 2 && headLen === CAP && tailLen === CAP && fb.excerpt.length <= 4000 && (fb.tests || []).includes('Big.Out') &&
         fs.statSync(path.join(path.dirname(B.logsOf(BIG.dir, bbig.id)), `${bbig.id}.json`)).size < 64 * 1024, JSON.stringify({ parts: parts.length, headLen, tailLen, ex: (fb.excerpt || '').length, n: (rbig.failures || []).length }));
 
       // 정리 — batch drop 은 로그 폴더를 지운다 · 끝난(accepted) 묶음의 로그는 gc 가 지운다 · ready 묶음의 로그는 gc 가 남긴다
