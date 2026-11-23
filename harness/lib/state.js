@@ -211,9 +211,10 @@ function ownerAlive(owner) {
 
 // ── 잠금 ───────────────────────────────────────────────────────────────
 // mkdir 은 원자적이다. owner.json 을 쓰기 전에 죽은 잠금(owner 없음)은 10초가 지나면 버려진 것으로 본다.
+//   base: 잠금 폴더를 둘 곳(없으면 그 저장소의 locks) — serial_checks: machine 의 PC 공용 줄(resources.machineLocksDir)이 쓴다.
 const ORPHAN_MS = 10000;
-function lockDir(root, name) { return path.join(paths(root).locksDir, `${name}.lock`); }
-function lockOwner(root, name) { return readJson(path.join(lockDir(root, name), 'owner.json'), null); }
+function lockDir(root, name, base) { return path.join(base || paths(root).locksDir, `${name}.lock`); }
+function lockOwner(root, name, base) { return readJson(path.join(lockDir(root, name, base), 'owner.json'), null); }
 // {stale, owner} — owner 는 판정 때 본 owner.json(없으면 null). 빼앗기는 이 owner 를 들고 가 그사이 바뀌지 않았는지 확인한다.
 function staleInfo(dir) {
   const owner = readJson(path.join(dir, 'owner.json'), null);
@@ -262,7 +263,7 @@ function takeOver(dir, seen) {
 }
 function acquire(root, name, opts) {
   const o = opts || {}, waitMs = o.waitMs == null ? 0 : o.waitMs, pollMs = o.pollMs || 50;
-  const dir = lockDir(root, name), deadline = Date.now() + waitMs;
+  const dir = lockDir(root, name, o.dir), deadline = Date.now() + waitMs;
   fs.mkdirSync(path.dirname(dir), { recursive: true });
   let staleMiss = 0;
   for (;;) {
@@ -333,6 +334,8 @@ async function withLock(root, name, fn, opts) {
 //   가장 앞(우선순위 → 시각 → pid → 순번)의 산 번호표 주인만 잠금을 잡으러 간다. 0 = 사용자의 accept · 1 = 나머지.
 //   [2026-10-25 C++ 저장소 실측] 사용자의 accept 가 1초 폴링 잠금 뒤에서 무인 검사들을 2.5시간 기다렸다(그동안 merge 잠금을 쥔 채).
 //   옛 프로세스의 acquire 와도 서로 배제된다(같은 잠금). 죽은 pid 의 번호표는 지운다. 기다리는 동안 이벤트 루프를 막지 않는다.
+//   opts.dir: 잠금 · 번호표 폴더를 둘 곳(lockDir 의 base) · opts.meta: 번호표와 잠금 주인 기록에 더할 것(repo · timeout_ms …) ·
+//   opts.onWait(차례, 지금 주인): 아직 못 잡았을 때 폴링마다 — 진행을 알리는 쪽이 바뀐 때만 출력한다.
 const TICKET_BEAT_MS = 10 * 60 * 1000;
 let TICKET_SEQ = 0;
 const TICKETS = new Map();   // 이 프로세스의 번호표 → 잡은 잠금(없으면 null) — 끝날 때 치운다
@@ -347,7 +350,7 @@ function dropTicket(file) {
   if (h) h.release();
   try { fs.unlinkSync(file); } catch { /* 없음 */ }
 }
-const queueDir = (root, name) => path.join(paths(root).locksDir, `${name}.queue`);
+const queueDir = (root, name, base) => path.join(base || paths(root).locksDir, `${name}.queue`);
 const pad = (n, w) => String(n).padStart(w, '0');
 // 차례대로의 산 번호표 [{file, pid, host, at, priority, label}]. prune: 죽은 주인 · 오래 못 읽는 번호표를 지운다.
 function liveTickets(dir, prune) {
@@ -369,10 +372,10 @@ function liveTickets(dir, prune) {
 async function acquireQueued(root, name, opts) {
   const o = opts || {}, pollMs = o.pollMs || 500;
   const p = Number(o.priority == null ? 1 : o.priority), priority = Number.isFinite(p) ? Math.max(0, Math.min(9, Math.floor(p))) : 1;
-  const dir = queueDir(root, name);
+  const dir = queueDir(root, name, o.dir);
   fs.mkdirSync(dir, { recursive: true });
   const file = path.join(dir, `${priority}-${pad(Date.now(), 15)}-${pad(process.pid, 10)}-${pad(++TICKET_SEQ, 6)}.json`);
-  const ticket = { pid: process.pid, host: HOST, at: nowIso(), started_at: PROC_STARTED_AT, priority, label: o.label == null ? null : String(o.label) };
+  const ticket = { ...(o.meta || {}), pid: process.pid, host: HOST, at: nowIso(), started_at: PROC_STARTED_AT, priority, label: o.label == null ? null : String(o.label) };
   hookExit();
   TICKETS.set(file, null);
   writeJsonAtomic(file, ticket);
@@ -380,10 +383,10 @@ async function acquireQueued(root, name, opts) {
   try {
     for (;;) {
       if (!fs.existsSync(file)) writeJsonAtomic(file, ticket);   // 남이 지웠다(폴더 정리) — 같은 자리로 다시
-      const head = liveTickets(dir, true)[0];
+      const live = liveTickets(dir, true), head = live[0];
       if (head && head.file === file) {
         let h = null;
-        try { h = acquire(root, name, { pollMs: 25, meta: { priority, ...(ticket.label ? { label: ticket.label } : {}) } }); }
+        try { h = acquire(root, name, { pollMs: 25, dir: o.dir, meta: { ...(o.meta || {}), priority, ...(ticket.label ? { label: ticket.label } : {}) } }); }
         catch (e) { if (e.code !== 'LOCK_HELD') throw e; }   // 줄 밖의 옛 acquire 주인이 쥐고 있다 — 다음 차례에
         if (h) {
           TICKETS.set(file, h);
@@ -391,14 +394,15 @@ async function acquireQueued(root, name, opts) {
           return { ...h, ticket: file, touch: () => h.touch(), release() { if (released) return; released = true; dropTicket(file); } };
         }
       }
+      if (o.onWait) o.onWait(live.findIndex(t => t.file === file) + 1, lockOwner(root, name, o.dir));
       if (Date.now() - beat > TICKET_BEAT_MS) { beat = Date.now(); try { writeJsonAtomic(file, { ...ticket, heartbeat_at: nowIso() }); } catch { /* 다음에 */ } }
       await new Promise(r => setTimeout(r, pollMs));
     }
   } catch (e) { dropTicket(file); throw e; }
 }
 // 기다리는 줄(차례대로 · 맨 앞은 잡은 이일 수 있다) — 현황 표시용. 읽기만 한다.
-function queueOf(root, name) {
-  return liveTickets(queueDir(root, name), false).map(t => ({ pid: t.pid, priority: t.priority, label: t.label, at: t.at }));
+function queueOf(root, name, base) {
+  return liveTickets(queueDir(root, name, base), false).map(t => ({ pid: t.pid, priority: t.priority, label: t.label, at: t.at, ...(t.repo ? { repo: t.repo } : {}) }));
 }
 
 function listLocks(root) {

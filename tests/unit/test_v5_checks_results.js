@@ -190,6 +190,26 @@ const GO = ['=== RUN   TestParse', '--- FAIL: TestParse (0.00s)', '=== RUN   Tes
     hold2.release();
     await p2;
     R.check('[CR-09] runJudged 결과', res2 && res2.judged.ok === true && eq(res2.judged.failed_tests, []));
+
+    // ── [dev.pilot #84] 재실행했으면 첫 실행 결과(출력 포함)를 돌려준다 · 실패 기록(failureRecord) — TRX 경로 · 가리기 · 상한 ──
+    {
+      const d = path.join(base, 'cr10'); fs.mkdirSync(d, { recursive: true });
+      write(path.join(d, 'once.js'), "const fs=require('fs');if(!fs.existsSync('seen')){fs.writeFileSync('seen','1');console.log('FIRST-OUT');process.exitCode=1;}else console.log('# pass 1\\n# fail 0');");
+      write(path.join(d, 'pass.js'), "console.log('# pass 1\\n# fail 0')");
+      const rr = await K.runJudged(d, [['node', 'once.js']], { timeoutMs: 20000 });
+      const ro = await K.runJudged(d, [['node', 'pass.js']], { timeoutMs: 20000 });
+      fs.rmSync(path.join(d, 'seen'));
+      const rn = await K.runJudged(d, [['node', 'once.js']], { timeoutMs: 20000, rerun: false });
+      R.check('[CR-10] 다시 돌렸으면 first(첫 실행 · 출력 포함) · 판정은 재실행 결과 — 다시 돌리지 않았으면(통과 · rerun: false) first 없음',
+        rr.judged.ok === true && rr.flaky.length === 1 && rr.first && rr.first.ok === false && /FIRST-OUT/.test(rr.first.results[0].output) && ro.first === undefined && rn.judged.ok === false && rn.first === undefined,
+        JSON.stringify({ ok: rr.judged.ok, flaky: rr.flaky, first: !!rr.first, ro: !!ro.first, rn: !!rn.first }));
+      const out = ['not ok 1 - A.B', 'AssertionError: boom', '    at A.B (a.js:1:1)', 'Results File: C:\\r\\one.trx', '  결과 파일: D:/r/two.trx', 'Results File: C:\\r\\one.trx', 'password=hunter2xyz', 'Bearer abcdefghijklmnop'].join('\r\n');
+      const fr = K.failureRecord([{ ok: true, command: 'ok', output: 'x' }, { ok: false, command: 'node t.js', exit_code: 1, timed_out: false, pass: 0, fail: 1, output: out + '\n' + 'Z'.repeat(9000) }], 'final');
+      const f = fr[0] || {};
+      R.check('[CR-11] failureRecord — 실패한 검사만 · 시험 이름 · TRX 경로(영어 · 한국어 줄 · 중복 없이) · 발췌 4000자 이하 · 비밀은 가린다',
+        fr.length === 1 && f.command === 'node t.js' && f.run === 'final' && f.exit_code === 1 && eq(f.tests, ['A.B']) && eq(f.artifacts, ['C:\\r\\one.trx', 'D:/r/two.trx']) &&
+        f.excerpt.length <= 4000 && /AssertionError: boom/.test(f.excerpt) && !/hunter2xyz|abcdefghijklmnop/.test(f.excerpt) && /<secret>/.test(f.excerpt), JSON.stringify(f).slice(0, 500));
+    }
   } catch (e) { R.check('예외 없이 끝난다', false, String(e && e.stack || e).slice(0, 800)); }
   finally { try { fs.rmSync(base, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }); } catch { /* 임시 디렉터리 정리 실패는 결과와 무관 */ } }
   R.done();

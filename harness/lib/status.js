@@ -43,7 +43,9 @@ function status(o) {
       owner: t.owner ? { pid: t.owner.pid, host: t.owner.host, alive, heartbeat_at: t.owner.heartbeat_at || null, heartbeat_age_s: hb ? Math.round((now - hb) / 1000) : null } : null,
       stale: running && !alive, branch: t.branch, branch_exists: has(t.branch), base_branch: t.base_branch,
       files_changed: files.length, files, cost_usd: t.spent ? t.spent.cost_usd : 0, worktree: wtOf(t) && fs.existsSync(wtOf(t)) ? wtOf(t) : null,
-      merge_commit: t.merge_commit || null, updated_at: t.updated_at };
+      merge_commit: t.merge_commit || null, updated_at: t.updated_at,
+      // 다음 batch 후보 표시(ready <id> · #87) — fresh: 지금 브랜치 끝이 표시한 끝과 같다(계산 값 · 저장하지 않는다). 끝난 작업에는 보이지 않는다.
+      ready: t.ready && !FINAL.has(t.status) ? { ...t.ready, fresh: G.headSha(root, t.branch) === t.ready.tip } : null };
   });
   // 겹침: 끝나지 않은(병합·취소 전) 작업들이 같은 파일을 바꿈.
   const byFile = new Map();
@@ -74,7 +76,37 @@ function status(o) {
   const cost_total = Math.round(tasks.reduce((a, t) => a + (t.mode === 'light' ? 0 : Number(t.cost_usd) || 0), 0) * 100) / 100;
   return { root, checkout: main, branch: G.currentBranch(main), language, cost_total, tasks: tasks.map(({ files, ...t }) => t), finished_hidden: finished.length - shownFinished.size,
     v6: v6Tasks(root, all), broken: S.listBrokenTasks(root), overlaps, uncommitted: { by_session: bySession, unowned },
-    board: board(root, tasks, now) };
+    board: board(root, tasks, now), checks_slot: checksSlot(root) };
+}
+
+// 검사 줄(checks) — 범위(repo · machine · off) · 폴더 · 지금 쥔 이 · 기다리는 번호표(맨 앞은 쥔 이일 수 있다). 읽기만 한다.
+//   [dev.pilot #85] 줄이 보이지 않아 총괄이 손 장부로 차례를 셌다. 상한은 명령당(timeout_ms) — 실패 재실행 · 기준선 때문에 실제로 쥐는 시간은 그 배수일 수 있어
+//   끝나는 시각을 지어내지 않는다. slot 은 명령 하나라 until(잡은 시각 + 상한)을 적는다.
+function checksSlot(root) {
+  const K = require('./checks'), scope = K.serialScope(root);
+  if (!scope) return { scope: 'off', dir: null, holder: null, queue: [] };
+  const dir = scope === 'machine' ? require('./resources').machineLocksDir() : S.paths(root).locksDir;
+  const o = S.lockOwner(root, 'checks', dir), at = o ? Date.parse(o.at || '') : NaN;
+  const holder = o && S.ownerAlive(o) ? { pid: o.pid, label: o.label || null, repo: o.repo || null, priority: o.priority ?? null, at: o.at || null, timeout_ms: o.timeout_ms || null,
+    ...(o.kind === 'slot' && o.timeout_ms && at ? { until: new Date(at + o.timeout_ms).toISOString() } : {}) } : null;
+  return { scope, dir, holder, queue: S.queueOf(root, 'checks', dir) };
+}
+const hhmm = iso => { const d = new Date(iso); return Number.isNaN(d.getTime()) ? '?' : `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`; };
+// 줄이 비면(쥔 이도 기다리는 이도 없음) 아무것도 보이지 않는다 — 기존 출력 그대로.
+function slotLines(s, ko) {
+  const c = s.checks_slot;
+  if (!c || c.scope === 'off') return [];
+  const h = c.holder, mine = h ? c.queue.findIndex(t => t.pid === h.pid && t.label === h.label && t.priority === h.priority) : -1, wait = c.queue.filter((t, i) => i !== mine);   // 쥔 이의 번호표는 맨 앞이 아닐 수 있다(뒤에 온 우선순위 0)
+  if (!h && !wait.length) return [];
+  const who = x => [x.label, x.repo ? path.basename(x.repo) : null].filter(Boolean).join(' · ') || `pid ${x.pid}`;
+  const where = c.scope === 'machine' ? (ko ? `PC 공용 · ${c.dir}` : `per PC · ${c.dir}`) : (ko ? '이 저장소' : 'this repository');
+  const L = [];
+  if (h) {
+    const lim = h.until ? (ko ? ` · ${hhmm(h.until)}까지(상한)` : ` · until ${hhmm(h.until)} (limit)`) : h.timeout_ms ? (ko ? ` · 명령당 상한 ${Math.round(h.timeout_ms / 60000)}분` : ` · limit ${Math.round(h.timeout_ms / 60000)} min per command`) : '';
+    L.push(ko ? `검사 줄(${where}): 지금 pid ${h.pid} · ${who(h)} · ${hhmm(h.at)}부터${lim}` : `checks queue (${where}): now pid ${h.pid} · ${who(h)} · since ${hhmm(h.at)}${lim}`);
+  } else L.push(ko ? `검사 줄(${where}): 쥔 이 없음` : `checks queue (${where}): free`);
+  if (wait.length) L.push((ko ? `  대기 ${wait.length}: ` : `  waiting ${wait.length}: `) + wait.map((t, i) => `${i + 1}) ${who(t)} ${hhmm(t.at)}`).join('  '));
+  return L;
 }
 
 // v6 무인 작업(mode thin · full · 없음)으로 끝나지 않은 것 — 이어 가는 명령(레인으로 받기 · 작업자의 대화 그대로 이어 가기).
@@ -157,6 +189,10 @@ function boardLines(s, ko) {
 
 // 레인에는 비용이 없다 — v7 이전 무인 작업이 기록한 비용(0 보다 클 때)만 보인다
 const costText = t => (t.mode !== 'light' && Number(t.cost_usd) > 0 ? ` · $${Number(t.cost_usd).toFixed(2)}` : '');
+// 다음 batch 후보(#87) — 표시한 작업 줄 끝의 꼬리와 목록 아래 안내 한 줄. 표시가 없으면 아무것도 더하지 않는다(기존 출력 그대로).
+const readyText = (t, ko) => !t.ready ? '' : (ko ? ` · 다음 batch 후보(${hhmm(t.ready.at)}${t.ready.note ? ` · ${t.ready.note}` : ''})${t.ready.fresh ? '' : ` · 후보 표시 뒤 커밋 있음 — ready ${t.id} 로 다시 표시`}`
+  : ` · next batch candidate (${hhmm(t.ready.at)}${t.ready.note ? ` · ${t.ready.note}` : ''})${t.ready.fresh ? '' : ` · new commits since it was marked — mark it again with ready ${t.id}`}`);
+const readyHint = (s, ko) => { const n = s.tasks.filter(t => t.ready).length; return n ? [ko ? `다음 batch 후보 ${n}: node harness/cli.js batch --ready` : `next batch candidates ${n}: node harness/cli.js batch --ready`] : []; };
 function formatStatusKo(s) {
   const L = [`저장소: ${s.root} (${s.branch || 'detached HEAD'})`];
   if (!s.tasks.length) L.push('작업: 없음');
@@ -166,13 +202,15 @@ function formatStatusKo(s) {
       // [2026-10-25] 주인이 죽은 running 은 상태 칸부터 DEAD — 무엇이 실제로 도는지 한눈에.
       const dead = t.status === 'running' && !(t.owner && t.owner.alive);
       const own = t.status === 'running' ? (dead ? ` (running · 주인 프로세스${t.owner ? ` pid ${t.owner.pid}` : ''} 없음${t.owner && t.owner.heartbeat_age_s != null ? ` · 마지막 신호 ${t.owner.heartbeat_age_s}초 전` : ''}) — 아무것도 돌지 않는다 · start --from ${t.id} 로 이어 가거나 cancel 하세요` : ` · 실행 중 pid ${t.owner.pid}(신호 ${t.owner.heartbeat_age_s}초 전)`) : '';
-      L.push(`  ${t.id}  ${dead ? 'DEAD' : t.status}${own} · ${t.branch}${t.branch_exists ? '' : ' (없음)'} · 파일 ${t.files_changed}개${costText(t)} — ${t.goal}`);
+      L.push(`  ${t.id}  ${dead ? 'DEAD' : t.status}${own} · ${t.branch}${t.branch_exists ? '' : ' (없음)'} · 파일 ${t.files_changed}개${costText(t)} — ${t.goal}${readyText(t, true)}`);
     }
     if (s.finished_hidden) L.push(`  … 끝난(accepted · cancelled) 작업 ${s.finished_hidden}개는 줄였다(최근 ${FINISHED_SHOW}개만 보인다)`);
+    L.push(...readyHint(s, true));
     if (s.cost_total > 0) L.push(`누적 비용(v7 이전 무인 작업): $${Number(s.cost_total).toFixed(2)}`);
   }
   L.push(...v6Lines(s, true));
   L.push(...boardLines(s, true));
+  L.push(...slotLines(s, true));
   for (const b of s.broken || []) L.push(`  ${b.id}  손상 — task.json 을 읽을 수 없다(${b.task_file}) · 기록: ${b.log} — ${b.goal}`);
   if (s.overlaps.length) {
     L.push('겹침(열린 작업 둘 이상이 같은 파일을 바꿨다 — 두 번째를 들일 때 충돌한다):');
@@ -196,13 +234,15 @@ function formatStatus(s) {
     for (const t of s.tasks) {
       const dead = t.status === 'running' && !(t.owner && t.owner.alive);
       const own = t.status === 'running' ? (dead ? ` (running · OWNER DEAD: ${t.owner ? `pid ${t.owner.pid} is gone` : 'no owner recorded'}${t.owner && t.owner.heartbeat_age_s != null ? `, last heartbeat ${t.owner.heartbeat_age_s}s ago` : ''}) — nothing is running it; continue it with start --from ${t.id} or cancel it` : ` · owner pid ${t.owner.pid} alive (heartbeat ${t.owner.heartbeat_age_s}s ago)`) : '';
-      L.push(`  ${t.id}  ${dead ? 'DEAD' : t.status}${own} · ${t.branch}${t.branch_exists ? '' : ' (gone)'} · ${t.files_changed} files${costText(t)} — ${t.goal}`);
+      L.push(`  ${t.id}  ${dead ? 'DEAD' : t.status}${own} · ${t.branch}${t.branch_exists ? '' : ' (gone)'} · ${t.files_changed} files${costText(t)} — ${t.goal}${readyText(t, false)}`);
     }
     if (s.finished_hidden) L.push(`  … ${s.finished_hidden} more finished (accepted · cancelled) tasks not shown (the latest ${FINISHED_SHOW} are)`);
+    L.push(...readyHint(s, false));
     if (s.cost_total > 0) L.push(`spent by pre-v7 unattended tasks: $${Number(s.cost_total).toFixed(2)}`);
   }
   L.push(...v6Lines(s, false));
   L.push(...boardLines(s, false));
+  L.push(...slotLines(s, false));
   for (const b of s.broken || []) L.push(`  ${b.id}  BROKEN — task.json cannot be read (${b.task_file}) · its log: ${b.log} — ${b.goal}`);
   if (s.overlaps.length) {
     L.push('overlaps (the same file changed by more than one open task — integrating the second will conflict):');
@@ -254,12 +294,13 @@ function ignoredChanged(root, wt, include) {
   }
   return out;
 }
-const ignoredWhy = files => `ignored files changed (outside git; removing the worktree would delete them): ${files.slice(0, 10).join(', ')}${files.length > 10 ? ` … (+${files.length - 10})` : ''} — copy what you need, then remove it with git worktree remove --force`;
+// [#91] 안내는 --force 없는 remove 다 — guard 가 강제 제거를 막는다. 무시된 파일만 남았으면 이것으로 지워지고, 미커밋 변경이 있으면 git 이 거절한다.
+const ignoredWhy = (files, wt) => `ignored files changed (outside git; removing the worktree would delete them): ${files.slice(0, 10).join(', ')}${files.length > 10 ? ` … (+${files.length - 10})` : ''} — copy what you need, then remove it with git worktree remove "${wt || '<worktree>'}" (no --force: git still refuses if tracked or untracked changes remain)`;
 
 // 작업 worktree 를 지워도 되면 지우고 {ok:true}, 아니면 {ok:false, why}. 무시된 파일이 바뀌었으면 남긴다.
 function removeIfSafe(root, wt, include) {
   const ign = fs.existsSync(wt) ? ignoredChanged(root, wt, include) : [];
-  if (ign.length) return { ok: false, why: ignoredWhy(ign), ignored: ign };
+  if (ign.length) return { ok: false, why: ignoredWhy(ign, wt), ignored: ign };
   const rm = G.removeWorktree(root, wt);
   return rm.ok ? { ok: true } : { ok: false, why: rm.error };
 }
@@ -364,15 +405,26 @@ function gc(o) {
       if (r.ok) removed.push({ id: null, worktree: wt }); else kept.push({ id: null, worktree: wt, why: r.why, ...(r.ignored ? { ignored_changed: r.ignored } : {}) });
     }
   } finally { if (mh) mh.release(); }
+  // [dev.pilot #84] 끝난 묶음(accepted · dropped · empty · error)의 실패 출력 로그(batches/<bid>.logs)를 함께 지운다 — ready · 만드는 중은 남긴다.
+  const batchLogs = [];
+  try {
+    const Bt = require('./batch');
+    for (const b of Bt.listBatches(root)) {
+      const d = Bt.logsOf(root, b.id);
+      if (!['accepted', 'dropped', 'empty', 'error'].includes(b.status) || !fs.existsSync(d) || S.lockLive(root, `batch-${b.id}`)) continue;
+      try { fs.rmSync(d, { recursive: true, force: true }); batchLogs.push(d); } catch { /* 다음 gc */ }
+    }
+  } catch { /* 없는 판 */ }
   const locks = S.removeDeadLocks(root);
   G.git(root, ['worktree', 'prune'], { allowFail: true });
-  return { root, removed, kept, released, locks_removed: locks };
+  return { root, removed, kept, released, locks_removed: locks, ...(batchLogs.length ? { batch_logs_removed: batchLogs } : {}) };
 }
 function formatGc(g) {
   return [`gc: ${g.root}`, `removed worktrees: ${g.removed.length ? g.removed.map(x => x.id || x.worktree).join(', ') : 'none'}`,
     ...g.kept.map(k => `kept ${k.id || k.worktree}: ${k.why}`),
     ...(g.released || []).map(r => `released ${r.id}: ${[r.tmp_removed ? 'temp folder' : '', ...Object.entries(r.docker || {}).map(([k, v]) => `${v} docker ${k}`), r.cleanup != null ? `cleanup_command ${r.cleanup ? 'ok' : 'FAILED'}` : ''].filter(Boolean).join(' · ') || 'nothing'}${r.residue.length ? ` — LEFT: ${r.residue.join(', ')}` : ''}`),
-    `dead locks released: ${g.locks_removed.length ? g.locks_removed.join(', ') : 'none'}`].join('\n');
+    `dead locks released: ${g.locks_removed.length ? g.locks_removed.join(', ') : 'none'}`,
+    ...((g.batch_logs_removed || []).length ? [`removed batch failure logs: ${g.batch_logs_removed.length}`] : [])].join('\n');
 }
 
 module.exports = { status, formatStatus, gc, formatGc, taskFiles, ignoredChanged, ignoredWhy, removeIfSafe };

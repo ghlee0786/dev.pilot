@@ -156,6 +156,56 @@ const parents = (cwd, ref) => git(cwd, ['rev-list', '--parents', '-n', '1', ref]
       R.check('[BA-15] 칸의 커밋하지 않은 추적 파일 대량 삭제는 커밋하지 않고 그 구성원을 건너뛴다', mdel.status === 'skipped' && /tracked file/.test(mdel.why) && !mdel.committed && git(yb.wt, ['ls-tree', '-r', '--name-only', 'HEAD']).split(/\r?\n/).filter(f => f.startsWith('src/')).length === 25, JSON.stringify(mdel));
     }
 
+    // ── [2026-11-05 소유권] light 칸의 주인 모를 미커밋분(남의 tracked 수정 · staged 새 파일 · 설치기가 남긴 미추적 .vscode)은
+    //   대신 커밋하지 않는다 — 그 구성원은 건너뛰고(옛 끝을 합쳐 pass 를 내지 않는다) index 바이트 · 작업 파일 · HEAD 를 그대로 둔다 ─
+    {
+      const O = mkRepo({ 'tracked.txt': 'base\n' });
+      const lo = lane(O, 'lane with foreign leftovers', { 'mine.txt': 'mine\n' });
+      write(path.join(lo.wt, 'tracked.txt'), 'base\nother edit\n'); git(lo.wt, ['add', '--', 'tracked.txt']);   // 같은 파일에 staged 부분 …
+      write(path.join(lo.wt, 'tracked.txt'), 'base\nother edit\nother unstaged edit\n');                          // … 과 unstaged 부분이 함께(MM)
+      write(path.join(lo.wt, 'staged.txt'), 'other staged\n'); git(lo.wt, ['add', '--', 'staged.txt']);
+      write(path.join(lo.wt, '.vscode', 'settings.json'), '{"x":1}\n');
+      const idxFile = path.join(git(lo.wt, ['rev-parse', '--absolute-git-dir']), 'index');
+      const snapO = () => ({ head: git(lo.wt, ['rev-parse', 'HEAD']), index: fs.readFileSync(idxFile).toString('base64'), status: git(lo.wt, ['status', '--porcelain', '--untracked-files=all']),
+        files: ['tracked.txt', 'staged.txt', '.vscode/settings.json'].map(f => read(path.join(lo.wt, f))) });
+      const s0 = snapO(), mainO = git(O.dir, ['rev-parse', 'main']);
+      const bo = await B.create({ ...quiet, root: O.dir, ids: [lo.id] });
+      const mo = B.readBatch(O.dir, bo.id).members[0], s1 = snapO();
+      R.check('[BA-22] 주인 모를 미커밋분이 있는 light 칸은 건너뛴다(커밋 0 · 이유에 그 파일들) · 빈 묶음',
+        mo.status === 'skipped' && !mo.committed && /owner cannot be proven/.test(mo.why) && /staged\.txt/.test(mo.why) && /tracked\.txt/.test(mo.why) && /\.vscode\/settings\.json/.test(mo.why) && bo.status === 'empty', JSON.stringify(mo));
+      R.check('[BA-22] 그 칸의 HEAD · index 바이트 · 작업 파일 · status 가 그대로 · main 그대로', JSON.stringify(s0) === JSON.stringify(s1) && git(O.dir, ['rev-parse', 'main']) === mainO, JSON.stringify([s0.status, s1.status]));
+      R.check('[BA-22] 같은 파일의 staged + unstaged(MM)가 그대로 — index 의 tracked.txt 는 staged 내용 · 작업 파일은 unstaged 까지',
+        /^MM tracked\.txt$/m.test(s1.status) && git(lo.wt, ['show', ':tracked.txt']) === 'base\nother edit' && s1.files[0] === 'base\nother edit\nother unstaged edit\n', s1.status);
+      const ao = await I.accept({ ...quiet, root: O.dir, id: lo.id }), s2 = snapO();
+      R.check('[BA-22] accept 도 같은 칸을 거부하고 아무것도 바꾸지 않는다(HEAD · index · 파일 · main)', ao.refused === true && /owner cannot be proven/.test(ao.reason) && JSON.stringify(s0) === JSON.stringify(s2) && git(O.dir, ['rev-parse', 'main']) === mainO, ao.reason);
+      R.check('[BA-22] 거부 안내는 자기 파일만 커밋하고 남의 파일은 지우거나 되돌리지 말라고 한다(삭제 유도 문구 없음)',
+        /commit only the files you changed/.test(ao.reason) && /never delete, revert or commit files you did not change/.test(ao.reason) && /owner or the coordinator/.test(ao.reason)
+        && /must have no uncommitted changes/.test(ao.reason) && !/remove the rest/.test(ao.reason), ao.reason);
+    }
+
+    // ── [2026-11-05 소유권 S1 · S2] 검사 캐시(CACHE_RE)만 남은 light 칸은 묶고 받아들인다 — 캐시는 커밋하지 않고 leftovers_ignored 로 기록 ·
+    //   batch accept(acceptLocked)도 같은 규칙: 일반 미추적 파일이 더해지면 거부한다(대조군) ─
+    {
+      const Q = mkRepo();
+      const lq = lane(Q, 'lane with only a check cache left', { 'q.txt': 'q\n' });
+      write(path.join(lq.wt, '__pycache__', 'x.cpython-312.pyc'), 'cache\n');   // 검사가 남긴 미추적 캐시
+      const bq = await B.create({ ...quiet, root: Q.dir, ids: [lq.id] });
+      const mq = B.readBatch(Q.dir, bq.id).members[0];
+      const ign = S.readLog(Q.dir, lq.id).find(e => e.event === 'leftovers_ignored');
+      R.check('[BA-23] 캐시만 남은 light 칸은 묶인다(merged · 대신 커밋 0) · leftovers_ignored 에 그 캐시 경로',
+        mq.status === 'merged' && !mq.committed && bq.verdict === 'pass' && !!ign && ign.files.includes('__pycache__/x.cpython-312.pyc'), JSON.stringify([mq, ign]));
+      write(path.join(lq.wt, 'notes.txt'), 'someone else\n');   // 대조군 — 주인 모를 일반 미추적 파일
+      const mainQ = git(Q.dir, ['rev-parse', 'main']);
+      const aq0 = await B.accept({ root: Q.dir, bid: bq.id });
+      R.check('[BA-23] 일반 미추적 파일이 더해지면 batch accept 가 거부한다(이유에 notes.txt · 캐시는 이유에 없음 · main 그대로)',
+        aq0.refused === true && /notes\.txt/.test(aq0.reason) && !/__pycache__/.test(aq0.reason) && git(Q.dir, ['rev-parse', 'main']) === mainQ, aq0.reason);
+      fs.rmSync(path.join(lq.wt, 'notes.txt'));   // 시험이 만든 대조 파일만 치운다
+      const aq = await B.accept({ root: Q.dir, bid: bq.id });
+      R.check('[BA-23] 캐시만 남으면 batch accept 가 accepted · 캐시는 main 트리에 없다 · 칸의 캐시 파일은 그대로',
+        aq.status === 'accepted' && !git(Q.dir, ['ls-tree', '-r', '--name-only', 'main']).split(/\r?\n/).some(f => f.includes('__pycache__'))
+          && read(path.join(lq.wt, '__pycache__', 'x.cpython-312.pyc')) === 'cache\n', JSON.stringify([aq.status, aq.reason]));
+    }
+
     // ── [감사] 사용자 검사(--checks)는 원래 실패여도 not-worse 가 아니다(accept 와 같다) · lint_command 를 돌린다 ─
     {
       const U = mkRepo({ 'bad1.txt': 'known failure\n' });
@@ -211,6 +261,7 @@ const parents = (cwd, ref) => git(cwd, ['rev-list', '--parents', '-n', '1', ref]
       const bv = await B.create({ ...quiet, root: V.dir, all: true });
       const mv = (B.readBatch(V.dir, bv.id).members || []).find(m => m.id === va.id) || {};
       R.check('[BA-20] 산 세션이 일하는 칸은 batch(--all)가 건너뛴다(why: live session)', mv.status === 'skipped' && /live session live1111/.test(mv.why), JSON.stringify(mv));
+      R.check('[BA-20c] (#88) 산 세션으로 건너뛴 이유에 기록상 cwd · 기록 시각이 있다(낡은 기록인지 알아볼 수 있게)', /recorded cwd .+ at \d{4}-\d\d-\d\dT/.test(mv.why || '') && (mv.why || '').includes(va.wt), JSON.stringify(mv.why));
       // [자동 이슈 #67] 부른 세션 자신이 그 칸을 가리키면(예전에 cd 했다) 건너뛰지 않는다
       const hadSid = process.env.CLAUDE_CODE_SESSION_ID;
       process.env.CLAUDE_CODE_SESSION_ID = 'live1111-aaaa';
@@ -242,6 +293,69 @@ const parents = (cwd, ref) => git(cwd, ['rev-list', '--parents', '-n', '1', ref]
       const bz2 = await B.create({ ...quiet, root: Z.dir, ids: [zl.id], checkTimeoutMs: 2500 });
       const rz2 = B.readBatch(Z.dir, bz2.id);
       R.check('[BA-21] 시간 초과로 잰 기준선은 캐시에 남기지 않고 다음 묶음은 다시 잰다', cached === 0 && rz2.baseline && rz2.baseline.cached === false, JSON.stringify({ cached, base: rz2.baseline }));
+    }
+
+    // ── [dev.pilot #84] 실패 출력 — 실패한 시험 이름만이 아니라 메시지 · 스택 · TRX 경로 · 로그 파일을 기록에 남긴다(비밀은 가린다) ──
+    {
+      const St = require('../../harness/lib/status');
+      // bad.txt 가 있으면 실패: 시험 이름 · 단언 메시지 · 스택 · TRX 경로 · 비밀 꼴 한 줄을 찍는다
+      const CHK = `const fs=require('fs'),path=require('path');
+if(fs.existsSync('bad.txt')){console.log('not ok 1 - Suite.FailsUnderLoad');console.log('AssertionError: expected 1 got 2');console.log('    at Suite.FailsUnderLoad (check.js:3:9)');
+console.log('Results File: '+path.resolve('TestResults','run1.trx'));console.log('token=abc123secretvalue');console.log('# pass 1\\n# fail 1');process.exitCode=1;}
+else console.log('# pass 2\\n# fail 0');`;
+      const F = mkRepo({ 'check.js': CHK });
+      const lf = lane(F, 'lane breaks', { 'bad.txt': 'x\n' });
+      const bf = await B.create({ ...quiet, root: F.dir, ids: [lf.id] });
+      const rf = B.readBatch(F.dir, bf.id), fails = rf.failures || [], fin = fails.find(f => f.run === 'final') || {};
+      const logText = fin.log ? read(fin.log) : null;
+      R.check('[BA-24] 실패한 묶음 — failures 에 첫 · 마지막 실행(재실행했으니 둘) · 명령 · 종료 코드 · 실패한 시험 이름',
+        bf.verdict === 'fail' && fails.map(f => f.run).join() === 'first,final' && fin.command === 'node check.js' && fin.exit_code === 1 && (fin.tests || []).includes('Suite.FailsUnderLoad'), JSON.stringify(fails).slice(0, 600));
+      R.check('[BA-24] 발췌에 단언 메시지와 스택 앞부분 · TRX 경로(복사 아님) · 로그 파일은 batches/<bid>.logs 아래에 같은 출력',
+        /AssertionError: expected 1 got 2/.test(fin.excerpt) && /at Suite\.FailsUnderLoad/.test(fin.excerpt) && (fin.artifacts || []).length === 1 && /run1\.trx$/.test(fin.artifacts[0]) &&
+        !!logText && /AssertionError: expected 1 got 2/.test(logText) && path.dirname(fin.log) === B.logsOf(F.dir, bf.id), JSON.stringify({ ex: fin.excerpt, art: fin.artifacts, log: fin.log }).slice(0, 600));
+      R.check('[BA-24] 비밀은 쓰는 쪽에서 가린다 — 발췌와 로그 파일 모두에 원래 값이 없다',
+        !/abc123secretvalue/.test(JSON.stringify(rf)) && !!logText && !/abc123secretvalue/.test(logText) && /<secret>/.test(logText), (logText || '').slice(0, 300));
+      R.check('[BA-24] 보고에 실패 출력 줄(로그 경로 · TRX)과 발췌 몇 줄 · 기존 기록 필드(checks · failed_tests · failing) 모양은 그대로',
+        /실패 출력\(마지막 실행\): node check\.js → /.test(bf.report) && /TRX: .*run1\.trx/.test(bf.report) && /\| AssertionError: expected 1 got 2/.test(bf.report) &&
+        Object.keys(rf.checks).join() === 'ok,pass,fail,failed_tests,indeterminate,results' && rf.failed_tests.includes('Suite.FailsUnderLoad') && rf.failing.join() === 'node check.js' && !('failures' in bf), bf.report.split('\n').filter(l => /실패|\|/.test(l)).join(' / '));
+      const lp = lane(F, 'lane passes', { 'ok.txt': 'x\n' });
+      const bp = await B.create({ ...quiet, root: F.dir, ids: [lp.id] });
+      R.check('[BA-24] 통과한 묶음(불안정 없음)은 failures 도 로그 폴더도 없다', bp.verdict === 'pass' && !('failures' in B.readBatch(F.dir, bp.id)) && !fs.existsSync(B.logsOf(F.dir, bp.id)));
+
+      // 처음엔 실패하고 다시 돌리면 통과 — 판정은 재실행 결과(pass)지만 첫 실행의 실패 출력이 남는다
+      const flakyCount = path.join(base, 'flaky-count.txt');
+      const FL = mkRepo({ 'check.js': `const fs=require('fs'),c=${JSON.stringify(flakyCount)};const n=fs.existsSync(c)?fs.readFileSync(c,'utf8').length:0;
+if(fs.existsSync('flaky.txt')){fs.appendFileSync(c,'x');if(n===0){console.log('not ok 1 - Flaky.Once');console.log('FIRST-RUN-ONLY boom');console.log('# pass 0\\n# fail 1');process.exitCode=1;return;}}
+console.log('# pass 1\\n# fail 0');` });
+      const lfl = lane(FL, 'flaky lane', { 'flaky.txt': 'x\n' });
+      const bfl = await B.create({ ...quiet, root: FL.dir, ids: [lfl.id] });
+      const rfl = B.readBatch(FL.dir, bfl.id), f1 = (rfl.failures || [])[0] || {};
+      R.check('[BA-25] 불안정(첫 실행만 실패)해도 첫 실행의 실패 출력이 남는다 — 판정 pass · flaky · failures 는 first 하나 · 로그에 첫 출력',
+        bfl.verdict === 'pass' && (rfl.flaky || []).length === 1 && (rfl.failures || []).length === 1 && f1.run === 'first' && /FIRST-RUN-ONLY/.test(read(f1.log) || '') && (f1.tests || []).includes('Flaky.Once'), JSON.stringify({ v: bfl.verdict, flaky: rfl.flaky, failures: rfl.failures }).slice(0, 500));
+
+      // 큰 출력 — 로그는 runCheck 가 모은 만큼(앞 256KB + 꼬리 256KB) · 발췌는 4000자 · 재실행 끔이면 마지막 실행 하나
+      const BIG = mkRepo({ 'AGENTS.md': '# p\n\n```yaml\ntest_command: "node check.js"\nrerun_failed: off\n```\n',
+        'check.js': `if(require('fs').existsSync('bad.txt')){process.stdout.write('A'.repeat(700*1024)+'\\n');console.log('not ok 1 - Big.Out');console.log('# pass 0\\n# fail 1');process.exitCode=1;}else console.log('# pass 1\\n# fail 0');` });
+      const lbig = lane(BIG, 'big output', { 'bad.txt': 'x\n' });
+      const bbig = await B.create({ ...quiet, root: BIG.dir, ids: [lbig.id] });
+      const rbig = B.readBatch(BIG.dir, bbig.id), fb = (rbig.failures || [])[0] || {};
+      // runCheck 는 앞부분을 CAP(256KB)에 닿을 때까지 읽은 조각째 붙이고(마지막 조각만큼 넘을 수 있다 — 파이프 조각은 64KB 이하) 꼬리는 정확히 CAP 로 자른다
+      const CAP = 256 * 1024, bigLog = read(fb.log) || '';
+      const parts = bigLog.split(/\n…\[\d+ bytes omitted\]…\n/);
+      const headLen = parts.length === 2 ? parts[0].length : -1, tailLen = parts.length === 2 ? parts[1].length : -1;
+      R.check('[BA-26] 큰 출력 — 로그는 앞부분(CAP 이상 · CAP + 64KB 이하) + 생략 표시 한 번 + 꼬리(정확히 CAP) · 발췌는 4000자 이하 · 기록 JSON 은 작다 · 재실행 끔이면 final 하나',
+        bbig.verdict === 'fail' && (rbig.failures || []).length === 1 && fb.run === 'final' && parts.length === 2 && headLen >= CAP && headLen <= CAP + 64 * 1024 && tailLen === CAP && fb.excerpt.length <= 4000 && (fb.tests || []).includes('Big.Out') &&
+        fs.statSync(path.join(path.dirname(B.logsOf(BIG.dir, bbig.id)), `${bbig.id}.json`)).size < 64 * 1024, JSON.stringify({ parts: parts.length, headLen, tailLen, ex: (fb.excerpt || '').length, n: (rbig.failures || []).length }));
+
+      // 정리 — batch drop 은 로그 폴더를 지운다 · 끝난(accepted) 묶음의 로그는 gc 가 지운다 · ready 묶음의 로그는 gc 가 남긴다
+      B.drop({ root: BIG.dir, bid: bbig.id });
+      R.check('[BA-27] batch drop 은 그 묶음의 로그 폴더를 함께 지운다', !fs.existsSync(B.logsOf(BIG.dir, bbig.id)));
+      const g0 = St.gc({ root: F.dir });
+      R.check('[BA-27] gc 는 ready 묶음의 로그를 남긴다', fs.existsSync(B.logsOf(F.dir, bf.id)) && !(g0.batch_logs_removed || []).includes(B.logsOf(F.dir, bf.id)));
+      const af = await B.accept({ root: F.dir, bid: bf.id, force: true });
+      const g1 = St.gc({ root: F.dir });
+      R.check('[BA-27] 받아들인(accepted) 묶음의 로그는 gc 가 지운다 · gc 결과와 보고에 그 수',
+        af.status === 'accepted' && !fs.existsSync(B.logsOf(F.dir, bf.id)) && (g1.batch_logs_removed || []).includes(B.logsOf(F.dir, bf.id)) && /removed batch failure logs: 1/.test(St.formatGc(g1)), JSON.stringify({ af: [af.status, af.reason], g1: g1.batch_logs_removed }));
     }
   } catch (e) { R.check('예외 없이 끝난다', false, String(e && e.stack || e).slice(0, 800)); }
   finally { try { fs.rmSync(base, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }); } catch { /* 임시 디렉터리 정리 실패는 결과와 무관 */ } }

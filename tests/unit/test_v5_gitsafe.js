@@ -31,7 +31,10 @@ const write = (f, t) => { fs.mkdirSync(path.dirname(f), { recursive: true }); fs
     const editorExe = path.join(base, 'Microsoft VS Code', process.platform === 'win32' ? 'Code.exe' : 'code');
     fs.mkdirSync(path.dirname(editorExe), { recursive: true }); fs.copyFileSync(process.execPath, editorExe);
     const editor = spawn(editorExe, ['-e', 'setTimeout(()=>{},60000)', hold], { stdio: 'ignore', windowsHide: true }); kids.push(editor);
+    const orphanSpawnAt = Date.now();
     const orphan = spawn(process.execPath, [path.join(hold, 'sleep.js')], { stdio: 'ignore', windowsHide: true }); kids.push(orphan);
+    // GS-04 관측 — 실패하면 pid 재사용 · 종료 실패 · 종료 지연을 구분할 수 있게 자기 자식의 exit 이벤트를 기록한다
+    let orphanExit = null; orphan.on('exit', (code, signal) => { orphanExit = { code, signal, at: Date.now() }; });
     // 두 프로세스가 목록에 보일 때까지(상한 30초) — [2026-10-30 릴리스 CI] 부하 속에서 0.8초 뒤 목록에 아직 없었다(복사한 실행 파일 기동이 늦음)
     let seen = [];
     for (const until = Date.now() + 30000; Date.now() < until;) {
@@ -40,10 +43,27 @@ const write = (f, t) => { fs.mkdirSync(path.dirname(f), { recursive: true }); fs
       await new Promise(r => setTimeout(r, 500));
     }
     if (!seen.some(p => p.pid === editor.pid)) console.log(`  (GS-03 대기: 30초 안에 편집기 pid ${editor.pid} 가 목록에 보이지 않았다 — ${JSON.stringify(seen)})`);
+    const killAt = Date.now();
     const killed = G.killProcsIn(hold);
     await new Promise(r => setTimeout(r, 800));
+    const orphanAlive = S.pidAlive(orphan.pid);   // 판정은 이 한 번 — 아래 관측은 판정에 쓰지 않는다
     R.check('[GS-03] killProcsIn: 폴더를 연 편집기(Code)는 끝내지 않는다', seen.some(p => p.pid === editor.pid) && !killed.some(p => p.pid === editor.pid) && S.pidAlive(editor.pid), JSON.stringify({ seen, killed }));
-    R.check('[GS-04] killProcsIn: 같은 폴더의 고아 프로세스(node)는 끝낸다', killed.some(p => p.pid === orphan.pid) && !S.pidAlive(orphan.pid), JSON.stringify(killed));
+    const gs04 = killed.some(p => p.pid === orphan.pid) && !orphanAlive;
+    let gs04Detail = { orphanPid: orphan.pid, orphanAlive, killed };
+    if (!gs04) {
+      let kill0 = 'ok'; try { process.kill(orphan.pid, 0); } catch (e) { kill0 = e.code; }
+      gs04Detail = { ...gs04Detail, kill0, exitCode: orphan.exitCode, signalCode: orphan.signalCode,
+        exitEvent: orphanExit && { code: orphanExit.code, signal: orphanExit.signal, msAfterKill: orphanExit.at - killAt }, spawnAt: new Date(orphanSpawnAt).toISOString(), killAt: new Date(killAt).toISOString() };
+      if (orphanAlive && process.platform === 'win32') {
+        // 지금 그 pid 를 가진 프로세스 — 생성 시각이 spawnAt 보다 뒤면 다른 프로세스(pid 재사용). 남의 명령줄은 적지 않는다(이 테스트 폴더를 가리킬 때만).
+        const q = `Get-CimInstance Win32_Process -Filter "ProcessId=${orphan.pid}" | ForEach-Object { '{0}\t{1}\t{2}\t{3}' -f $_.Name, $_.CreationDate.ToUniversalTime().ToString('o'), $_.ParentProcessId, $_.CommandLine }`;
+        const r = require('node:child_process').spawnSync('powershell', ['-NoProfile', '-NonInteractive', '-Command', q], { encoding: 'utf8', windowsHide: true, timeout: 30000 });
+        const [name, created, ppid, ...cmd] = String(r.stdout || '').trim().split('\t');
+        const line = cmd.join('\t');
+        gs04Detail.samePidNow = name ? { name, created, ppid: Number(ppid), ownTestProcess: line.toLowerCase().includes(hold.toLowerCase()), cmd: line.toLowerCase().includes(hold.toLowerCase()) ? line.slice(0, 300) : '(다른 프로세스 — 생략)' } : { none: true, status: r.status };
+      }
+    }
+    R.check('[GS-04] killProcsIn: 같은 폴더의 고아 프로세스(node)는 끝낸다', gs04, JSON.stringify(gs04Detail));
   } catch (e) { R.check('예외 없이 끝난다', false, String(e && e.stack || e).slice(0, 800)); }
   finally {
     for (const k of kids) { try { process.kill(k.pid); } catch { /* 끝났다 */ } }

@@ -81,7 +81,8 @@ function claudeHooks() {
   //   board — 세션 게시판(같은 체크아웃의 다른 세션 · 같은 목표 알림 · 남의 미커밋 파일 편집 전 묻기 · 가벼운 길의 환경).
   return {
     // guard 는 실패(오류 · 시간 초과 · 셸 없음)해도 막는다 — [2026-10-29 Claude Code 문서] onFailure 가 없으면 Git for Windows 가 있을 때 실패가 통과로 끝난다(v2.1.295+ · 옛 판은 이 키를 무시)
-    PreToolUse: [{ matcher: 'Bash|PowerShell|mcp__.*', hooks: [{ ...h('guard', 10), onFailure: 'block' }] }, { matcher: 'Write|Edit|MultiEdit|NotebookEdit', hooks: [h('board', 10)] }],
+    PreToolUse: [{ matcher: 'Bash|PowerShell|mcp__.*', hooks: [{ ...h('guard', 10), onFailure: 'block' }] }, { matcher: 'Write|Edit|MultiEdit|NotebookEdit', hooks: [h('board', 10)] },
+      { matcher: 'mcp__.*__(write_file|edit_file|move_file|create_file)', hooks: [h('board', 10)] }],   // [2026-11-02 소유권] track 이 기록하는 쓰기는 모두 쓰기 전 상태도 적는다
     PostToolUse: [{ matcher: 'Write|Edit|MultiEdit|NotebookEdit|mcp__.*__(write_file|edit_file|move_file|create_file)', hooks: [h('track', 10)] }],
     UserPromptSubmit: [{ hooks: [h('lang', 10), h('board', 10)] }],          // 응답 언어 — 매 턴 상기(2026-10-13) · 게시판
     SessionStart: [{ hooks: [h('board', 10)] }],
@@ -102,7 +103,8 @@ function codexHooks(root) {
   });
   return {
     // [2026-10-29 감사] MCP 의 git · GitHub 쓰기 도구가 Codex 에서는 guard 를 비켜 갔다 — Claude 쪽처럼 mcp__ 도구도 본다.
-    PreToolUse: [{ matcher: 'Bash|shell|local_shell|exec_command|unified_exec|mcp__.*', hooks: [h('guard', 10)] }],
+    PreToolUse: [{ matcher: 'Bash|shell|local_shell|exec_command|unified_exec|mcp__.*', hooks: [h('guard', 10)] },
+      { matcher: 'apply_patch|Edit|Write', hooks: [h('board', 10)] }],   // [2026-11-02 소유권] 쓰기 전 상태(board 는 Codex 에선 적기만 한다)
     PostToolUse: [{ matcher: 'apply_patch|Edit|Write', hooks: [h('track', 10)] }],
     UserPromptSubmit: [{ hooks: [h('lang', 10), h('board', 10)] }],      // 게시판은 요청 때만(Codex 는 CLAUDE_ENV_FILE 이 없다)
     Stop: [{ hooks: [h('stop', 30), h('lang', 10)] }],

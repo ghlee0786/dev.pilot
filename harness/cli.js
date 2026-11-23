@@ -13,12 +13,14 @@ usage:
       --from <id>: continue that task from its branch instead of starting over
   node harness/cli.js status [--json]   (lanes · tasks · live sessions · overlapping files · uncommitted changes by owner)
   node harness/cli.js accept <id> [--into <branch>] [--force] [--check-timeout-min <n>]   (task ids only · only after the user says so — runs the checks once and refuses only what got worse)
-  node harness/cli.js batch [<id>...] [--all] [--branch <name>]... [--into <branch>] [--check "<cmd>"]... [--force] [--json]   (lanes a live session still works in are skipped unless --force · merge finished work — lanes or any branch, e.g. a background session's — into harness/batch/<bid> and run the checks once — your branch is untouched)
+  node harness/cli.js ready <id> [--note "<one line>"] | ready <id> --clear   (mark a finished lane as a candidate for the next batch at its current tip — status shows it · batch --ready bundles it)
+  node harness/cli.js batch [<id>...] [--all] [--ready] [--branch <name>]... [--into <branch>] [--check "<cmd>"]... [--force] [--json]   (lanes a live session still works in are skipped unless --force · merge finished work — lanes or any branch, e.g. a background session's — into harness/batch/<bid> and run the checks once — your branch is untouched)
   node harness/cli.js batch accept <bid> [--force] | batch status [<bid>] | batch drop <bid> [--force]   (batch accept merges into your branch — only after the user says so)
   node harness/cli.js check <id> [--force]   (run the checks now and record them — merges nothing)
+  node harness/cli.js slot [--label <name>] [--timeout-min <n>] -- <command> [args...]   (wait in the checks queue — per repository, or per PC with serial_checks: machine — run the command, then free it · its exit code as is · 124 past the limit)
   node harness/cli.js cancel <id> [--skip-checks] [--force] | restore <id> [--skip-checks]   (revert a merge · bring it back)
       check · cancel refuse while a live session works inside that lane's worktree — --force only after the user says so
-  node harness/cli.js push [<remote>] [<branch>] | push [<remote>] --tag <name> [--dry-run]   (only after the user explicitly asks; fast-forward only, never force, never harness/* branches)
+  node harness/cli.js push [<remote>] [<branch>] | push [<remote>] --tag <name> [--dry-run]   (only after the user explicitly asks; fast-forward only, never force, never harness/* branches · --dry-run also checks write access — nothing is sent — and reports the remote · credential helper · account)
   node harness/cli.js gc [--json]   (remove finished work: worktrees · processes · containers · temp folders · ports — only the harness's own)
   node harness/cli.js toolkit [--json]   (skills · MCP · plugins that fit this repository: present · missing · to watch — read only)
   node harness/cli.js report --kind <bug|intent|improve> --title "<one line>" [--body "<text>" | --body-file <path>] [--repo <owner/name>] | report-bug [--open] [--sent <sig>]
@@ -30,8 +32,8 @@ unattended work: a Claude Code background session in its own worktree (claude --
   — the harness no longer runs its own worker (go · factory were removed in v7)`;
 
 // [2026-10-29 감사] --owns 는 v7 에서 아무것도 막지 않았다(기록만) — 강제하던 guard 작업자 모드와 함께 뺐다.
-const VALUE = new Set(['--check', '--base', '--from', '--branch', '--into', '--root', '--target', '--goal-file', '--tag', '--check-timeout-min', '--kind', '--title', '--body', '--body-file', '--sent', '--repo']);
-const FLAGS = new Set(['--json', '--help', '-h', '--uninstall', '--dry-run', '--force', '--skip-checks', '--all', '--open', '--auto', '--migrate']);
+const VALUE = new Set(['--check', '--base', '--from', '--branch', '--into', '--root', '--target', '--goal-file', '--tag', '--check-timeout-min', '--kind', '--title', '--body', '--body-file', '--sent', '--repo', '--label', '--timeout-min', '--note']);
+const FLAGS = new Set(['--json', '--help', '-h', '--uninstall', '--dry-run', '--force', '--skip-checks', '--all', '--open', '--auto', '--migrate', '--clear', '--ready']);
 // v7 에서 뺀 명령 — 부르면 무엇으로 바뀌었는지 알린다(옛 안내를 따르는 세션이 있다)
 const REMOVED = { go: 'start "<goal>" (a lane you work in) · unattended: claude --bg -w <name> "<goal>" then batch --branch <branch>', resume: 'start --from <id>', wait: 'status', note: 'start --from <id>', stop: 'claude agents (stop the session)',
   factory: 'several lanes (start) + batch', metrics: null, insights: null, profile: null, doc: null, 'cleanup-legacy': 'gc' };
@@ -40,6 +42,7 @@ function parse(argv) {
   const o = { _: [], checks: [], branches: [] };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
+    if (a === '--') { o.command = argv.slice(i + 1); break; }   // slot 이 돌릴 명령 — 그 뒤는 하네스 옵션이 아니다
     if (FLAGS.has(a)) { o[a.replace(/^-+/, '')] = true; continue; }
     const eq = /^(--[a-z-]+)=(.*)$/.exec(a);
     const key = eq ? eq[1] : a;
@@ -60,7 +63,7 @@ function parse(argv) {
 const OK = new Set(['done', 'open', 'accepted', 'cancelled', 'restored', 'checked']);
 function resultLine(r) {
   const keep = ['id', 'status', 'reason', 'refused', 'mode', 'branch', 'commit', 'base_branch', 'checks', 'cost_usd', 'outside_git', 'worktree', 'merge_commit', 'revert_commit', 'task_status',
-    'ports', 'continues', 'related', 'verdict', 'target', 'members', 'failed_tests'];
+    'ports', 'continues', 'related', 'verdict', 'target', 'members', 'failed_tests', 'ready'];
   const o = {};
   for (const k of keep) if (r[k] !== undefined) o[k] = r[k];
   return `HARNESS_RESULT ${JSON.stringify(o)}`;
@@ -68,14 +71,14 @@ function resultLine(r) {
 
 // 하네스 결함 보고 — [2026-10-29 사용자 요청] "버그 · 이슈는 자동으로 GitHub 에" 를 모든 명령에서. 예기치 못한 예외만 기록한다(운영 오류는 결함이 아니다).
 //   예전엔 accept · cancel · restore · check 만 기록 · 발행했다 — start · batch · status · gc · toolkit 의 예외는 출력만 하고 사라졌다.
-const OPERATIONAL = new Set(['USAGE', 'UNKNOWN_TASK', 'LOCK_HELD', 'NOT_A_REPO', 'NOT_WORKTREE_ROOT', 'PORTS_EXHAUSTED']);
+const OPERATIONAL = new Set(['USAGE', 'UNKNOWN_TASK', 'LOCK_HELD', 'NOT_A_REPO', 'NOT_WORKTREE_ROOT', 'PORTS_EXHAUSTED', 'GIT_LOCKED']);
 function recordBug(root, e) {
   if (!e || OPERATIONAL.has(e.code)) return null;
   try { return require('./lib/bugreport').record(root, 'cli', e); } catch { return null; }
 }
 const bugHint = bug => (bug ? `\n하네스 결함으로 보입니다(서명 ${bug.sig}) — 내용을 확인하고 보고하려면: node harness/cli.js report-bug` : '');
 // 끝에 쌓인 보고(기록된 결함 · hook-errors.log)를 올린다 — 설치된 사본 · 로그인이 있을 때만 · 실패는 조용히.
-const NO_POST = new Set(['install', 'uninstall', 'update', 'version', 'report', 'report-bug']);
+const NO_POST = new Set(['install', 'uninstall', 'update', 'version', 'report', 'report-bug', 'slot']);
 async function autoPost(root, err) {
   try { const a = await require('./lib/bugreport').autoReport(root); for (const p of a.posted) err(`[pilot] 하네스 보고를 올렸다: ${p.url}`); } catch { /* 보고가 작업을 멈추지 않는다 */ }
 }
@@ -88,6 +91,7 @@ async function main(argv, io) {
   const [cmd, ...rest] = o._;
   if (!cmd || cmd === 'help' || o.help || o.h) { out(USAGE); return cmd || o.help || o.h ? 0 : 2; }
   if (Object.prototype.hasOwnProperty.call(REMOVED, cmd)) { err(`pilot ${cmd}: removed in v7 (Light)${REMOVED[cmd] ? ` — use ${REMOVED[cmd]}` : ''}\n${USAGE}`); return 2; }
+  if (o.command && cmd !== 'slot') { err(`unknown option: --\n${USAGE}`); return 2; }   // "--" 뒤는 slot 만 받는다 — 다른 명령은 예전처럼 거부(뒤를 조용히 버리지 않는다)
   const root = o.root ? path.resolve(o.root) : process.cwd();
   // 자동 갱신 확인(설치된 사본 · 하루 한 번 · 별도 프로세스) — 갱신 · 설치 명령 자신은 빼고. 실패는 조용히.
   if (!['install', 'uninstall', 'update', 'version'].includes(cmd)) { try { require('./lib/autoupdate').maybe(root); } catch { /* 하네스를 멈추지 않는다 */ } }
@@ -108,6 +112,14 @@ async function dispatch(cmd, rest, o, root, out, err, io) {
     return r && r.ok === false ? 1 : 0;
   }
   if (cmd === 'start' || cmd === 'batch') return lightCommand(cmd, rest, o, root, out, err, io);
+  if (cmd === 'slot') {
+    // 하네스 밖 무거운 명령을 검사 줄에 세운다 — 종료 코드는 그 명령의 것(하네스 결과 줄 없음). 끝나고 보고를 올리지 않는다(명령의 종료를 늦추지 않게).
+    if (!o.command || !o.command.length) { err(`slot needs the command after --\n${USAGE}`); return 2; }
+    let timeoutMs;
+    if (o['timeout-min'] != null) { const v = Number(o['timeout-min']); if (!(v > 0)) { err('--timeout-min must be a number > 0'); return 2; } timeoutMs = v * 60000; }
+    try { return await require('./lib/checks').runInSlot(require('./lib/state').mainRoot(root), o.command, { cwd: process.cwd(), label: o.label, timeoutMs, log: err }); }
+    catch (e) { err(`pilot slot: ${e.code ? e.code + ': ' : ''}${e.message}${bugHint(recordBug(root, e))}`); return 1; }
+  }
   if (cmd === 'push') {
     const Pu = require('./lib/push');
     try {
@@ -182,6 +194,7 @@ async function dispatch(cmd, rest, o, root, out, err, io) {
     else if (cmd === 'cancel') r = await require('./lib/integrate').cancel({ ...common, id: needId(), skipChecks: !!o['skip-checks'], force: !!o.force });
     else if (cmd === 'restore') r = await require('./lib/integrate').restore({ ...common, id: needId(), skipChecks: !!o['skip-checks'] });
     else if (cmd === 'check') r = await require('./lib/integrate').check({ ...common, id: needId(), force: !!o.force });
+    else if (cmd === 'ready') r = require('./lib/batch').markReady({ root, id: needId(), note: o.note, clear: !!o.clear });
     else { err(`unknown command: ${cmd}\n${USAGE}`); return 2; }
   } catch (e) {
     if (e.code === 'USAGE') { err(`${e.message}\n${USAGE}`); return 2; }
@@ -218,7 +231,7 @@ async function lightCommand(cmd, rest, o, root, out, err, io) {
     else if (sub === 'drop') r = B.drop({ root, bid: rest[1], force: !!o.force });
     else if (sub === 'status') { const s = B.status({ root, bid: rest[1] }); out(o.json ? JSON.stringify(s.batches, null, 2) : s.report); return 0; }
     // [2026-10-29] 산 세션이 일하는 레인은 묶지 않는다(batch 가 판단) — --force 로만 넘는다
-    else r = await B.create({ root, ids: rest, all: !!o.all, branches: o.branches, into: o.into, checks: o.checks, checkTimeoutMs: o.checkTimeoutMs, force: !!o.force, log: err });
+    else r = await B.create({ root, ids: rest, all: !!o.all, ready: !!o.ready, branches: o.branches, into: o.into, checks: o.checks, checkTimeoutMs: o.checkTimeoutMs, force: !!o.force, log: err });
     show(r);
     if (r.refused) return 1;
     if (sub === 'accept' || sub === 'drop') return 0;

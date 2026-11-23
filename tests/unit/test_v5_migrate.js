@@ -61,8 +61,15 @@ function v6Task(root, id, o) {
       && log1[0] === 'created' && log1.includes('adopted'), JSON.stringify({ mode: t1.mode, st: t1.status, from: t1.adopted_from_status, log1 }));
     R.check('[MG-01] 미커밋 작업 · 작업자의 커밋은 그대로 · 포트 구역을 잡는다', read(path.join(P1.wt, 'wip.txt')) === 'uncommitted work of the worker\n' && read(path.join(P1.wt, `${ID1}.txt`)) === 'worker commit\n' && a1.ports && Number.isInteger(a1.ports.base), JSON.stringify(a1.ports));
     R.check('[MG-01] 보고: 그 대화를 그대로 이어 가는 명령(cd "<worktree>" ; claude --resume <세션>)', a1.report.includes(`cd "${P1.wt}" ; claude --resume ${SID1}`) && a1.resume && a1.resume.source === 'task', a1.report);
+    // [2026-11-05 소유권] 옛 계약은 받은 레인의 미커밋분을 하네스가 대신 커밋했다 — 주인을 증명할 수 없어 이제 거부하고 아무것도 바꾸지 않는다.
+    const main1 = git(r1, 'rev-parse', 'main'), head1 = git(P1.wt, 'rev-parse', 'HEAD');
+    const acc0 = await I.accept({ ...quiet, root: r1, id: ID1 });
+    R.check('[MG-01] 받은 레인의 미커밋분은 대신 커밋하지 않고 accept 를 거부한다(이유에 그 파일 · main · 칸 HEAD · wip.txt 그대로)',
+      acc0.refused === true && /owner cannot be proven/.test(acc0.reason) && /wip\.txt/.test(acc0.reason) && git(r1, 'rev-parse', 'main') === main1 && git(P1.wt, 'rev-parse', 'HEAD') === head1
+      && read(path.join(P1.wt, 'wip.txt')) === 'uncommitted work of the worker\n', `${acc0.status} ${acc0.reason}`);
+    git(P1.wt, 'add', '--', 'wip.txt'); git(P1.wt, 'commit', '-qm', 'wip (the lane owner commits it)', '--', 'wip.txt');   // 이어 받은 주인이 직접 커밋
     const acc1 = await I.accept({ ...quiet, root: r1, id: ID1 });
-    R.check('[MG-01] 받은 레인은 accept 로 병합된다(작업자의 커밋 · 미커밋분 모두 main 에)', acc1.status === 'accepted' && read(path.join(r1, `${ID1}.txt`)) === 'worker commit\n' && read(path.join(r1, 'wip.txt')) === 'uncommitted work of the worker\n', `${acc1.status} ${acc1.reason}`);
+    R.check('[MG-01] 받은 레인은 accept 로 병합된다(작업자의 커밋 · 주인이 커밋한 미커밋분 모두 main 에)', acc1.status === 'accepted' && read(path.join(r1, `${ID1}.txt`)) === 'worker commit\n' && read(path.join(r1, 'wip.txt')) === 'uncommitted work of the worker\n', `${acc1.status} ${acc1.reason}`);
 
     // MG-02 — 세션 id 가 없는 v6 작업: 가짜 HOME 의 .claude/projects/<폴더 이름>/ 에서 가장 최근 대화
     const r2 = repo({ 'a.txt': 'a\n' });

@@ -9,9 +9,10 @@ const S = require('./state'), G = require('./git'), K = require('./checks');
 //   [2026-10-29 감사 G2 #9 · #13] 늦은 기준선과 멈춘 테스트 떼어 내기는 task.checks.serial(명시적으로 on 일 때만 기록)만 봐서 기본(켬)에서
 //   다른 작업의 검사와 동시에 돌았다(자동 이슈 #4 — 같은 시험 DB). accept 의 기준선은 merge 잠금을 쥐고 있으니 priority 0 으로 줄 맨 앞에.
 const serialRoot = (root, task) => ((typeof K.serialChecksOn === 'function' ? K.serialChecksOn(root) : !!(task.checks && task.checks.serial)) ? root : null);
+//   fn(q): q.slotHeld 를 그 안의 검사에 넘긴다 — 검사 자식이 같은 줄을 다시 서면(slot 으로 감싼 test_command) 교착한다(#85 리뷰 S1). timeoutMs 는 status 의 명령당 상한.
 const queued = (root, task, o, label, fn) => {
   const sr = serialRoot(root, task);
-  return sr ? K.inQueue({ serialRoot: sr, priority: o.priority, label: `${label} ${task.id}` }, () => fn()) : fn();
+  return sr ? K.inQueue({ serialRoot: sr, priority: o.priority, label: `${label} ${task.id}`, timeoutMs: o.checkTimeoutMs }, q => fn(q)) : fn({});
 };
 
 // 캐시 열쇠: 기준 커밋 · 검사 · .worktreeinclude 내용 · 검사 상한.
@@ -43,13 +44,13 @@ async function measureBaseline(root, task, found, dir, o, log, baseCommit) {
         log(`[pilot] ${task.id} — baseline reused from an earlier task on the same base commit (cache: ${cacheFile} — delete it to measure again)`); task.checks.baseline_cached = true;
         if (b.commands) { found.commands = b.commands; task.checks.commands = b.commands; task.checks.hung = b.hung; }
       } else {
-        b = await queued(root, task, o, 'baseline', async () => {
-          let m = (await K.runJudged(dir, found.commands, { timeoutMs: o.checkTimeoutMs, rerun: task.checks.rerun })).judged;
+        b = await queued(root, task, o, 'baseline', async q => {
+          let m = (await K.runJudged(dir, found.commands, { timeoutMs: o.checkTimeoutMs, rerun: task.checks.rerun, slotHeld: q.slotHeld })).judged;
           // 멈춘 테스트 떼어 내기(K.isolateHangs) — 시간 초과된 검사 가운데 언어 팩이 멈춘 테스트를 짚을 수 있는 것은 그 테스트를 빼고 다시 잰다. 사용자가 준 검사도.
           const hung = [];
           for (let i = 0; i < m.results.length; i++) {
             if (!m.results[i].timed_out) continue;
-            const iso = await K.isolateHangs(dir, found.commands[i], { timeoutMs: o.checkTimeoutMs });
+            const iso = await K.isolateHangs(dir, found.commands[i], { timeoutMs: o.checkTimeoutMs, slotHeld: q.slotHeld });
             if (!iso) continue;
             hung.push(...iso.excluded.map(t => ({ command: K.display(found.commands[i]), test: t })));
             found.commands = found.commands.map((c, k) => (k === i ? iso.argv : c));
@@ -122,7 +123,7 @@ async function measureAt(root, task, commit, opts) {
   if (hit) return K.brief(hit);
   log(`[pilot] ${task.id} — measuring the checks at ${String(commit).slice(0, 10)} (the target as it is now) to tell whether it already fails without this work`);
   try {
-    const b = await withTree(root, task, commit, 'target', dir => queued(root, task, o, 'target', async () => (await K.runJudged(dir, cmds, { timeoutMs: o.checkTimeoutMs, rerun: task.checks.rerun })).judged));
+    const b = await withTree(root, task, commit, 'target', dir => queued(root, task, o, 'target', async q => (await K.runJudged(dir, cmds, { timeoutMs: o.checkTimeoutMs, rerun: task.checks.rerun, slotHeld: q.slotHeld })).judged));
     writeCache(file, b);
     return K.brief(b);
   } catch (e) { S.log(root, task.id, { event: 'target_measure_error', error: String(e.message).slice(0, 300) }); return null; }

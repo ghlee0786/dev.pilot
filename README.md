@@ -43,10 +43,12 @@ node dev.pilot/harness/cli.js install --root <내 저장소>
 | `start "<요청>"` | **레인** — 자기 worktree · 브랜치(`harness/<id>`) · 포트 구역. 그 폴더에서 세션을 열어 일하고 진행하며 커밋한다. `--from <id>` 는 앞 작업의 브랜치에서 이어 간다(v6 작업은 남은 worktree 를 그 자리에서 레인으로 받고 `claude --resume <세션>` 을 알려 준다) · `--base <브랜치>` · 비슷한 작업이 있으면 알린다 |
 | `status` | 레인 · 작업 · 산 세션(플랫폼 목록 · busy/idle) · 주인이 죽은 작업(DEAD) · 겹치는 파일 · 주인 없는 미커밋 변경 |
 | `accept <id>` | 사용자 브랜치로 병합(사용자가 말한 뒤) — 검사 한 번 · 나빠졌을 때만 거절 · 커밋 안 된 대량 삭제는 커밋하지 않고 멈춤 · 검사가 다시 쓴 산출물은 되돌림 · 검사 뒤 문서만 들어오면 재검사 생략. 충돌은 그 레인에 병합을 남겨 두고 알린다(그 레인에서 풀고 다시 accept) |
-| `batch <id>... \| --all \| --branch <이름>` · `batch accept <bid>` | 끝난 작업 · 브랜치를 `harness/batch/<bid>` 에 묶고(충돌하는 것 · 산 세션이 일하는 레인은 건너뜀) 검사를 **한 번만** · `batch accept` 가 병합(사용자가 말한 뒤) · `batch status\|drop` |
+| `batch <id>... \| --all \| --ready \| --branch <이름>` · `batch accept <bid>` | 끝난 작업 · 브랜치를 `harness/batch/<bid>` 에 묶고(충돌하는 것 · 산 세션이 일하는 레인은 건너뜀) 검사를 **한 번만** · `batch accept` 가 병합(사용자가 말한 뒤) · `batch status\|drop`. 검사가 실패하면 첫 실행과 마지막 실행의 실패 출력(비밀은 가림)을 `batches/<bid>.logs/` 에 남긴다 |
+| `ready <id> [--note "<메모>"] \| --clear` | 다음 클로징에 실을 레인 표시 — `status` 가 보이고 `batch --ready` 가 묶는다(표시 뒤 커밋하면 다시 표시) |
+| `slot [--label <이름>] [--timeout-min <n>] -- <명령>` | 하네스 밖 무거운 명령(전체 빌드 · 이미지 빌드)을 검사 줄에 세운다 — 차례가 오면 돌리고 놓는다 · 종료 코드는 그 명령의 것 · 상한 초과는 124 |
 | `check <id>` | 검사를 지금 돌려 기록(병합하지 않음) |
 | `cancel <id>` · `restore <id>` | 병합 되돌리기(revert) · 되살리기 |
-| `push [<remote>] [<branch>]` · `push --tag <이름>` | 빨리감기 push · 릴리스 태그(사용자가 명시한 뒤 · 강제 없음) |
+| `push [<remote>] [<branch>]` · `push --tag <이름>` | 빨리감기 push · 릴리스 태그(사용자가 명시한 뒤 · 강제 없음) · `--dry-run` 은 전송 없이 원격 쓰기 권한까지 확인하고 실패하면 원격 · 자격 증명 도우미 · 계정을 알린다(대화형 창 없음 · 토큰은 가림) |
 | `gc` | 끝난 작업 정리 — 하네스가 만든 것만(열린 레인 · 끝나지 않은 v6 작업은 남긴다) |
 | `toolkit` | 이 저장소 스택(C++ · Qt · .NET · Python · 웹 …)에 맞는 스킬 · MCP · 플러그인 중 있는 것 · 없는 것(이유 · 설치 방법) · 주의할 것(보관된 MCP 서버 등). 읽기만 한다 · 세션 시작 때 하루 한 번 한 줄로도 |
 | `report --kind <bug\|intent\|improve> …` | 하네스 보고(아래) |
@@ -72,7 +74,7 @@ test_command: "npm test"                 # 병합 판정 — 없으면 package.j
 lint_command: "npx eslint {files}"       # 두 번째 판정 — {files} 는 바뀐 파일
 check_timeout_min: 20                    # 검사 상한(기본 15분)
 rerun_failed: on                         # 실패한 검사 한 번 더(off 로 끈다)
-serial_checks: on                        # 검사를 저장소 단위로 줄 세운다(기본 on · off 로 끈다)
+serial_checks: on                        # 검사를 저장소 단위로 줄 세운다(기본 on · off 로 끈다 · machine 은 같은 PC 의 저장소들이 줄 하나를 함께 쓴다)
 port_range: "20000-39999"                # 레인마다의 포트 구역 범위 · port_block: 20
 worktree_links: ["../SiblingRepo"]       # 저장소 밖 형제 폴더를 참조하는 빌드
 outside_git_ok: ["data/*.db"]            # worktree 를 붙잡지 않는 런타임 부산물

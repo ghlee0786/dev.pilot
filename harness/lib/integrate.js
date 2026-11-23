@@ -134,13 +134,22 @@ function liveLaneSessions(root, task) {
   try { cand = Ch.listSessions(common).filter(s => String(s.session_id) !== self && (inside(s.root) || inside(s.cwd))); } catch { return []; }
   if (!cand.length) return [];
   let agents = null; try { agents = Ch.platformAgents(common); } catch { agents = null; }
-  return cand.filter(s => Ch.sessionLive(s, agents)).map(s => { const a = Ch.agentOf(s, agents); return { session_id: s.session_id, name: a && a.name || null, status: a && a.status || null }; });
+  return cand.filter(s => Ch.sessionLive(s, agents)).map(s => { const a = Ch.agentOf(s, agents); return { session_id: s.session_id, name: a && a.name || null, status: a && a.status || null, cwd: s.cwd || s.root || null, last_seen: s.last_seen || null, platform_cwd: a && a.cwd || null }; });
+}
+// [자동 이슈 #88] 세션 기록의 cwd 는 UserPromptSubmit 때만 갱신된다 — 그 세션이 레인에서 나간 뒤에도 낡은 기록으로 거부될 수 있다.
+//   거부 이유에 기록상 cwd · 기록 시각 · (다르면) 플랫폼 목록의 cwd 를 실어 낡은 기록인지 알아볼 수 있게 한다.
+function sessionWhere(s) {
+  const bits = [];
+  if (s.cwd) bits.push(`recorded cwd ${s.cwd}${s.last_seen ? ` at ${s.last_seen}` : ''}`);
+  const k = p => { const r = path.resolve(p); return S.IS_WIN ? r.toLowerCase() : r; };
+  if (s.platform_cwd && (!s.cwd || k(s.platform_cwd) !== k(s.cwd))) bits.push(`platform cwd ${s.platform_cwd}`);
+  return bits.length ? ` · ${bits.join(' · ')}` : '';
 }
 function liveSessionWhy(root, task, o, cmd) {
   if (o.force) return null;
   const live = liveLaneSessions(root, task);
   if (!live.length) return null;
-  const who = live.slice(0, 3).map(s => `${s.name || String(s.session_id).slice(0, 8)}${s.status ? ` ${s.status}` : ''}`).join(', ');
+  const who = live.slice(0, 3).map(s => `${s.name || String(s.session_id).slice(0, 8)}${s.status ? ` ${s.status}` : ''}${sessionWhere(s)}`).join(', ');
   return `a live session is working in this lane's worktree ${S.taskPathsFor(root, task).wt} (${who}) — finish and commit the work in that session (or end it), then run ${cmd} again; --force to ${cmd} anyway`;
 }
 // merge 잠금 → task 잠금 → 잠금 아래에서 task 를 **다시 읽고** 선행 조건을 다시 본다.
@@ -173,9 +182,29 @@ function commitInto(task, cwd, label) {
   return sha;
 }
 // 칸의 커밋되지 않은 변경을 그 칸의 브랜치에 커밋한다 → 커밋한 파일(없으면 []) — 무엇을 대신 커밋했는지 보고에 싣는다.
-//   light 칸은 사람이 일한 곳이라 턴 체크포인트가 없었다 — 줄바꿈을 먼저 원래대로(G.keepEol · 루프의 체크포인트와 같이).
+//   [2026-11-05 소유권] light 칸의 미커밋분은 누가 만든 것인지 증명할 수 없다 — 설치기가 남긴 .vscode/settings.json 같은 미추적 파일 ·
+//   남이 스테이징한 파일 · 편집기 변경을 commitAll(`add -A -- :/`)이 레인 이름으로 커밋했다. 대신 커밋하지 않고(줄바꿈 복원 keepEol 도
+//   남의 파일을 고쳐 쓰므로 하지 않는다) index · 작업 파일 · HEAD 를 그대로 둔 채 던진다 — 레인의 세션이 자기 파일을 직접 커밋한 뒤 다시.
+// light 칸의 미커밋 중 주인을 증명할 수 없는 것 → { unowned, ignored }. commitLeftovers 와 batch accept(acceptLocked)가 같은 규칙을 쓴다.
+//   빼는 것(ignored)은 하네스가 원래 커밋하지 않는 둘뿐이다 — 기록된 커밋은 그대로이고 내용만 바뀐 서브모듈(worktree 를 남겨 보호한다 · DP-04) ·
+//   이 칸의 검사가 만든 미추적 캐시(CACHE_RE · HG-05 — 커밋도 하지 않는다: archivePlan 은 .harness 만 커밋). .harness/ 는 어느 쪽에도 넣지 않는다.
+function unownedLeftovers(wt) {
+  const subs = new Set(G.gitlinks(wt).map(l => l.path));
+  const contentOnlySub = p => subs.has(p) && G.git(wt, ['diff', '--quiet', '--ignore-submodules=dirty', 'HEAD', '--', `:(literal)${p}`], { allowFail: true }).ok;
+  const unowned = [], ignored = [];
+  for (const e of G.dirtyFiles(wt)) {
+    if (e.path.startsWith('.harness/')) continue;
+    if ((e.code === '??' && G.CACHE_RE.test(e.path)) || contentOnlySub(e.path)) ignored.push(e.path); else unowned.push(e.path);
+  }
+  return { unowned, ignored };
+}
 function commitLeftovers(task, wt, label) {
-  if (task.mode === 'light') { try { G.keepEol(wt); } catch { /* 줄바꿈 복원 실패는 커밋을 막지 않는다 */ } }
+  if (task.mode === 'light') {
+    const { unowned: dirty, ignored } = unownedLeftovers(wt);
+    if (ignored.length) { try { S.log(S.mainRoot(wt), task.id, { event: 'leftovers_ignored', phase: label, files: ignored.slice(0, 200) }); } catch { /* 기록 실패는 판정을 바꾸지 않는다 */ } }
+    if (dirty.length) throw Object.assign(new Error(`uncommitted changes in ${wt} are not committed by the harness (their owner cannot be proven): ${dirty.slice(0, 10).join(', ')}${dirty.length > 10 ? ` … (+${dirty.length - 10})` : ''} — commit only the files you changed in this lane (git add -- <file> · git commit -m "<what and why>" -- <file>); never delete, revert or commit files you did not change — resolve their ownership with their owner or the coordinator; the lane must have no uncommitted changes before it can be accepted`), { code: 'LEFTOVERS_UNOWNED', files: dirty });
+    return [];
+  }
   const sha = commitInto(task, wt, label);
   return sha ? G.diffNames(wt, `${sha}^`, sha) : [];
 }
@@ -247,7 +276,15 @@ function archivePlan(root, task, P) {
   fs.rmSync(P.workDir, { recursive: true, force: true });
   const parent = path.dirname(P.workDir);
   try { if (fs.readdirSync(parent).length === 0) fs.rmdirSync(parent); } catch { /* 다른 것이 남음 */ }
-  const sha = commitInto(task, P.wt, `archive .harness/${task.id}`);
+  // light 칸은 계획 폴더만 — 남겨 둔 검사 캐시 · 서브모듈 내용을 레인 이름으로 쓸어 담지 않는다
+  let sha;
+  if (task.mode === 'light') {
+    // 바뀐 것이 없으면 commitAll 의 `git add -A -- .harness` 가 '경로 없음' 으로 실패한다 — 그때는 커밋하지 않는다
+    const planChanged = G.dirtyFiles(P.wt).some(e => e.path.startsWith('.harness/'));
+    sha = planChanged ? G.commitAll(P.wt, `harness(${task.id}): archive .harness/${task.id}`, { branch: task.branch, paths: ['.harness'] }) : null;
+    if (sha) task.commits.push(sha);
+  }
+  else sha = commitInto(task, P.wt, `archive .harness/${task.id}`);
   S.log(root, task.id, { event: 'archive', sha, to: P.archiveDir });
   return sha;
 }
@@ -358,7 +395,8 @@ async function accept(o) {
       S.log(root, task.id, { event: 'conflict_merge_finished', sha });
       leftover = [];
     } else {
-      leftover = commitLeftovers(task, P.wt, 'uncommitted work before accept');
+      try { leftover = commitLeftovers(task, P.wt, 'uncommitted work before accept'); }
+      catch (e) { if (e.code !== 'LEFTOVERS_UNOWNED') throw e; S.writeTask(root, task); return refused(task, e.message); }
       if (leftover.length) S.log(root, task.id, { event: 'leftovers_committed', phase: 'accept', files: leftover.slice(0, 200) });
     }
     // [G2 #0] 표식째 커밋된 병합(예전 cancel 이 남긴 태그를 restore · 사람이 표식째 커밋)을 대상에 들이지 않는다
@@ -755,4 +793,4 @@ async function check(o) {
   });
 }
 
-module.exports = { accept, cancel, restore, check, dirtyOverlap, archivePlan, acceptTarget, result, releaseResources, commitLeftovers, copyDir, isIndeterminate, serialRootOf, docsOnly, refuseKo, liveLaneSessions, MERGE_WAIT_MS };
+module.exports = { accept, cancel, restore, check, dirtyOverlap, archivePlan, acceptTarget, result, releaseResources, commitLeftovers, unownedLeftovers, copyDir, isIndeterminate, serialRootOf, docsOnly, refuseKo, liveLaneSessions, sessionWhere, MERGE_WAIT_MS };

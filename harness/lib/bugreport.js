@@ -17,18 +17,27 @@ const esc = s => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 //   [2026-10-29 감사] 공개 저장소에 사람 검토 없이 올라간다 — 토큰 · 비밀번호 · 키 · 접속 문자열 · URL · IP · 상대 경로도 가린다.
 const SECRET = '<secret>';
 const SECRET_KEY = '(?:[A-Za-z_][\\w.-]*?)?(?:token|secret|passw(?:or)?d|pwd|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|credential|auth)[\\w.-]*';
-function sanitize(text) {
+// 비밀만 가린다(경로 · URL · 이름은 남긴다) — 진단 출력(push 실패 이유 등)에 쓴다. sanitize 는 이것을 먼저 부르고 나머지를 더 가린다.
+//   [dev.pilot #86] push 실패 이유에 git 오류 원문(원격 URL 의 user:token@ 포함)이 가려지지 않고 나갔다.
+function redactSecrets(text) {
   let s = String(text || '');
-  const keepHarness = p => { const m = /(?:^|[\\/])(harness[\\/](?:lib|hooks)[\\/][\w.-]+\.js|harness[\\/]cli\.js)(:\d+(?::\d+)?)?/i.exec(p); return m ? m[1].replace(/\\/g, '/') + (m[2] || '') : '<path>'; };
-  // 비밀처럼 보이는 값 — 따옴표 · 경로 규칙보다 먼저(값이 따옴표 안이어도)
   s = s.replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{6,}/gi, `$1 ${SECRET}`);
   s = s.replace(/\b(?:gh[pousr]_[A-Za-z0-9]{6,}|github_pat_[A-Za-z0-9_]{6,}|sk-[A-Za-z0-9_-]{6,}|[sr]k_(?:live|test)_[A-Za-z0-9]{6,}|xox[abprs]-[A-Za-z0-9-]{6,}|glpat-[A-Za-z0-9_-]{6,}|npm_[A-Za-z0-9]{6,}|AIza[0-9A-Za-z_-]{20,}|(?:AKIA|ASIA)[0-9A-Z]{12,})/g, SECRET);
   s = s.replace(/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*/g, SECRET);                          // JWT
+  s = s.replace(/\b(https?:\/\/)[^\s/@'"<>]+@/gi, `$1${SECRET}@`);                                              // http(s) 의 userinfo 는 통째로 — 토큰을 user 자리에 두는 꼴(https://<PAT>@ · <토큰>:x-oauth-basic@)이 흔하다(#86 리뷰 S1 · S5) · ssh 의 git@ 은 둔다
+  s = s.replace(/\b([a-z][a-z0-9+.-]*:\/\/)([^\s/@:'"<>]+):[^\s/@'"<>]*@/gi, '$1$2@');                           // URL userinfo user:pass@ → user@
+  s = s.replace(/([?&;\s]sig=)[^&\s'"<>]+/gi, `$1${SECRET}`);                                                    // Azure SAS 서명
   s = s.replace(new RegExp(`\\b(${SECRET_KEY})(\\s*[:=]\\s*)("[^"\\n]*"|'[^'\\n]*'|[^\\s;,&]+)`, 'gi'), `$1$2${SECRET}`);   // KEY=VALUE · KEY: VALUE
-  s = s.replace(/\b(Server|Data Source|Host|Address|Addr|User ?Id|Uid|User|Username|Database|Initial Catalog)\s*=\s*[^;\n]+/gi, `$1=${SECRET}`);   // 접속 문자열 조각
   s = s.replace(/(\s--?(?:password|passwd|pass|token|api-key|apikey|secret|access-key)(?:=|\s+))\S+/gi, `$1${SECRET}`);
   s = s.replace(/(\blogin\b[^\n]*?\s-p)\s*\S+/gi, `$1 ${SECRET}`);                                               // docker login -p …
   s = s.replace(/(\s-u)\s+[^\s:]+:\S+/g, `$1 ${SECRET}`);                                                       // curl -u user:pass
+  return s;
+}
+function sanitize(text) {
+  const keepHarness = p => { const m = /(?:^|[\\/])(harness[\\/](?:lib|hooks)[\\/][\w.-]+\.js|harness[\\/]cli\.js)(:\d+(?::\d+)?)?/i.exec(p); return m ? m[1].replace(/\\/g, '/') + (m[2] || '') : '<path>'; };
+  // 비밀처럼 보이는 값 — 따옴표 · 경로 규칙보다 먼저(값이 따옴표 안이어도)
+  let s = redactSecrets(text);
+  s = s.replace(/\b(Server|Data Source|Host|Address|Addr|User ?Id|Uid|User|Username|Database|Initial Catalog)\s*=\s*[^;\n]+/gi, `$1=${SECRET}`);   // 접속 문자열 조각
   s = s.replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s'"<>()]+/gi, '<url>');                                             // URL(자격 증명 · 내부 호스트 · 쿼리 토큰)
   s = s.replace(/\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?\b/g, '<ip>');
   // 작은따옴표는 낱말 밖에서 열고 닫힌 것만 — 낱말 안의 아포스트로피(lane's · didn't)를 따옴표로 읽어 문장을 통째로 지웠다(자동 이슈 #67)
@@ -255,5 +264,5 @@ function openUrl(url) {
   try { spawn(cmd, args, { detached: true, stdio: 'ignore', windowsHide: true }).unref(); return true; } catch { return false; }
 }
 
-module.exports = { DEFAULT_REPO, sanitize, record, collect, draft, findExisting, markSent, openUrl, entryOf, signatureOf, versions,
+module.exports = { DEFAULT_REPO, sanitize, redactSecrets, record, collect, draft, findExisting, markSent, openUrl, entryOf, signatureOf, versions,
   enabled, githubToken, post, autoReport, note, maskProject, projectWords };

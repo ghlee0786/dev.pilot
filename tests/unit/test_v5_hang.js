@@ -71,6 +71,14 @@ const FAKE_HANG = { applies: () => true, next: Langs.PACKS.find(p => p.id === 'p
     const iso2 = await K.isolateHangs(base, ['node', sleeper], { timeoutMs: 60000, hang: FAKE_HANG });
     R.check('[HG-04] 멈춘 자리를 짚을 수 없으면 null(검사는 원래대로 시간 초과로 남는다)', iso2 === null);
 
+    // HG-07 — [자동 이슈 #53] 검사는 끝났는데 남은 자손(MSBuild 노드)이 출력 파이프를 붙들면 'close' 가 오지 않아 결과가 상한까지 안 돌아왔다
+    //   자손의 작업 폴더는 시험 폴더 밖(os.tmpdir) — 시험이 끝난 뒤 남은 자손이 임시 폴더 정리를 막지 않게.
+    const orphaner = path.join(base, 'orphan.js');
+    write(orphaner, "require('node:child_process').spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], { stdio: 'inherit', cwd: require('node:os').tmpdir() }).unref(); console.log('# pass 1\\n# fail 0');");
+    const r7 = await K.runCheck(base, ['node', orphaner], { timeoutMs: 45000 });
+    R.check('[HG-07] (#53) 부모가 끝나고 자손이 출력 파이프를 붙들어도 곧 결과를 낸다(상한까지 기다리지 않는다) · 통과 판정 그대로',
+      r7.ok && !r7.timed_out && r7.exit_code === 0 && r7.ms < 20000 && /# pass 1/.test(r7.output), JSON.stringify({ ok: r7.ok, t: r7.timed_out, code: r7.exit_code, ms: r7.ms }));
+
     // HG-05 — 실제 pytest(있을 때): 작업 칸의 검사가 멈추면 늦은 기준선(작업 시작 커밋)에서 멈추는 테스트를 짚어 빼고 판정 · 기록에 남긴다
     //   v7 Light: 무인 루프가 없다 — 칸을 열고(lane.start) 커밋한 뒤 check <id> 가 늦은 기준선(baseline.ensureBaseline)을 잰다. accept 는 그 명령으로 들인다.
     const py = spawnSync('python', ['-m', 'pytest', '--version'], { windowsHide: true, encoding: 'utf8' });

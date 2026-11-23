@@ -43,6 +43,38 @@ try {
   const outside = path.join(base, 'x'); fs.mkdirSync(outside, { recursive: true });
   const sub = path.join(repo, 'sub');
 
+  // hc --on의 저장소 상태는 로컬 clone과 다르다. 조회가 발생하면 이전 오판을 드러내는 값을 준다.
+  {
+    const originalGit = C.git, originalRepoInfo = C.repoInfo, originalRead = fs.readFileSync, originalExists = fs.existsSync;
+    const localSpecs = path.join(repo, 'paths.txt'), localReset = path.join(repo, 'HEAD~1');
+    write(localSpecs, '.env\n'); write(localReset, 'local file\n');
+    let localReads = 0;
+    C.git = () => { localReads++; return { status: 0, stdout: 'push\n', stderr: '' }; };
+    C.repoInfo = () => { localReads++; return null; };
+    fs.readFileSync = (file, ...args) => { if (String(file) === localSpecs) localReads++; return originalRead(file, ...args); };
+    fs.existsSync = file => { if (String(file) === localReset) localReads++; return originalExists(file); };
+    try {
+      allow(repo, [
+        ['hc exec --on build git localalias'],
+        ['hc exec --on build git -C /srv/app localalias'],
+        ['hc exec --on build git add -A'],
+        [`hc exec --on build git add --pathspec-from-file "${localSpecs.replace(/\\/g, '/')}"`],
+        ['hc exec --on build git commit -m update'],
+        ['hc exec --on build git restore src/a.js'],
+        ['hc exec --on build git checkout -- src/a.js'],
+      ], 'hc 원격 상태 격리');
+      block(repo, [
+        ['hc exec --on build git reset HEAD~1'],
+        ['hc exec --on build git branch -M main'], // 대상 존재를 모르면 기존 보수 판정.
+        ['hc exec --on build git -c alias.publish=push publish'],
+        ['hc exec --on build git add .env'],
+        ['hc exec --on build git commit -m update -- .env'],
+        ['hc exec --on build git restore .'],
+      ], 'hc 원격 문법 가드');
+      R.check('[hc 원격] 로컬 Git·저장소·pathspec·reset 경로를 조회하지 않는다', localReads === 0, String(localReads));
+    } finally { C.git = originalGit; C.repoInfo = originalRepoInfo; fs.readFileSync = originalRead; fs.existsSync = originalExists; }
+  }
+
   // ── 1. git long option 약어 · --no-<옵션> 부정 · 옵션 값 자리의 --dry-run/--abort ──
   block(repo, [
     ['git reset --har'], ['git reset --h'], ['git commit --amen -m x'], ['git commit --am -m x'], ['git clean --forc'], ['git checkout --forc main'],
@@ -190,6 +222,18 @@ try {
     const u = C.uncommittedOf(lp, [rel]);
     R.check('[longpaths] uncommittedOf 도 그 파일을 세션 파일로 잡는다', u.mine.length === 1 && u.mine[0] === rel, JSON.stringify(u));
   } else R.check('[longpaths] 긴 경로 파일을 만들 수 있다(시험 준비)', false, 'fs 쓰기 실패');
+
+  // [자동 이슈 #95 #96] 자기 참조 변수(`x='$x$x$x$x$x$x'`)를 명령 자리에서 거듭 풀면 지수로 불어나 Invalid string length 로 죽었다.
+  {
+    const bomb = "x='$x$x$x$x$x$x'; $x status";
+    const t0 = Date.now(), r = decide(repo, bomb), ms = Date.now() - t0;
+    R.check('[#95] 자기 참조 변수 확장이 예외 없이 끝난다', r === null, String(r).slice(0, 200));
+    R.check('[#95] 오래 걸리지 않는다(< 10초 — 부하 여유)', ms < 10000, `${ms}ms`);
+    const alone = decide(repo, 'git push --force origin main');
+    const after = decide(repo, bomb.replace(' status', '') + '; git push --force origin main');
+    R.check('[#95] 뒤따르는 명령은 그대로 판정한다', typeof alone === 'string' && after === alone, `${after} / ${alone}`);
+    R.check('[#95] 보통 변수 확장은 그대로다', decide(repo, "g=git; $g push --force origin main") === alone, String(decide(repo, "g=git; $g push --force origin main")));
+  }
 } catch (e) { R.check('예외 없이 끝난다', false, String(e && e.stack || e).slice(0, 800)); }
 finally { try { fs.rmSync(base, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }); } catch { /* 임시 폴더 정리 실패는 결과와 무관 */ } }
 R.done();

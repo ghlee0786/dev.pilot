@@ -99,7 +99,7 @@ try {
     !settings.permissions.allow.some(x => /push|reset|rebase|merge|clean/.test(x)), JSON.stringify(settings.permissions));
   // 사양 변경(2026-10-25): guard 매처에 mcp__.* (git · GitHub MCP 쓰기) · track 매처에 파일 시스템 MCP 쓰기 · 게시판(board) — 요청 · 시작 · 쓰기 전.
   const expect = [['PreToolUse', 'Bash|PowerShell|mcp__.*', 'guard'], ['PostToolUse', 'Write|Edit|MultiEdit|NotebookEdit|mcp__.*__(write_file|edit_file|move_file|create_file)', 'track'], ['Stop', undefined, 'stop'], ['SessionEnd', undefined, 'session-end'],
-    ['PreToolUse', 'Write|Edit|MultiEdit|NotebookEdit', 'board'], ['UserPromptSubmit', undefined, 'board'], ['SessionStart', undefined, 'board'], ['UserPromptSubmit', undefined, 'lang']];
+    ['PreToolUse', 'Write|Edit|MultiEdit|NotebookEdit', 'board'], ['PreToolUse', 'mcp__.*__(write_file|edit_file|move_file|create_file)', 'board'], ['UserPromptSubmit', undefined, 'board'], ['SessionStart', undefined, 'board'], ['UserPromptSubmit', undefined, 'lang']];
   R.check('[install] settings: 우리 훅 · 매처 · node "${CLAUDE_PROJECT_DIR}/harness/hooks/<x>.js"', expect.every(([ev, matcher, x]) =>
     (settings.hooks[ev] || []).some(g => g.matcher === matcher && g.hooks.some(h => h.type === 'command' && h.command === `node "\${CLAUDE_PROJECT_DIR}/harness/hooks/${x}.js"`))), JSON.stringify(settings.hooks));
   // [2026-10-29] guard 는 실패(오류 · 시간 초과 · 셸 없음)해도 막는다(onFailure: 'block') — 다른 훅(board · track · lang · stop · session-end)은 실패해도 막지 않는다 · Codex 훅에는 이 키가 없다
@@ -129,6 +129,18 @@ try {
     ['PreToolUse', 'PostToolUse', 'Stop', 'SessionEnd'].every(ev => codex.hooks[ev].some(g => g.hooks.some(h => /harness\/hooks\/[a-z-]+\.js" --codex$/.test(h.command) &&
       h.commandWindows.startsWith('node "' + absRoot + '/harness/hooks/') && /\/harness\/hooks\/[a-z-]+\.js" --codex$/.test(h.commandWindows)))) &&
     codex.hooks.PostToolUse[0].matcher.includes('apply_patch'), JSON.stringify(codex));
+  // [2026-11-02 소유권] track 이 기록하는 쓰기 도구는 모두 쓰기 전(board)도 본다 — Claude(Write · Edit · MCP 쓰기) · Codex(apply_patch · Edit · Write)
+  {
+    const re = (gs, x) => gs.filter(g => g.hooks.some(h => new RegExp(`harness/hooks/${x}\\.js`).test(h.command))).map(g => new RegExp(`^(?:${g.matcher})$`));
+    const hits = (res, t) => res.some(r => r.test(t));
+    const cPre = re(settings.hooks.PreToolUse, 'board'), cPost = re(settings.hooks.PostToolUse, 'track');
+    const xPre = re(codex.hooks.PreToolUse, 'board'), xPost = re(codex.hooks.PostToolUse, 'track');
+    const claudeTools = ['Write', 'Edit', 'MultiEdit', 'NotebookEdit', 'mcp__filesystem__write_file', 'mcp__filesystem__edit_file', 'mcp__filesystem__move_file', 'mcp__fs__create_file'];
+    const codexTools = ['apply_patch', 'Edit', 'Write'];
+    R.check('[install] 소유권: 쓰기 뒤(track) 도구 = 쓰기 전(board) 도구 · Claude · MCP · Codex apply_patch',
+      claudeTools.every(t => hits(cPost, t) && hits(cPre, t)) && codexTools.every(t => hits(xPost, t) && hits(xPre, t)) && !hits(cPre, 'mcp__filesystem__read_file') && !hits(xPre, 'Bash'),
+      JSON.stringify({ c: settings.hooks.PreToolUse.map(g => g.matcher), x: codex.hooks.PreToolUse.map(g => g.matcher) }));
+  }
   R.check('[install] 요약에 Codex 신뢰(프로젝트 trust · /hooks 해시) 안내', r1.notes.some(n => /trust_level/.test(n) && /\/hooks/.test(n)));
 
   const skillSrc = read(path.join(SOURCE, 'skill', 'SKILL.md'));
@@ -226,9 +238,16 @@ try {
   const c7b = readJson(cf7);
   const t7abs = fs.realpathSync.native(t7).split(path.sep).join('/');
   // 사양 변경(2026-10-13): Stop 에 우리 훅이 둘(stop · lang)이다 — "이벤트마다 하나" 가 아니라 "설치기가 정한 수 그대로(옛 경로 사본 없이)".
-  const want7 = require('../../harness/lib/install.js').codexHooks(t7);
+  //   [2026-11-02] 한 이벤트에 그룹이 여럿일 수 있다(Codex PreToolUse = guard · board) — 그룹 수 · matcher · 훅(type · command · commandWindows · timeout)을
+  //   설치기가 이 저장소(실경로)에 만드는 값과 전부 그대로 대조한다.
+  const want7 = require('../../harness/lib/install.js').codexHooks(fs.realpathSync.native(t7));
+  const same7 = (a, b) => JSON.stringify(a) === JSON.stringify(b);
   R.check('[L10/codex] 옮긴 저장소 재설치: 옛 경로 훅은 사라지고 이벤트마다 설치기가 정한 우리 훅만 · 새 절대 경로',
-    r7.changed.includes('.codex/hooks.json') && Object.entries(c7b.hooks).every(([ev, gs]) => gs.length === 1 && gs[0].hooks.length === want7[ev][0].hooks.length && gs[0].hooks.every(h => h.commandWindows.startsWith('node "' + t7abs + '/'))), JSON.stringify(c7b).slice(0, 400));
+    r7.changed.includes('.codex/hooks.json') && same7(Object.keys(c7b.hooks).sort(), Object.keys(want7).sort())
+      && Object.entries(c7b.hooks).every(([ev, gs]) => gs.length === want7[ev].length && gs.every((g, i) => g.matcher === want7[ev][i].matcher && g.hooks.length === want7[ev][i].hooks.length
+        && g.hooks.every((h, j) => same7([h.type, h.command, h.commandWindows, h.timeout], [want7[ev][i].hooks[j].type, want7[ev][i].hooks[j].command, want7[ev][i].hooks[j].commandWindows, want7[ev][i].hooks[j].timeout])
+          && h.commandWindows.startsWith('node "' + t7abs + '/'))))
+      && !JSON.stringify(c7b).includes('D:/old place'), JSON.stringify(c7b).slice(0, 400));
   R.check('[L10/codex] 그 뒤 설치는 다시 바이트 그대로', install({ target: t7, source: SOURCE }).changed.length === 0);
 
   // [리뷰 M11] 경로에 harness/hooks/ 가 들어간 사용자 훅 · 설치 전부터 있던 allow 항목은 걷지 않는다.

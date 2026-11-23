@@ -30,7 +30,7 @@ const tickets = repo => { try { return fs.readdirSync(qdir(repo)).filter(n => n.
 // 자식 프로세스: 줄을 서서 잡으면 "got" 을 찍고 MODE 에 따라 행동한다(hold: 계속 쥠 · exit: 풀지 않고 끝남).
 const child = (repo, env) => {
   const script = `const S=require(${JSON.stringify(STATE)});
-    S.acquireQueued(process.env.REPO,'checks',{priority:Number(process.env.PRI||1),label:process.env.LABEL,pollMs:40}).then(h=>{
+    S.acquireQueued(process.env.REPO,'checks',{priority:Number(process.env.PRI||1),label:process.env.LABEL,pollMs:40,dir:process.env.DIR||undefined}).then(h=>{
       console.log('got '+Date.now());
       if(process.env.MODE==='exit') process.exit(0);
       if(process.env.MODE==='release'){h.release();process.exit(0);}
@@ -153,6 +153,48 @@ const child = (repo, env) => {
       got4.release();
       R.check('[Q-10] 새 잠금 · 번호표 기록에는 이 프로세스의 시작 시각(started_at)이 있다 — 산 주인은 그대로 산 것',
         (() => { const h = S.acquire(repo4, 'x'); const ok = !!S.lockOwner(repo4, 'x').started_at && S.ownerAlive(S.lockOwner(repo4, 'x')) && S.ownerAlive({ pid: other.pid, host: os.hostname(), at: new Date().toISOString(), started_at: new Date(spawnedAt).toISOString() }); h.release(); return ok; })());
+    }
+
+    // ── [dev.pilot #85] 폴더를 함께 쓰면(opts.dir — serial_checks: machine 의 PC 공용 줄) 저장소를 넘어 한 줄이 된다 ──
+    {
+      const ra = mkRepo('m-a'), rb = mkRepo('m-b'), mdir = path.join(base, 'machine-locks');
+      const hA = await S.acquireQueued(ra, 'checks', { label: 'holder-a', pollMs: 30, dir: mdir, meta: { repo: ra } });
+      const order = [];
+      const take = (repo, label, priority) => S.acquireQueued(repo, 'checks', { label, priority, pollMs: 30, dir: mdir, meta: { repo } }).then(h => { order.push(label); h.release(); });
+      const pB = take(rb, 'b1', 1); await wait(30);
+      const pA = take(ra, 'a0', 0); await wait(30);
+      await wait(300);
+      R.check('[Q-11] 같은 폴더면 다른 저장소의 잠금도 기다린다 · 잠금은 그 폴더에 있고 저장소 locks 에는 없다',
+        order.length === 0 && fs.existsSync(path.join(mdir, 'checks.lock')) && !fs.existsSync(S.lockDir(ra, 'checks')) && !fs.existsSync(S.lockDir(rb, 'checks')) && S.lockOwner(ra, 'checks', mdir).repo === ra,
+        JSON.stringify({ order, owner: S.lockOwner(ra, 'checks', mdir) }));
+      const q14 = S.queueOf(rb, 'checks', mdir);
+      R.check('[Q-14] queueOf(root, name, dir) — 다른 저장소의 번호표가 repo · label 과 함께 차례대로 보인다(우선순위 0 → 먼저 온 1)',
+        q14.map(x => `${x.priority}${x.label}@${path.basename(x.repo || '')}`).join() === '0a0@m-a,1holder-a@m-a,1b1@m-b' && S.queueOf(rb, 'checks').length === 0, JSON.stringify(q14));
+      hA.release();
+      await Promise.all([pA, pB]);
+      R.check('[Q-11] 놓이면 저장소를 넘어 차례대로 — 우선순위 0(다른 저장소)이 먼저 온 1 을 앞선다 · 끝나면 남는 것이 없다',
+        order.join() === 'a0,b1' && !fs.existsSync(path.join(mdir, 'checks.lock')) && fs.readdirSync(path.join(mdir, 'checks.queue')).length === 0, JSON.stringify(order));
+
+      // 기본(dir 없음)은 저장소마다 — 두 저장소가 동시에 쥔다(기본값 불변 반증 짝)
+      const h1 = await S.acquireQueued(ra, 'checks', { pollMs: 30 });
+      let h2 = null; const p2 = S.acquireQueued(rb, 'checks', { pollMs: 30 }).then(h => { h2 = h; });
+      await until(() => h2, 3000, 'repo b without dir');
+      R.check('[Q-12] dir 없이(기본)는 저장소마다 따로 — 다른 저장소가 쥔 동안에도 곧바로 잡는다', !!h2 && fs.existsSync(S.lockDir(ra, 'checks')) && fs.existsSync(S.lockDir(rb, 'checks')));
+      await p2; h1.release(); if (h2) h2.release();
+
+      // 저장소 A 의 자식이 PC 공용 잠금을 쥔 채 강제 종료 → 저장소 B 대기자가 빼앗아 잡는다
+      const kc = child(ra, { MODE: 'hold', LABEL: 'killed-a', DIR: mdir }); kids.push(kc);
+      await until(() => /got/.test(kc.out), 10000, 'machine holder got');
+      let gotB = null; const pb = S.acquireQueued(rb, 'checks', { pollMs: 30, dir: mdir, label: 'b-after' }).then(h => { gotB = h; });
+      await wait(300);
+      const waited = gotB === null;
+      if (process.platform === 'win32') spawnSync('taskkill', ['/PID', String(kc.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true }); else kc.kill('SIGKILL');
+      await kc.done;
+      await until(() => gotB, 5000, 'b after machine holder killed');
+      R.check('[Q-13] 다른 저장소의 주인이 PC 공용 잠금을 쥔 채 강제로 죽으면 — 기다리던 저장소 B 가 빼앗아 잡고 죽은 번호표는 남지 않는다',
+        waited && !!gotB && S.lockOwner(rb, 'checks', mdir).label === 'b-after' && S.queueOf(rb, 'checks', mdir).map(x => x.label).join() === 'b-after', JSON.stringify({ waited, got: !!gotB, out: kc.out.slice(0, 200), q: S.queueOf(rb, 'checks', mdir) }));
+      if (gotB) gotB.release();
+      await pb;
     }
   } catch (e) { R.check('예외 없이 끝난다', false, String(e && e.stack || e).slice(0, 800)); }
   finally {

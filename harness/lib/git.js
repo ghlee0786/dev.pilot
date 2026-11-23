@@ -11,13 +11,19 @@ const BACKOFF_MS = [200, 400, 800, 1600, 3200];
 // [자동 이슈 #54] Windows: core.longpaths 가 없는 저장소에서 MAX_PATH 를 넘는 경로가 있으면 git 이 그 파일을 읽지 못해
 //   status 가 "바뀌었다" 로 보고(정리가 시작도 못 함) · worktree remove 는 'Filename too long' 으로 등록만 지웠다 — 하네스의 git 은 늘 긴 경로를 켠다.
 const LONGPATHS = process.platform === 'win32' ? ['-c', 'core.longpaths=true'] : [];
+// opt.timeout(ms): 넘으면 git 을 끊는다 — [dev.pilot #86] 넘긴 상한(push 180초)을 spawnSync 에 주지 않아 fetch · push 가 무기한 멈출 수 있었다.
 function run(cwd, args, o) {
   const opt = o || {};
-  const r = spawnSync('git', [...LONGPATHS, ...args], { cwd, encoding: 'utf8', windowsHide: true, maxBuffer: 256 * 1024 * 1024, input: opt.input, env: opt.env ? { ...process.env, ...opt.env } : process.env });
+  const r = spawnSync('git', [...LONGPATHS, ...args], { cwd, encoding: 'utf8', windowsHide: true, maxBuffer: 256 * 1024 * 1024, input: opt.input, env: opt.env ? { ...process.env, ...opt.env } : process.env, ...(opt.timeout ? { timeout: opt.timeout, killSignal: 'SIGKILL' } : {}) });
+  if (r.error && r.error.code === 'ETIMEDOUT') return { ok: false, code: null, timedOut: true, out: String(r.stdout || ''), err: `timed out after ${Math.round(opt.timeout / 1000)}s` };
   return { ok: r.status === 0, code: r.status, out: String(r.stdout || ''), err: String(r.stderr || (r.error && r.error.message) || '') };
 }
+// [자동 이슈 #58] 다시 시도한 뒤에도 남은 잠금 파일(index.lock …)은 운영 오류다 — 하네스 결함으로 기록하지 않고(GIT_LOCKED) 무엇을 하면 되는지 알린다(#20 과 같은 안내).
+const LEFT_LOCK = /Unable to create '([^'\n]+\.lock)': File exists/;
 function fail(args, r) {
-  return Object.assign(new Error(`git ${args.join(' ')} failed (${r.code}): ${r.err.trim().slice(0, 600)}`), { code: 'GIT_FAILED', stderr: r.err, stdout: r.out });
+  const lock = LEFT_LOCK.exec(r.err);
+  const hint = lock ? ` — ${lock[1]} is left over; if no git command is running (editor, another session), delete that file and run the command again` : '';
+  return Object.assign(new Error(`git ${args.join(' ')} failed (${r.code}): ${r.err.trim().slice(0, 600)}${hint}`), { code: lock ? 'GIT_LOCKED' : 'GIT_FAILED', stderr: r.err, stdout: r.out });
 }
 // 기본: 실패하면 던지고 stdout(끝 공백 제거)을 돌려준다. allowFail 이면 {ok, out, err}.
 function git(cwd, args, o) {
@@ -28,7 +34,7 @@ function git(cwd, args, o) {
     if (r.ok || !opt.retryLock || i >= BACKOFF_MS.length || !LOCK_ERR.test(r.err)) break;
     S.sleepSync(BACKOFF_MS[i] + Math.floor(Math.random() * 100));
   }
-  if (opt.allowFail) return { ok: r.ok, out: r.out.replace(/\s+$/, ''), err: r.err, code: r.code };
+  if (opt.allowFail) return { ok: r.ok, out: r.out.replace(/\s+$/, ''), err: r.err, code: r.code, ...(r.timedOut ? { timedOut: true } : {}) };
   if (!r.ok) throw fail(args, r);
   return r.out.replace(/\s+$/, '');
 }
@@ -425,7 +431,7 @@ function procsIn(dir) {
 const USER_APPS = /^(code|code - insiders|cursor|windsurf|devenv|rider64|rider|idea64|idea|pycharm64|webstorm64|clion64|goland64|explorer|finder|windowsterminal|wt|openconsole|conhost|powershell|pwsh|cmd|bash|zsh|sh|claude|codex)(\.exe)?$/i;
 function killProcsIn(dir) {
   const found = procsIn(dir).filter(p => !USER_APPS.test(p.name || ''));
-  for (const p of found) require('./proc').killTree(p.pid);
+  for (const p of found) p.kill = require('./proc').killTree(p.pid);   // 끝내기 결과도 함께 — 실패가 보이게
   return found;
 }
 // 남은 폴더의 파일 중 브랜치 내용과 다른 것(캐시 제외)을 dest 로 복사 → { copied: [상대 경로], unreadable: [...] }
@@ -557,5 +563,5 @@ module.exports = {
   git, identityArgs, headSha, isWorktreeRoot, removeEmptyDir, rdTree, clearWorktreeSlot, slotOpts, useAltWorktree, keepEol, procsIn, killProcsIn, salvageLeftover, currentBranch, branchExists, tagExists, isAncestor, ensureRepo, isRepo, statusEntries, dirtyFiles, isClean, ignoredChanges,
   commitAll, unaddablePaths, isSecretPath, ensureExclude, addWorktree, worktreeList, worktreeRegistered, checkoutOf, mainWorktree, removeWorktree, samePath,
   diffNames, mergeBase, unmergedFiles, mergeInProgress, hasConflictMarkers, hasConflictMarkersText, MARKER_RE, worktreeIncludeFiles, copyWorktreeInclude, sha1, LOCK_ERR,
-  gitlinks, fillSubmodules, dropSubmoduleClones, worktreeLinks,
+  gitlinks, fillSubmodules, dropSubmoduleClones, worktreeLinks, CACHE_RE,
 };

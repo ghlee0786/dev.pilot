@@ -73,6 +73,8 @@ const cfg = d => { git(d, 'config', 'user.name', 't'); git(d, 'config', 'user.em
     R.check('[PS-08] push --tag: 원격에 없는 태그를 올린다(원격 태그 = 로컬 태그)', tg1.status === 0 && /PUSHED/.test(tg1.stdout) && git(bare, 'rev-parse', 'v1.0.0^{}') === git(a, 'rev-parse', 'v1.0.0^{}'), `${tg1.status} ${tg1.stdout} ${tg1.stderr}`);
     const tg2 = Push.push({ root: a, remote: 'origin', tag: 'v1.0.0' });
     R.check('[PS-09] 같은 태그가 이미 같은 커밋이면 아무것도 하지 않는다', tg2.ok && !tg2.pushed && /already/.test(tg2.reason), tg2.reason);
+    const tg2d = Push.push({ root: a, remote: 'origin', tag: 'v1.0.0', dryRun: true });
+    R.check('[PS-09] (#86 리뷰 N2 · 재리뷰 N4) 같은 태그가 이미 있어도 dry-run 은 쓰기 권한을 확인한다(write ok · 보낸 것 없음)', tg2d.ok && tg2d.dryRun && tg2d.write === 'ok' && !tg2d.pushed && /already/.test(tg2d.reason), JSON.stringify([tg2d.write, tg2d.reason]));
     git(b, 'fetch', '-q', 'origin'); git(b, 'tag', 'v2.0.0', 'origin/main'); git(b, 'push', '-q', 'origin', 'v2.0.0');
     git(a, 'tag', 'v2.0.0', 'HEAD');
     const remoteV2 = git(bare, 'rev-parse', 'v2.0.0');
@@ -80,6 +82,164 @@ const cfg = d => { git(d, 'config', 'user.name', 't'); git(d, 'config', 'user.em
     R.check('[PS-10] 원격의 같은 이름 태그가 다른 커밋이면 거부(덮어쓰지 않는다)', tg3.refused && /different commit/.test(tg3.reason) && git(bare, 'rev-parse', 'v2.0.0') === remoteV2, tg3.reason);
     let e11 = null; try { Push.push({ root: a, remote: 'origin', tag: 'v9.9.9' }); } catch (e) { e11 = e; }
     R.check('[PS-11] 로컬에 없는 태그 → USAGE', e11 && e11.code === 'USAGE' && /no such tag/.test(e11.message), e11 && e11.message);
+
+    // ── [dev.pilot #86] push --dry-run 이 쓰기 권한까지 확인한다(전송 0) · 실패면 원격 · 자격 증명 도우미 · 계정 · 비밀은 보이지 않는다 · 상한 ──
+    //   격리: 사용자 · 시스템 git 설정과 실제 자격 저장소를 쓰지 않는다(임시 HOME · GIT_CONFIG_NOSYSTEM) · 원격은 임시 bare 와 127.0.0.1 의 Node 서버뿐.
+    {
+      const KEEP = ['HOME', 'USERPROFILE', 'XDG_CONFIG_HOME', 'GIT_CONFIG_NOSYSTEM', 'GIT_SSH_COMMAND', 'HARNESS_PUSH_TIMEOUT_MS', 'GIT_HTTP_LOW_SPEED_LIMIT', 'GIT_HTTP_LOW_SPEED_TIME'];
+      const saved = Object.fromEntries(KEEP.map(k => [k, process.env[k]]));
+      const home = path.join(base, 'home86'); fs.mkdirSync(home, { recursive: true });
+      Object.assign(process.env, { HOME: home, USERPROFILE: home, XDG_CONFIG_HOME: path.join(home, '.config'), GIT_CONFIG_NOSYSTEM: '1' });
+      for (const k of ['GIT_SSH_COMMAND', 'HARNESS_PUSH_TIMEOUT_MS', 'GIT_HTTP_LOW_SPEED_LIMIT', 'GIT_HTTP_LOW_SPEED_TIME']) delete process.env[k];
+      const servers = [];
+      try {
+        const bare2 = path.join(base, 'r86.git'); git(base, 'init', '-q', '--bare', '-b', 'main', bare2);
+        const w = path.join(base, 'w86'); git(base, 'clone', '-q', bare2, w); cfg(w); git(w, 'config', 'credential.helper', '');
+        write(path.join(w, 'y.txt'), '1\n'); git(w, 'add', '-A'); git(w, 'commit', '-qm', 'y1'); git(w, 'push', '-q', '-u', 'origin', 'main');
+        const remoteBefore = git(bare2, 'rev-parse', 'main');
+        const d0 = Push.push({ root: w, dryRun: true });
+        write(path.join(w, 'y.txt'), '2\n'); git(w, 'commit', '-qam', 'y2');
+        const d1 = Push.push({ root: w, dryRun: true });
+        R.check('[PS-12] dry-run 은 쓰기 권한을 확인한다(write ok · 전송 0) — 올릴 것이 없어도(ahead 0) · 올릴 것이 있어도 · bare 는 그대로',
+          d0.ok && d0.dryRun && d0.write === 'ok' && d0.ahead === 0 && /nothing to push/.test(d0.reason) && d1.ok && d1.write === 'ok' && d1.ahead === 1 && /would push 1/.test(d1.reason) &&
+          /write: ok \(dry run — nothing was sent\)/.test(Push.format(d1)) && git(bare2, 'rev-parse', 'main') === remoteBefore, JSON.stringify({ d0: [d0.write, d0.reason], d1: [d1.write, d1.reason] }));
+
+        // 읽기는 되는데 쓰기 주소(pushurl)가 없는 곳 — "would push" 가 아니라 쓰기 확인 실패(반증 짝: PS-12)
+        git(w, 'config', 'remote.origin.pushurl', path.join(base, 'no-such-remote.git'));
+        const d2 = Push.push({ root: w, dryRun: true });
+        const cli2 = spawnSync(process.execPath, [CLI, 'push', '--dry-run', '--root', w], { encoding: 'utf8', windowsHide: true, timeout: 60000, env: process.env });
+        R.check('[PS-13] fetch 는 되고 pushurl 이 없는 곳이면 dry-run 이 실패한다(write unreachable · exit 1) · bare 그대로 · 원격 · 도우미 · 계정 줄',
+          !d2.ok && d2.dryRun && d2.write === 'unreachable' && !/would push/.test(d2.reason) && /nothing was sent/.test(d2.reason) && cli2.status === 1 &&
+          /remote: origin → .*no-such-remote\.git/.test(cli2.stdout) && /credential helper: none/.test(cli2.stdout) && /account: unknown/.test(cli2.stdout) && git(bare2, 'rev-parse', 'main') === remoteBefore,
+          `${JSON.stringify([d2.write, d2.reason])} ${cli2.status} ${cli2.stdout.slice(0, 500)}`);
+
+        // receive-pack 을 거부하는 서버: 인증 없으면 401 · 인증하면 403(denied to alice) — 도우미는 받은 환경만 적고 비밀을 돌려준다
+        const srvJs = "const s=require('http').createServer((q,r)=>{if(!/git-receive-pack/.test(q.url)){r.writeHead(404);return r.end();}if(!q.headers.authorization){r.writeHead(401,{'WWW-Authenticate':'Basic realm=\"x\"'});return r.end();}r.writeHead(403,{'Content-Type':'text/plain'});r.end('Permission to o/r.git denied to alice.\\n')});s.listen(0,'127.0.0.1',()=>console.log(s.address().port))";
+        const srv = spawn(process.execPath, ['-e', srvJs], { stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true }); servers.push(srv);
+        const port = await new Promise(res => srv.stdout.once('data', d => res(Number(String(d).trim()))));
+        const envLog = path.join(base, 'helper86-env.jsonl').replace(/\\/g, '/'), helper = path.join(base, 'helper86.js').replace(/\\/g, '/');
+        write(helper, `require('fs').appendFileSync(${JSON.stringify(envLog)}, JSON.stringify({ gcm: process.env.GCM_INTERACTIVE || null, prompt: process.env.GIT_TERMINAL_PROMPT || null, op: process.argv[2] }) + '\\n');\nif (process.argv[2] === 'get') process.stdout.write('username=alice\\npassword=SEKRET-XYZ-123\\n');\n`);
+        git(w, 'config', '--add', 'credential.helper', `!node "${helper}"`);
+        git(w, 'config', 'credential.username', 'alice');
+        git(w, 'config', 'remote.origin.pushurl', `http://127.0.0.1:${port}/o/r.git`);
+        const d3 = Push.push({ root: w, dryRun: true });
+        const cli3 = spawnSync(process.execPath, [CLI, 'push', '--dry-run', '--json', '--root', w], { encoding: 'utf8', windowsHide: true, timeout: 60000, env: process.env });
+        const all3 = `${Push.format(d3)}\n${JSON.stringify(d3)}\n${cli3.stdout}\n${cli3.stderr}`;
+        R.check('[PS-14] 쓰기가 거부되면 write denied · 계정(credential.username 출처) · 도우미 custom(node) · 원격 URL 을 보고한다 · 비밀(도우미가 준 비밀번호)은 어디에도 없다',
+          !d3.ok && d3.write === 'denied' && d3.diagnose && d3.diagnose.account === 'alice' && d3.diagnose.accountFrom === 'credential.username' && d3.diagnose.helpers.includes('custom(node) (local)') &&
+          d3.diagnose.url === `http://127.0.0.1:${port}/o/r.git` && /account: alice \(from credential\.username\)/.test(Push.format(d3)) && !/SEKRET-XYZ-123/.test(all3), all3.slice(0, 900));
+        // URL 의 user(bob · hex 토큰)와 다른 credential.username(carol)을 두어, 계정이 URL 이 아니라 설정에서 온다는 것을 실제 값으로 고정한다
+        git(w, 'config', 'credential.username', 'carol');
+        git(w, 'config', 'remote.origin.pushurl', `http://bob:TOK-999@127.0.0.1:${port}/o/r.git`);
+        const d4 = Push.push({ root: w, dryRun: true });
+        const all4 = `${Push.format(d4)}\n${JSON.stringify(d4)}`;
+        R.check('[PS-14] URL 에 user:token@ 이 있어도 토큰은 보이지 않는다 — 계정은 credential.username 의 carol(URL 의 bob 이 아니다 · 재리뷰 S5) · 원격 URL 은 userinfo 없이',
+          !d4.ok && d4.diagnose && d4.diagnose.account === 'carol' && d4.diagnose.accountFrom === 'credential.username' && d4.diagnose.url === `http://127.0.0.1:${port}/o/r.git` && !/TOK-999/.test(all4) && !/\bbob\b/.test(all4), all4.slice(0, 700));
+        const hex = '0123456789abcdef0123456789abcdef01234567';
+        git(w, 'config', 'remote.origin.pushurl', `http://${hex}:x-oauth-basic@127.0.0.1:${port}/o/r.git`);
+        const d4h = Push.push({ root: w, dryRun: true });
+        const all4h = `${Push.format(d4h)}\n${JSON.stringify(d4h)}`;
+        R.check('[PS-14] (재리뷰 S5) 접두 없는 40자 hex 토큰을 user 자리에 둔 <토큰>:x-oauth-basic@ 꼴도 계정 · 출력 · JSON 어디에도 없다 — 계정은 carol(credential.username)',
+          !d4h.ok && d4h.diagnose && d4h.diagnose.account === 'carol' && d4h.diagnose.accountFrom === 'credential.username' && !all4h.includes(hex) && d4h.diagnose.url === `http://127.0.0.1:${port}/o/r.git`, all4h.slice(0, 700));
+        git(w, 'config', '--unset', 'credential.username');
+        // ssh 는 URL 의 user@ 를 계정으로 읽는다(ssh://alice@host · scp alice@host:) — 접속하지 않는 diagnose 만 본다
+        git(w, 'remote', 'add', 'sshr', 'ssh://alice@host.example/o/r.git'); git(w, 'remote', 'add', 'scpr', 'alice@host.example:o/r.git');
+        const ds = Push.diagnose(w, 'sshr', ''), dc = Push.diagnose(w, 'scpr', '');
+        git(w, 'remote', 'remove', 'sshr'); git(w, 'remote', 'remove', 'scpr');
+        R.check('[PS-14] (재리뷰 nit) ssh://alice@host · alice@host:o/r 는 계정 alice(remote URL 출처)', ds.account === 'alice' && ds.accountFrom === 'remote URL' && dc.account === 'alice' && dc.accountFrom === 'remote URL', JSON.stringify({ ds, dc }));
+        const calls = fs.existsSync(envLog) ? fs.readFileSync(envLog, 'utf8').trim().split('\n').filter(Boolean).map(l => JSON.parse(l)) : [];
+        R.check('[PS-15] 쓰기 확인도 창을 띄우지 않는다 — 도우미가 받은 환경 GIT_TERMINAL_PROMPT=0 · GCM_INTERACTIVE=never', calls.some(x => x.op === 'get') && calls.every(x => x.gcm === 'never' && x.prompt === '0'), JSON.stringify(calls).slice(0, 400));
+        const e1 = Push.noPromptEnv(w, 60000);
+        git(w, 'config', 'core.sshCommand', 'node fake-ssh.js');
+        const e2 = Push.noPromptEnv(w, 60000);
+        process.env.GIT_HTTP_LOW_SPEED_TIME = '999';
+        const e3 = Push.noPromptEnv(w, 60000); delete process.env.GIT_HTTP_LOW_SPEED_TIME;
+        git(w, 'config', '--unset', 'core.sshCommand');
+        process.env.GIT_SSH = path.join(base, 'plink-fake.exe');
+        const e4 = Push.noPromptEnv(w, 60000); delete process.env.GIT_SSH;
+        git(w, 'config', 'ssh.variant', 'plink');
+        const e5 = Push.noPromptEnv(w, 60000); git(w, 'config', '--unset', 'ssh.variant');
+        git(w, 'config', `http.http://127.0.0.1:${port}/.lowSpeedTime`, '600');
+        const e6 = Push.noPromptEnv(w, 60000); git(w, 'config', '--unset', `http.http://127.0.0.1:${port}/.lowSpeedTime`);
+        R.check('[PS-15] SSH: 사용자가 ssh 명령을 정하지 않았으면 BatchMode=yes + ConnectTimeout · ServerAlive(같은 상한) · core.sshCommand 를 정했으면 덮지 않는다 · HTTP 도우미 상한은 사용자가 정한 env 가 있으면 덮지 않는다',
+          e1.GIT_SSH_COMMAND === 'ssh -o BatchMode=yes -o ConnectTimeout=60 -o ServerAliveInterval=15 -o ServerAliveCountMax=4' && e1.GIT_HTTP_LOW_SPEED_TIME === '60' && e1.GIT_HTTP_LOW_SPEED_LIMIT === '1' && !('GIT_SSH_COMMAND' in e2) && e2.GIT_TERMINAL_PROMPT === '0' && !('GIT_HTTP_LOW_SPEED_TIME' in e3),
+          JSON.stringify({ e1, e2, e3 }));
+        R.check('[PS-15] (#86 리뷰 S3 · N1) GIT_SSH(plink 등) · ssh.variant 가 있으면 GIT_SSH_COMMAND 를 넣지 않는다 · git 설정 http.<url>.lowSpeedTime 이 있으면 HTTP 상한 env 를 넣지 않는다',
+          !('GIT_SSH_COMMAND' in e4) && !('GIT_SSH_COMMAND' in e5) && e4.GIT_TERMINAL_PROMPT === '0' && !('GIT_HTTP_LOW_SPEED_TIME' in e6) && !('GIT_HTTP_LOW_SPEED_LIMIT' in e6) && 'GIT_SSH_COMMAND' in e6, JSON.stringify({ e4, e5, e6 }));
+
+        // [#86 리뷰 B1] 콜론 없는 userinfo(https://<토큰>@host)는 계정이 아니다 — 출력 · --json · 하네스 기록 어디에도 토큰이 없다
+        for (const tok of ['TOK-999-NOCOLON', 'ghp_ABCDEFGHIJKL123456']) {
+          git(w, 'config', 'remote.origin.pushurl', `http://${tok}@127.0.0.1:${port}/o/r.git`);
+          const d6 = Push.push({ root: w, dryRun: true });
+          const cli6 = spawnSync(process.execPath, [CLI, 'push', '--dry-run', '--json', '--root', w], { encoding: 'utf8', windowsHide: true, timeout: 60000, env: process.env });
+          const cli6t = spawnSync(process.execPath, [CLI, 'push', '--dry-run', '--root', w], { encoding: 'utf8', windowsHide: true, timeout: 60000, env: process.env });
+          const walk = d => { let out = ''; let names = []; try { names = fs.readdirSync(d, { withFileTypes: true }); } catch { return ''; } for (const e of names) { const p = path.join(d, e.name); out += e.isDirectory() ? walk(p) : (() => { try { return fs.readFileSync(p, 'utf8'); } catch { return ''; } })(); } return out; };
+          const all6 = `${Push.format(d6)}\n${JSON.stringify(d6)}\n${cli6.stdout}\n${cli6.stderr}\n${cli6t.stdout}\n${cli6t.stderr}\n${walk(path.join(w, '.git', 'harness'))}`;
+          R.check(`[PS-18] 콜론 없는 userinfo 토큰(${tok.slice(0, 4)}…)은 계정으로 쓰지 않고 어디에도 보이지 않는다 — 원격 URL 은 userinfo 없이`,
+            !d6.ok && d6.diagnose && d6.diagnose.account !== tok && !all6.includes(tok) && d6.diagnose.url === `http://127.0.0.1:${port}/o/r.git`, all6.slice(0, 700));
+        }
+        git(w, 'config', 'remote.origin.pushurl', `http://127.0.0.1:${port}/o/r.git`);
+
+        // [#86 리뷰 S2] 쓰기 확인은 로컬 pre-push 훅을 돌리지 않는다(실제 push 는 그대로)
+        const hookMark = path.join(base, 'pre-push-ran.txt').replace(/\\/g, '/');
+        write(path.join(w, '.git', 'hooks', 'pre-push'), `#!/bin/sh\necho ran > "${hookMark}"\nexit 0\n`);
+        try { fs.chmodSync(path.join(w, '.git', 'hooks', 'pre-push'), 0o755); } catch { /* Windows */ }
+        git(w, 'config', '--unset', 'remote.origin.pushurl');
+        git(w, 'push', '--dry-run', 'origin', 'main');
+        const hookRunsPlain = fs.existsSync(hookMark); try { fs.rmSync(hookMark); } catch { /* 없음 */ }
+        const d7 = Push.push({ root: w, dryRun: true });
+        R.check('[PS-19] push --dry-run 의 쓰기 확인은 pre-push 훅을 돌리지 않는다(--no-verify) · 확인은 ok — 반증 짝: 맨 git push --dry-run 은 그 훅을 돌린다',
+          hookRunsPlain && d7.ok && d7.write === 'ok' && !fs.existsSync(hookMark), JSON.stringify({ hookRunsPlain, ok: d7.ok, write: d7.write, ran: fs.existsSync(hookMark) }));
+        const p7 = Push.push({ root: w });
+        R.check('[PS-19] (짝) 실제 push 는 pre-push 훅을 그대로 돌린다 — 확인만 훅을 건너뛴다', p7.ok && p7.pushed && fs.existsSync(hookMark) && git(bare2, 'rev-parse', 'main') === git(w, 'rev-parse', 'main'), JSON.stringify({ ok: p7.ok, pushed: p7.pushed, reason: p7.reason, ran: fs.existsSync(hookMark) }));
+        fs.rmSync(path.join(w, '.git', 'hooks', 'pre-push'));
+        git(w, 'config', 'remote.origin.pushurl', `http://127.0.0.1:${port}/o/r.git`);
+
+        // 상한: 연결을 받고 응답하지 않는 서버(10초 뒤 스스로 닫음) — 확인이 상한 근처에서 timeout 으로 끝나고 힌트를 보인다
+        const mute = spawn(process.execPath, ['-e', "const s=require('net').createServer(c=>{setTimeout(()=>c.destroy(),10000)});s.listen(0,'127.0.0.1',()=>console.log(s.address().port))"], { stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true }); servers.push(mute);
+        const mport = await new Promise(res => mute.stdout.once('data', d => res(Number(String(d).trim()))));
+        git(w, 'config', 'remote.origin.pushurl', `http://127.0.0.1:${mport}/o/r.git`);
+        process.env.HARNESS_PUSH_TIMEOUT_MS = '2000';
+        // 시간은 쓰기 확인(probe) 구간만 잰다 — fetch(로컬 bare) · 진단 git 호출은 넣지 않는다. 서버는 10초 뒤 스스로 닫으므로 9.5초를 넘기면 상한이 듣지 않은 것이다
+        const t0 = Date.now(), pr5 = Push.probe(w, 'origin', 'refs/heads/main:refs/heads/main'), ms5 = Date.now() - t0;
+        const d5 = Push.push({ root: w, dryRun: true });
+        delete process.env.HARNESS_PUSH_TIMEOUT_MS;
+        R.check('[PS-16] 응답 없는 원격 — 쓰기 확인이 상한(2초) 근처에서 timeout 으로 끝난다(10초 서버를 기다리지 않는다) · push --dry-run 보고에 timeout 과 힌트',
+          pr5.write === 'timeout' && ms5 < 9500 && !d5.ok && d5.write === 'timeout' && /did not answer in time/.test(Push.format(d5)),
+          JSON.stringify({ probe: pr5.write, ms5, write: d5.write, reason: d5.reason, detail: d5.writeDetail }));
+        const G = require('../../harness/lib/git.js');
+        const tg = Date.now(), rt = G.git(w, ['-c', 'alias.slow=!node -e "setTimeout(()=>{},4000)"', 'slow'], { allowFail: true, timeout: 1000 }), msg = Date.now() - tg;
+        R.check('[PS-16] git.run 은 넘긴 상한을 지킨다 — 시간 초과면 ok false · timedOut · err "timed out after"', !rt.ok && rt.timedOut === true && /timed out after 1s/.test(rt.err), JSON.stringify({ rt, msg }));
+      } finally {
+        for (const s of servers) { try { s.kill(); } catch { /* 끝남 */ } }
+        for (const k of KEEP) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]; }
+      }
+    }
+
+    // ── redactSecrets(진단용 비밀 가리기) · sanitize 는 그대로 · board.maskSecrets 의 빠진 꼴(#84 리뷰 N1) ──
+    {
+      const { redactSecrets, sanitize } = require('../../harness/lib/bugreport.js');
+      const BD = require('../../harness/hooks/board.js');
+      const src = "Authorization: Bearer abcdefghijklmnop · ghp_ABCDEFGH12345678 · https://u:p4ss@h.example/r.git · password=hunter22 · run --password s3cr3tVal · docker login -u me -p dckrPass1 · https://acct.blob.core.windows.net/c?sv=2020&sig=SASsig123%3D · remote: Permission to o/r.git denied to alice. · origin";
+      const rd = redactSecrets(src);
+      R.check('[PS-17] redactSecrets — Bearer · 토큰 · URL 비밀번호 · password= · --password 값 · login -p 값 · sig= 를 가리고, 계정 이름(denied to alice) · 원격 이름 · 호스트는 남긴다 · http(s) userinfo 는 통째로 <secret>@(재리뷰 S5)',
+        !/abcdefghijklmnop|ghp_ABCDEFGH|p4ss|hunter22|s3cr3tVal|dckrPass1|SASsig123/.test(rd) && /denied to alice/.test(rd) && /origin/.test(rd) && /https:\/\/<secret>@h\.example\/r\.git/.test(rd), rd);
+      const hx = 'https://0123456789abcdef0123456789abcdef01234567:x-oauth-basic@h.example/r.git · ssh://git@host.example/r.git';
+      R.check('[PS-17] (재리뷰 S5) 접두 없는 40자 hex:x-oauth-basic@ — redactSecrets · maskSecrets 모두 user 까지 가린다 · ssh 의 git@ 은 그대로',
+        [redactSecrets(hx), BD.maskSecrets(hx)].every(x => !/0123456789abcdef/.test(x) && /https:\/\/<secret>@h\.example/.test(x) && /ssh:\/\/git@host\.example/.test(x)), `${redactSecrets(hx)} || ${BD.maskSecrets(hx)}`);
+      const sz = sanitize(src);
+      R.check('[PS-17] sanitize 는 redactSecrets 를 먼저 부르고 URL 까지 가린다(발행용 · 기존보다 덜 가리지 않는다)', !/abcdefghijklmnop|ghp_ABCDEFGH|p4ss|hunter22|s3cr3tVal|dckrPass1|SASsig123|h\.example/.test(sz) && /<url>/.test(sz), sz);
+      const ms = BD.maskSecrets('run --password s3cr3tVal · docker login -u me -p dckrPass1 · https://x/c?sv=1&sig=SASsig123 · mkdir -p some/dir · --pass=xx9pass');
+      R.check('[PS-17] maskSecrets(#84 리뷰 N1) — 공백 구분 --password 값 · docker login … -p 값 · sig= 를 가린다 · login 이 아닌 -p(mkdir -p)는 그대로',
+        !/s3cr3tVal|dckrPass1|SASsig123|xx9pass/.test(ms) && /mkdir -p some\/dir/.test(ms), ms);
+      const nc = 'fatal: unable to access \'https://AZPATabc123xyz@dev.example/o/_git/r/\' · ssh://git@host.example/o/r.git · git@host.example:o/r.git · https://u:pw9@h.example/x';
+      const rn = redactSecrets(nc), mn = BD.maskSecrets(nc);
+      R.check('[PS-17] (#86 리뷰 S1) http(s) 의 콜론 없는 userinfo(토큰)는 가린다 — redactSecrets · maskSecrets 모두 · ssh 의 git@ 은 그대로',
+        !/AZPATabc123xyz/.test(rn) && !/AZPATabc123xyz/.test(mn) && /https:\/\/<secret>@dev\.example/.test(rn) && /ssh:\/\/git@host\.example/.test(rn) && /git@host\.example:o\/r\.git/.test(rn) && /ssh:\/\/git@host\.example/.test(mn) && !/pw9/.test(rn) && !/pw9/.test(mn),
+        `${rn} || ${mn}`);
+      const n3 = BD.maskSecrets('[login test] mkdir -p out/x · ssh login -p 2222 host · find . -print');
+      R.check('[PS-17] (#86 리뷰 N3) maskSecrets 의 login -p 는 레지스트리 login 만 — mkdir -p 경로 · ssh -p 포트 · -print 는 그대로', n3 === '[login test] mkdir -p out/x · ssh login -p 2222 host · find . -print', n3);
+    }
 
     // ── v7 에서 뺀 명령: exit 2 · 무엇으로 바뀌었는지 알린다(옛 안내를 따르는 세션이 있다) ──
     const removedCli = (...args) => spawnSync(process.execPath, [CLI, ...args, '--root', a], { encoding: 'utf8', windowsHide: true, timeout: 60000 });

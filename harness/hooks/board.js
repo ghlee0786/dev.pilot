@@ -34,7 +34,12 @@ function maskSecrets(text) {
   let s = String(text || '');
   for (const re of SECRET_RES) s = s.replace(re, SECRET);
   s = s.replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/g, `$1 ${SECRET}`);
+  s = s.replace(/(\bhttps?:\/\/)(?!<secret>@)[^\s/@'"<>]+@/gi, `$1${SECRET}@`);                          // http(s) 의 userinfo 는 통째로(https://<PAT>@ · <토큰>:x-oauth-basic@ — #86 리뷰 S1 · S5) · ssh 의 git@ 은 둔다
   s = s.replace(/(\b[a-z][a-z0-9+.-]*:\/\/[^\s:/@]+:)[^\s@/]+@/gi, `$1${SECRET}@`);                       // scheme://user:pass@
+  // [#84 리뷰 N1] 검사 출력에 흔한 꼴 — 공백으로 구분한 --password 값 · docker login … -p 값 · Azure SAS sig=
+  s = s.replace(/(\s--?(?:password|passwd|pass|token|api-key|apikey|secret|access-key)\s+)(?!<secret>)\S+/gi, `$1${SECRET}`);
+  s = s.replace(/(\b(?:docker|podman|nerdctl|helm|buildah|skopeo|oras)\b[^\n]*?\blogin\b[^\n]*?\s-p\s+)(?!<secret>)\S+/gi, `$1${SECRET}`);   // [#86 리뷰 N3] 레지스트리 login 의 -p 만(mkdir -p · ssh -p 2222 는 그대로)
+  s = s.replace(/([?&;\s]sig=)(?!<secret>)[^&\s'"<>]+/gi, `$1${SECRET}`);
   // NAME=값 · NAME: 값 (이름이 key · token · secret · password · pwd · pass 로 끝나는 것 — keyboard: 는 아니다)
   s = s.replace(/\b([A-Za-z0-9_.-]*(?:key|token|secret|passw(?:or)?d|pwd|pass)s?)(\s*[=:]\s*)(?!<secret>)("[^"]*"|'[^']*'|\S+)/gi, `$1$2${SECRET}`);
   // 비밀번호는 … · 토큰: … — 조사(은 · 는 · 이 · 가)나 : · = 뒤의 비밀 꼴 낱말(한글이 없고 숫자 · 기호가 든 4자 이상 — "토큰이 만료" 는 그대로)
@@ -153,6 +158,10 @@ function decide(input, runtime, now) {
   if (!info || C.harnessOwned(info)) return null;          // 무인 작업자의 worktree — 게시판에 오르지 않는다
 
   if (ev === 'PreToolUse') {
+    // [2026-11-02 소유권] 쓰기 전 상태(그때 미커밋이었나 · 내 마지막 쓰기 뒤 남의 손)를 적는다 — stop · session-end 가 대신 커밋할지 이것으로 정한다.
+    const pre = [...new Set(require('./track').pathsOf(input).map(p => C.repoRel(info.root, cwd, p)).filter(Boolean))];
+    if (pre.length) C.updateSession(info.common, sid, runtime, s => { s.file_meta = C.notePre(s.file_meta && typeof s.file_meta === 'object' ? s.file_meta : {}, info.root, pre); return s; });
+    if (runtime === 'codex') return null;                // Codex: 적기만 한다(묻기 'ask' 는 Claude 쓰기 도구만)
     const ti = input.tool_input && typeof input.tool_input === 'object' ? input.tool_input : {};
     const file = ti.file_path || ti.notebook_path;
     const rel = typeof file === 'string' ? C.repoRel(info.root, cwd, file) : null;

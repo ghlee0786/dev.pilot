@@ -51,6 +51,8 @@ const isDeny = r => r.status === 0 && r.json && r.json.hookSpecificOutput && r.j
   r.json.hookSpecificOutput.permissionDecision === 'deny' && typeof r.json.hookSpecificOutput.permissionDecisionReason === 'string';
 const isAllow = r => r.status === 0 && r.stdout.trim() === '';
 const status = repo => (spawnSync('git', ['status', '--porcelain', '--untracked-files=all'], { cwd: repo, encoding: 'utf8', env: ENV, windowsHide: true }).stdout || '').replace(/\s+$/, '');
+// 설치 흐름의 쓰기 전 이벤트 — PreToolUse(Write) = board. [2026-11-02 소유권] stop · session-end 는 쓰기 전 기록이 있어야 대신 커밋한다.
+const claudePre = (repo, sid, file) => hook('board', { hook_event_name: 'PreToolUse', session_id: sid, cwd: repo, prompt_id: 'p', tool_name: 'Write', tool_input: { file_path: file, content: 'x' } });
 const claudeWrite = (repo, sid, file, tool) => hook('track', { hook_event_name: 'PostToolUse', session_id: sid, cwd: repo, prompt_id: 'p', tool_name: tool || 'Write', tool_input: { file_path: file, content: 'x' }, tool_response: { success: true } });
 
 (async () => {
@@ -88,6 +90,34 @@ const claudeWrite = (repo, sid, file, tool) => hook('track', { hook_event_name: 
       ['git push --dry-run', 'Bash'], ['git add src/a.js', 'Bash'], ['git add .env.example', 'Bash'], ['git fetch origin', 'Bash'],
     ];
     for (const [c, t] of mustAllow) { const r = pre(c, t); R.check(`[guard] 통과(${t}): ${c.replace(/\n/g, '\\n').slice(0, 80)}`, isAllow(r), JSON.stringify(r).slice(0, 300)); }
+
+    // Herdr Core는 실제 실행(run/exec)과 작업자에게 보내는 문장(send)을 구분한다.
+    const hcBlock = [
+      ['hc exec git push origin main', 'Bash'],
+      ['hc run --bg --name check "git reset --hard"', 'Bash'],
+      ['hc --json exec --on build --cwd /srv/app --timeout 60 -- git push', 'Bash'],
+      ['hc run --on=build --cwd=/srv/app --label=role=test --parent=t1 --outlive-parent --bg git push', 'Bash'],
+      ['& "C:\\Program Files\\Herdr Core\\hc.exe" exec --cwd "C:\\repo with spaces" -- git reset --hard', 'PowerShell'],
+      ['hc exec --env G=git pwsh -Command "$env:G push"', 'PowerShell'],
+      ['hc run --bg bash -lc "git clean -fd"', 'Bash'],
+      ['hc exec -i sh <<\'EOF\'\ngit push\nEOF', 'Bash'],
+      ['echo "git push" | hc exec --stdin sh', 'Bash'],
+      ['hc run \'$g="git"; & $g push origin main\'', 'Bash'],
+      ['hc run --on vps \'git pu\\sh origin main\'', 'PowerShell'],
+    ];
+    for (const [c, t] of hcBlock) { const r = pre(c, t); R.check(`[guard/hc] 실행 내부를 막는다(${t}): ${c}`, isDeny(r), JSON.stringify(r).slice(0, 300)); }
+    const hcAllow = [
+      ['hc send t7 "git push 하지 말고 git reset --hard 위험을 보고하세요"', 'Bash'],
+      ['hc send --wait t7 "git push 차단 검토 완료"', 'Bash'],
+      ['hc run --bg --name review reviewer "git push 차단 검토"', 'Bash'],
+      ['hc exec --on build --cwd /srv/app git status --short', 'Bash'],
+      ['hc exec -- git push --dry-run', 'Bash'],
+      ['hc exec "git push"', 'Bash'], // exec는 셸 문자열을 실행하지 않는다.
+      ['hc run --help "git push"', 'Bash'],
+      ['hc read t7 --lines 100', 'Bash'],
+    ];
+    for (const [c, t] of hcAllow) { const r = pre(c, t); R.check(`[guard/hc] 읽기·지시문 통과(${t}): ${c}`, isAllow(r), JSON.stringify(r).slice(0, 300)); }
+    R.check('[guard/hc] --cwd는 내부 실행에만 적용한다', isDeny(pre('hc exec --cwd src git status; rm -rf .', 'Bash')));
 
     // 넓은 add 는 실제 작업 트리를 본다 — 추적 안 된 비밀 파일이 쓸려 들어가면 막는다.
     write(path.join(repo, 'src', 'b.js'), 'b\n');
@@ -255,6 +285,7 @@ const claudeWrite = (repo, sid, file, tool) => hook('track', { hook_event_name: 
 
     // ── stop (Claude) ─────────────────────────────────────────────────
     const st = mkRepo('stop', { 'a.js': 'a\n', 'b.js': 'b\n' });
+    claudePre(st, 'SA', path.join(st, 'a.js')); claudePre(st, 'SB', path.join(st, 'b.js'));
     write(path.join(st, 'a.js'), 'A\n'); write(path.join(st, 'b.js'), 'B\n');
     claudeWrite(st, 'SA', path.join(st, 'a.js'));
     claudeWrite(st, 'SB', path.join(st, 'b.js'));
@@ -291,6 +322,26 @@ const claudeWrite = (repo, sid, file, tool) => hook('track', { hook_event_name: 
       const c7 = SP.promiseWithoutAction({ transcript_path: tr('p7', [u('이전'), a(null, [{ name: 'Monitor' }]), u('계속해'), a(say)]) });   // 앞 차례의 감시는 이번 차례 것이 아니다
       R.check('[stop/#35] 약속만 하고 아무것도 안 띄우면 되돌려 보냄 · 백그라운드 · 예약 깨우기가 있거나 · 질문 · 이미 되돌린 뒤 · 끝낸 보고는 그냥 둔다',
         !!c1 && /이어서 진행하겠다/.test(c1) && !c2 && !c3 && !c4 && !c5 && !c6 && !!c7, JSON.stringify([!!c1, !!c2, !!c3, !!c4, !!c5, !!c6, !!c7]));
+      const hcCases = [
+        ['hc run --bg --name review reviewer "검토하세요"', 'Bash', false],
+        ['hc --json run --on=build --cwd=/srv/app --bg -- claude "검토하세요"', 'Bash', false],
+        ['& "C:\\Program Files\\Herdr Core\\hc.exe" run --cwd "C:\\repo with spaces" --bg claude', 'PowerShell', false],
+        ['HC_SESSION=test env -u UNUSED -- nohup hc run --bg reviewer', 'Bash', false],
+        ['env -i MODE=review hc.cmd run --bg reviewer', 'Bash', false],
+        ['& "C:\\Program Files\\Herdr Core\\hc.ps1" run --bg reviewer', 'PowerShell', false],
+        ['env --help hc run --bg reviewer', 'Bash', true],
+        ['env MODE=review hc send t7 "hc run --bg reviewer"', 'Bash', true],
+        ['hc send t7 "검토하세요"', 'Bash', true],
+        ['hc wait t7', 'Bash', true],
+        ['hc read t7', 'Bash', true],
+        ['hc run reviewer "예시: hc run --bg claude"', 'Bash', true],
+        ['hc run --help --bg claude', 'Bash', true],
+        ['hc run -- claude --bg', 'Bash', true],
+      ];
+      hcCases.forEach(([command, name, blocked], i) => {
+        const why = SP.promiseWithoutAction({ transcript_path: tr(`hc-${i}`, [u('계속해'), a(null, [{ name, input: { command } }]), a(say)]) });
+        R.check(`[stop/hc] 실제 run --bg만 이어 갈 작업이다: ${command}`, !!why === blocked, String(why));
+      });
     }
     write(path.join(st, 'a.js'), 'AA\n');
     R.check('[stop] 새 턴(stop_hook_active false)이면 다시 한 번 막는다', (stop('SA', false).json || {}).decision === 'block');
@@ -298,6 +349,7 @@ const claudeWrite = (repo, sid, file, tool) => hook('track', { hook_event_name: 
     R.check('[stop] 자기 파일이 커밋됐으면 통과(b.js 는 여전히 미커밋이어도)', isAllow(stop('SA', false)) && /b\.js/.test(status(st)));
     R.check('[stop] 기록 없는 세션은 통과', isAllow(stop('NOPE', false)));
 
+    claudePre(st, 'SS', path.join(st, 'c.js')); claudePre(st, 'SS', path.join(st, '.env'));
     write(path.join(st, 'c.js'), 'c\n'); write(path.join(st, '.env'), 'K=1\n');
     claudeWrite(st, 'SS', path.join(st, 'c.js')); claudeWrite(st, 'SS', path.join(st, '.env'));
     const bs = stop('SS', false);
@@ -308,6 +360,7 @@ const claudeWrite = (repo, sid, file, tool) => hook('track', { hook_event_name: 
     // ── stop (Codex) — 훅이 직접 그 파일만 커밋한다 ────────────────────
     const cr = mkRepo('codex', { 'lib/x.js': 'x\n', 'other.js': 'o\n' });
     const cpatch = '*** Begin Patch\n*** Add File: c1.js\n+c\n*** Update File: lib/x.js\n*** Add File: .env.local\n+S=1\n*** End Patch';
+    hook('board', { hook_event_name: 'PreToolUse', session_id: 'codex-sess-1234', turn_id: 't', cwd: cr, tool_name: 'apply_patch', tool_input: { command: cpatch } }, ['--codex']);
     write(path.join(cr, 'c1.js'), 'c\n'); write(path.join(cr, 'lib', 'x.js'), 'X\n'); write(path.join(cr, '.env.local'), 'S=1\n');
     write(path.join(cr, 'other.js'), 'O\n'); write(path.join(cr, 'staged.js'), 's\n'); git(cr, 'add', 'staged.js');
     hook('track', { hook_event_name: 'PostToolUse', session_id: 'codex-sess-1234', turn_id: 't', cwd: cr, tool_name: 'apply_patch', tool_input: { command: cpatch } }, ['--codex']);
@@ -324,7 +377,10 @@ const claudeWrite = (repo, sid, file, tool) => hook('track', { hook_event_name: 
     R.check('[stop/codex] 비밀 파일(.env.local)은 커밋하지 않고 기록만', /^\?\? \.env\.local$/m.test(after) && !committed.includes('.env.local') && (readSession(cr, 'codex-sess-1234').secrets_left || []).includes('.env.local'), after);
     R.check('[stop/codex] 커밋 뒤 다시 멈추면 할 일 없음(새 커밋 없음)', (() => { const h = git(cr, 'rev-parse', 'HEAD'); hook('stop', { hook_event_name: 'Stop', session_id: 'codex-sess-1234', turn_id: 't2', cwd: cr, stop_hook_active: false }, ['--codex']); return git(cr, 'rev-parse', 'HEAD') === h; })());
 
+    const cpatch2 = '*** Begin Patch\n*** Update File: c1.js\n*** End Patch';
+    hook('board', { hook_event_name: 'PreToolUse', session_id: 'codex-sess-1234', turn_id: 't3', cwd: cr, tool_name: 'apply_patch', tool_input: { command: cpatch2 } }, ['--codex']);
     write(path.join(cr, 'c1.js'), 'c2\n');
+    hook('track', { hook_event_name: 'PostToolUse', session_id: 'codex-sess-1234', turn_id: 't3', cwd: cr, tool_name: 'apply_patch', tool_input: { command: cpatch2 } }, ['--codex']);
     const lock = path.join(cr, '.git', 'index.lock');
     fs.writeFileSync(lock, '');
     const pending = hookAsync('stop', { hook_event_name: 'Stop', session_id: 'codex-sess-1234', turn_id: 't3', cwd: cr, stop_hook_active: false }, ['--codex']);
@@ -335,6 +391,7 @@ const claudeWrite = (repo, sid, file, tool) => hook('track', { hook_event_name: 
 
     // ── session-end ──────────────────────────────────────────────────
     const se = mkRepo('send', { 'd.js': 'd\n', 'e.js': 'e\n', 'f.js': 'f\n' });
+    claudePre(se, 'dddd1111-2222', path.join(se, 'd.js')); claudePre(se, 'eeee', path.join(se, 'e.js'));
     write(path.join(se, 'd.js'), 'D\n'); write(path.join(se, 'e.js'), 'E\n');
     claudeWrite(se, 'dddd1111-2222', path.join(se, 'd.js'));
     claudeWrite(se, 'eeee', path.join(se, 'e.js'));
@@ -357,6 +414,7 @@ const claudeWrite = (repo, sid, file, tool) => hook('track', { hook_event_name: 
       R.check('[session-end] 끝난 지 하루 지난 빈 기록만 치운다(남은 파일이 있는 기록 · 최근 기록은 둔다)', readSession(se, 'old-ended') === null && readSession(se, 'old-left') !== null && readSession(se, 'recent-ended') !== null,
         JSON.stringify([readSession(se, 'old-ended'), !!readSession(se, 'old-left'), !!readSession(se, 'recent-ended')]));
     }
+    claudePre(se, 'ffff', path.join(se, 'f.js')); claudePre(se, 'ffff', path.join(se, 'id_rsa'));
     write(path.join(se, 'f.js'), 'F\n'); write(path.join(se, 'id_rsa'), 'KEY\n');
     claudeWrite(se, 'ffff', path.join(se, 'f.js')); claudeWrite(se, 'ffff', path.join(se, 'id_rsa'));
     end('ffff', ['--codex']);
@@ -380,6 +438,7 @@ const claudeWrite = (repo, sid, file, tool) => hook('track', { hook_event_name: 
       R.check('[lane] laneOf: 가벼운 길의 worktree 만 {id, task} · 무인 작업 worktree · 메인 체크아웃은 null', (C0.laneOf(iL) || {}).id === lid && C0.laneOf(iL).task.mode === 'light' && C0.laneOf(iW) === null && C0.laneOf(iM) === null
         && C0.harnessOwned(iW) === true && C0.harnessOwned(iL) === false && C0.harnessOwned(iM) === false, JSON.stringify([C0.laneOf(iL), C0.laneOf(iW)]));
       const mainHead = git(lr, 'rev-parse', 'main');
+      claudePre(lwt, 'LANE1', path.join(lwt, 'a.js'));
       write(path.join(lwt, 'a.js'), 'A\n'); write(path.join(lr, 'b.js'), 'B by someone\n');
       claudeWrite(lwt, 'LANE1', path.join(lwt, 'a.js'));
       claudeWrite(wwt, 'WORK1', path.join(wwt, 'a.js'));
@@ -394,6 +453,7 @@ const claudeWrite = (repo, sid, file, tool) => hook('track', { hook_event_name: 
       const outside = path.join(base, 'lane-outside-dir');
       R.check('[lane] guard: 대화형 세션은 가벼운 길에서 자기 파일을 add · commit 할 수 있다 · push 는 여전히 막는다', isAllow(lpre('git add -- a.js')) && isAllow(lpre('git commit -m "x" -- a.js')) && isDeny(lpre('git push')));
       R.check('[lane] guard: 대화형 규칙이다 — worktree 밖 구체 경로 삭제는 대화형에선 통과', isAllow(lpre(`rm -rf ${JSON.stringify(outside)}`)));
+      claudePre(lwt, 'LANE1', path.join(lwt, 'c.js'));
       write(path.join(lwt, 'c.js'), 'c\n');
       claudeWrite(lwt, 'LANE1', path.join(lwt, 'c.js'));
       hook('session-end', { hook_event_name: 'SessionEnd', session_id: 'LANE1', cwd: lwt, reason: 'other' });
@@ -479,12 +539,14 @@ const claudeWrite = (repo, sid, file, tool) => hook('track', { hook_event_name: 
     write(path.join(hk, '.git', 'hooks', 'pre-commit'), '#!/bin/sh\necho blocked-by-pre-commit >&2\nexit 1\n');
     try { fs.chmodSync(path.join(hk, '.git', 'hooks', 'pre-commit'), 0o755); } catch { /* Windows 는 무관 */ }
     git(hk, 'config', 'commit.gpgsign', 'true'); git(hk, 'config', 'gpg.program', path.join(base, 'no-such-gpg'));
+    claudePre(hk, 'hkhkhkhk', path.join(hk, 'h.js'));
     write(path.join(hk, 'h.js'), 'H\n');
     claudeWrite(hk, 'hkhkhkhk', path.join(hk, 'h.js'));
     const hkHead = git(hk, 'rev-parse', 'HEAD');
     hook('session-end', { hook_event_name: 'SessionEnd', session_id: 'hkhkhkhk', cwd: hk, reason: 'exit' });
     R.check('[L11] pre-commit 훅이 실패하고 commit.gpgsign=true 여도 session-end 커밋이 된다(--no-verify · -c commit.gpgsign=false)',
       git(hk, 'rev-parse', 'HEAD') !== hkHead && git(hk, 'show', '--name-only', '--format=', 'HEAD') === 'h.js', status(hk) + ' | ' + JSON.stringify(readSession(hk, 'hkhkhkhk')));
+    hook('board', { hook_event_name: 'PreToolUse', session_id: 'cxcxcxcx', turn_id: 't', cwd: hk, tool_name: 'apply_patch', tool_input: { command: '*** Begin Patch\n*** Update File: h.js\n*** End Patch' } }, ['--codex']);
     write(path.join(hk, 'h.js'), 'H2\n');
     hook('track', { hook_event_name: 'PostToolUse', session_id: 'cxcxcxcx', turn_id: 't', cwd: hk, tool_name: 'apply_patch', tool_input: { command: '*** Begin Patch\n*** Update File: h.js\n*** End Patch' } }, ['--codex']);
     const hkHead2 = git(hk, 'rev-parse', 'HEAD');
@@ -504,7 +566,235 @@ const claudeWrite = (repo, sid, file, tool) => hook('track', { hook_event_name: 
     R.check('[lang] 한국어 답(코드 · 명령 · 경로가 섞여도)은 통과', isAllow(lang('Stop', { last_assistant_message: KO, stop_hook_active: false })));
     const enUp = lang('UserPromptSubmit', { prompt: 'please add the lint rules' }, 'L2');
     R.check('[lang] 영어로 묻는 세션에는 아무것도 하지 않는다(덧붙임 · 되돌림 없음)', isAllow(enUp) && isAllow(lang('Stop', { last_assistant_message: EN, stop_hook_active: false }, 'L2')));
+    // [#93] 세션 기록 잠금을 다른 프로세스가 쥐고 있어 기록이 시간 초과로 실패해도, 이번 턴의 언어 규칙은 싣고 실패는 기록한다.
+    const langErrLog = () => { try { return fs.readFileSync(path.join(lrepo, '.git', 'harness', 'hook-errors.log'), 'utf8'); } catch { return ''; } };
+    const holdLock = sid => { const l = sessionFile(lrepo, sid) + '.lock'; fs.mkdirSync(l, { recursive: true }); fs.writeFileSync(path.join(l, 'owner'), 'someone-else'); return l; };
+    const langLock = holdLock('L3');
+    const upLocked = lang('UserPromptSubmit', { prompt: '테스트를 고쳐 줘' }, 'L3');
+    R.check('[lang][#93] 세션 잠금 시간 초과에도 한국어 질문이면 이번 턴 문맥에 언어 규칙을 덧붙인다', upLocked.status === 0 && upLocked.json && upLocked.json.hookSpecificOutput && /한국어로 쓴다/.test(upLocked.json.hookSpecificOutput.additionalContext), upLocked.stdout);
+    R.check('[lang][#93] 잠금 실패는 hook-errors.log 에 남는다', /session lock timeout/.test(langErrLog()), langErrLog().slice(-300));
+    fs.rmSync(langLock, { recursive: true, force: true });
+    // [#93b] 기록에 이미 user_lang 'ko' 가 있으면 잠그지 않는다 — 잠금이 쥐어져 있어도 기다리지 않고 기록도 그대로.
+    const l4 = sessionFile(lrepo, 'L4');
+    fs.mkdirSync(path.dirname(l4), { recursive: true });
+    fs.writeFileSync(l4, JSON.stringify({ session_id: 'L4', runtime: 'claude', files: [], user_lang: 'ko', updated_at: null }) + '\n');
+    const l4Before = fs.statSync(l4).mtimeMs, errBefore = langErrLog().length;
+    const lock4 = holdLock('L4');
+    const t4 = Date.now(), up4 = lang('UserPromptSubmit', { prompt: '린트를 다시 돌려 줘' }, 'L4'), ms4 = Date.now() - t4;
+    R.check('[lang][#93b] user_lang 이 이미 ko 면 잠금이 쥐어져 있어도 문맥을 낸다', up4.json && /한국어로 쓴다/.test(up4.json.hookSpecificOutput.additionalContext), `${ms4}ms ${up4.stdout}`);
+    // 잠금을 기다렸다면 5초 뒤 'session lock timeout' 이 기록된다 — 벽시계 대신 그 기록이 없음으로 본다(부하에 흔들리지 않게).
+    R.check('[lang][#93b] 잠그지 않았다 — hook-errors.log 에 새 줄이 없고 기록 파일도 그대로다', langErrLog().length === errBefore && fs.statSync(l4).mtimeMs === l4Before, `${ms4}ms ${langErrLog().slice(errBefore, errBefore + 300)}`);
+    fs.rmSync(lock4, { recursive: true, force: true });
+    // [#93c] user_lang 이 null 이면 첫 한국어 턴에 'ko' 로 쓴다(지금 동작 유지).
+    const l5 = sessionFile(lrepo, 'L5');
+    fs.writeFileSync(l5, JSON.stringify({ session_id: 'L5', runtime: 'claude', files: [], user_lang: null, updated_at: null }) + '\n');
+    lang('UserPromptSubmit', { prompt: '린트를 넣어 줘' }, 'L5');
+    let l5After = null; try { l5After = JSON.parse(fs.readFileSync(l5, 'utf8')).user_lang; } catch { /* 아래 단언이 잡는다 */ }
+    R.check('[lang][#93c] user_lang 이 null 인 세션은 한국어 턴에 ko 로 기록된다', l5After === 'ko', String(l5After));
     R.check('[lang] 저장소 밖 · 깨진 입력은 조용히 통과', isAllow(hook('lang', { hook_event_name: 'Stop', session_id: 'x', cwd: base, last_assistant_message: EN })) && isAllow(hook('lang', 'not json')) && fs.existsSync(path.join(hookTmp, 'harness', 'hook-errors.log')));
+
+    // ── [2026-11-02 소유권] stop 의 대신 커밋은 '이 세션이 이 checkout 에서 쓴 그 내용' 만 ──
+    //   사고: 한 세션이 레인 worktree 의 `.gitignore` 를 고친 뒤 메인 checkout 에서 끝났다 — 원장(공통 .git · 상대 경로만)이
+    //   메인의 같은 상대 경로(남의 미커밋 변경)를 '내 파일' 로 보고 한 번 막은 뒤 대신 커밋했다. 경로 기록만으로는 소유가 아니다.
+    //   흐름은 설치 그대로: PreToolUse(Write|Edit) = board · 쓰기 · PostToolUse = track. 불확실하면 대신 커밋 0 · 이유를 원장 stop_skipped 에.
+    {
+      const own = mkRepo('own', { 'x.txt': 'x\n', '.cfg': 'c\n', 'b.txt': 'b\n', 'c.txt': 'c\n', 'd.txt': 'd\n', 'e.txt': 'e\n', 'f.txt': 'f\n', 'g.txt': 'g\n', 'h.txt': 'h\n', 'i.txt': 'i\n', 'j.txt': 'j\n' });
+      const owt = path.join(own, '.harness-worktrees', 't-20261102-000000-aaa1'), owt2 = path.join(own, '.harness-worktrees', 't-20261102-000000-aaa2');
+      git(own, 'worktree', 'add', '-q', '-b', 'harness/t-20261102-000000-aaa1', owt);
+      git(own, 'worktree', 'add', '-q', '-b', 'harness/t-20261102-000000-aaa2', owt2);
+      for (const id of ['t-20261102-000000-aaa1', 't-20261102-000000-aaa2'])
+        write(path.join(own, '.git', 'harness', 'tasks', id, 'task.json'), JSON.stringify({ id, status: 'open', owner: null, branch: `harness/${id}`, goal: 'own', mode: 'light' }));
+      const edit = (cwd, sid, file, text) => {           // 설치된 한 번의 Write: board(Pre) → 쓰기 → track(Post)
+        hook('board', { hook_event_name: 'PreToolUse', session_id: sid, cwd, prompt_id: 'p', tool_name: 'Write', tool_input: { file_path: file, content: text } });
+        write(file, text);
+        hook('track', { hook_event_name: 'PostToolUse', session_id: sid, cwd, prompt_id: 'p', tool_name: 'Write', tool_input: { file_path: file, content: text }, tool_response: { success: true } });
+      };
+      const ostop = (cwd, sid, active) => hook('stop', { hook_event_name: 'Stop', session_id: sid, cwd, prompt_id: 'p', stop_hook_active: active, last_assistant_message: 'done' });
+      const twice = (cwd, sid) => [ostop(cwd, sid, false), ostop(cwd, sid, true)];
+      const head = cwd => git(cwd, 'rev-parse', 'HEAD');
+      const skipped = (sid, file, reason) => ((readSession(own, sid) || {}).stop_skipped || []).some(x => x && x.path === file && x.reason === reason);
+      const text = f => fs.readFileSync(f, 'utf8');
+      const agentsWas = ENV.HARNESS_AGENTS_JSON;
+      ENV.HARNESS_AGENTS_JSON = path.join(base, 'own-agents.json'); fs.writeFileSync(ENV.HARNESS_AGENTS_JSON, '[]');   // 산 세션 목록 = 비어 있음(실제 claude 0)
+
+      // T1 같은 세션이 checkout 을 옮김 — 레인에서 쓰고 그 레인에서 커밋한 뒤 메인에서 끝남 · 메인의 같은 경로는 남의 변경
+      edit(owt, 'OT1', path.join(owt, '.cfg'), 'lane cfg\n');
+      git(owt, '-c', 'user.name=u', '-c', 'user.email=u@x', 'commit', '-q', '-m', 'lane cfg', '--', '.cfg');
+      write(path.join(own, '.cfg'), 'someone else cfg\n');
+      let h0 = head(own); const t1 = twice(own, 'OT1');
+      R.check('[own/T1] 세션이 checkout 을 옮겨도 메인의 같은 상대 경로(남의 변경)는 대신 커밋하지 않는다 · 사유 root_mismatch',
+        head(own) === h0 && text(path.join(own, '.cfg')) === 'someone else cfg\n' && isAllow(t1[1]) && skipped('OT1', '.cfg', 'root_mismatch'), JSON.stringify([t1.map(r => r.stdout), readSession(own, 'OT1')]));
+
+      // T2 다른 worktree 의 같은 상대 경로 — 레인 2 에 내 미커밋 b.txt · 메인 b.txt 는 남의 변경
+      edit(owt2, 'OT2', path.join(owt2, 'b.txt'), 'mine b\n');
+      write(path.join(own, 'b.txt'), 'other b\n');
+      h0 = head(own); const t2 = twice(own, 'OT2');
+      R.check('[own/T2] 메인에서 끝나도 레인 2 의 내 파일 이름으로 메인 b.txt 를 커밋하지 않는다 · 사유 root_mismatch',
+        head(own) === h0 && text(path.join(own, 'b.txt')) === 'other b\n' && isAllow(t2[1]) && skipped('OT2', 'b.txt', 'root_mismatch'), JSON.stringify(t2.map(r => r.stdout)));
+      const h2 = head(owt2); const t2b = twice(owt2, 'OT2');
+      R.check('[own/T2] 원래 레인 2 에서 끝나면 그 b.txt 만 그 레인 브랜치에 대신 커밋(정상 경로 유지)',
+        isAllow(t2b[1]) && head(owt2) !== h2 && git(owt2, 'log', '-1', '--name-only', '--format=') === 'b.txt' && head(own) === h0, JSON.stringify(t2b.map(r => r.stdout)));
+
+      // T3 첫 쓰기 전부터 dirty — 남이 고친 c.txt 를 이 세션이 다시 고쳤다(내용이 섞임)
+      write(path.join(own, 'c.txt'), 'other c\n');
+      edit(own, 'OT3', path.join(own, 'c.txt'), 'other c\nmine c\n');
+      h0 = head(own); const t3 = twice(own, 'OT3');
+      R.check('[own/T3] 첫 쓰기 전에 이미 미커밋이던 파일은 대신 커밋하지 않는다 · 사유 pre_existing_dirty',
+        head(own) === h0 && /mine c/.test(text(path.join(own, 'c.txt'))) && isAllow(t3[1]) && skipped('OT3', 'c.txt', 'pre_existing_dirty'), JSON.stringify(t3.map(r => r.stdout)));
+
+      // T4 마지막 기록 뒤 외부 변경 — 이 세션이 쓴 뒤 다른 손이 같은 파일을 고쳤다
+      edit(own, 'OT4', path.join(own, 'd.txt'), 'mine d\n');
+      write(path.join(own, 'd.txt'), 'mine d\nother d\n');
+      h0 = head(own); const t4 = twice(own, 'OT4');
+      R.check('[own/T4] 마지막 기록 뒤 파일이 바뀌었으면 대신 커밋하지 않는다 · 사유 external_change',
+        head(own) === h0 && isAllow(t4[1]) && skipped('OT4', 'd.txt', 'external_change'), JSON.stringify(t4.map(r => r.stdout)));
+
+      // T5 다른 살아 있는 세션이 같은 checkout 의 같은 파일을 기록 중
+      edit(own, 'OT5A', path.join(own, 'e.txt'), 'shared e\n');
+      edit(own, 'OT5B', path.join(own, 'e.txt'), 'shared e\n');     // 같은 내용 — 지문은 둘 다 맞다
+      h0 = head(own); const t5 = twice(own, 'OT5A');
+      R.check('[own/T5] 다른 산 세션이 같은 파일을 기록했으면 대신 커밋하지 않는다 · 사유 other_session_same_file',
+        head(own) === h0 && isAllow(t5[1]) && skipped('OT5A', 'e.txt', 'other_session_same_file'), JSON.stringify(t5.map(r => r.stdout)));
+
+      // T6 옛 원장(files 가 문자열 배열 · root · 지문 없음) — 호환은 유지하되 대신 커밋은 하지 않는다
+      write(path.join(own, 'f.txt'), 'legacy f\n');
+      write(sessionFile(own, 'OT6'), JSON.stringify({ session_id: 'OT6', runtime: 'claude', files: ['f.txt'], updated_at: new Date().toISOString() }));
+      h0 = head(own); const t6 = twice(own, 'OT6');
+      R.check('[own/T6] 옛 문자열 원장 항목은 막을 때 알리기만 하고 대신 커밋하지 않는다 · 사유 legacy_no_fingerprint',
+        head(own) === h0 && isAllow(t6[1]) && skipped('OT6', 'f.txt', 'legacy_no_fingerprint') && Array.isArray(readSession(own, 'OT6').files), JSON.stringify(t6.map(r => r.stdout)));
+
+      // T7 Windows 경로 표기 — 같은 checkout 을 대소문자 · 구분자 · 끝 구분자만 다르게 써도 같은 root 로 본다(오탐 0)
+      const alt = process.platform === 'win32' ? own.replace(/\//g, '\\').toUpperCase() + '\\' : own + '/';
+      edit(alt, 'OT7', path.join(alt, 'g.txt'), 'mine g\n');
+      h0 = head(own); const t7 = twice(own, 'OT7');
+      R.check('[own/T7] 경로 표기만 다른 같은 checkout 의 자기 변경은 정상대로 대신 커밋한다',
+        isAllow(t7[1]) && head(own) !== h0 && git(own, 'log', '-1', '--name-only', '--format=') === 'g.txt', JSON.stringify(t7.map(r => r.stdout)));
+
+      // T8 정상 자기 변경 — 한 번 막고(이유에 그 파일) · 이어 간 턴 뒤에도 남으면 그 파일만 대신 커밋 · 다른 미커밋은 그대로
+      edit(own, 'OT8', path.join(own, 'h.txt'), 'mine h\n');
+      write(path.join(own, 'other8.tmp'), 'not mine\n');           // 남의 미추적 파일 — 앞 시험 결과와 무관하게 이것만 본다
+      h0 = head(own); const t8 = twice(own, 'OT8');
+      const s8 = readSession(own, 'OT8');
+      R.check('[own/T8] 정상 자기 변경은 지금 정책 그대로(1회 막음 → stop-fallback 커밋 · 그 파일만)',
+        t8[0].json && t8[0].json.decision === 'block' && /`h\.txt`/.test(t8[0].json.reason) && isAllow(t8[1]) && head(own) !== h0
+        && git(own, 'log', '-1', '--name-only', '--format=') === 'h.txt' && s8 && s8.last_commit && s8.last_commit.by === 'stop-fallback'
+        && /^\?\? other8\.tmp$/m.test(status(own)), JSON.stringify([t8.map(r => r.stdout), s8]));
+
+      // T9 거부 뒤 두 번째 Stop — 내 파일(i.txt)과 외부가 바뀐 파일(j.txt)이 섞였을 때 i.txt 만
+      edit(own, 'OT9', path.join(own, 'i.txt'), 'mine i\n');
+      edit(own, 'OT9', path.join(own, 'j.txt'), 'mine j\n');
+      write(path.join(own, 'j.txt'), 'mine j\nother j\n');
+      h0 = head(own); const t9 = twice(own, 'OT9');
+      R.check('[own/T9] 모델이 커밋하지 않고 다시 끝나면 확인된 i.txt 만 대신 커밋 · j.txt 는 남기고 사유 external_change',
+        t9[0].json && t9[0].json.decision === 'block' && /`i\.txt`/.test(t9[0].json.reason) && isAllow(t9[1]) && head(own) !== h0
+        && git(own, 'log', '-1', '--name-only', '--format=') === 'i.txt' && /j\.txt/.test(status(own)) && skipped('OT9', 'j.txt', 'external_change'), JSON.stringify(t9.map(r => r.stdout)));
+
+      // ── SessionEnd 도 같은 대신 커밋 경로(uncommittedOf → commitFiles)다 — Stop 보호를 우회하지 못하게 ──
+      const oend = (cwd, sid) => hook('session-end', { hook_event_name: 'SessionEnd', session_id: sid, cwd, reason: 'prompt_input_exit' });
+      const endSkipped = (sid, file, reason) => ((readSession(own, sid) || {}).end_skipped || []).some(x => x && x.path === file && x.reason === reason);
+      // S1 checkout 이동 — 레인 1 에 내 미커밋 x.txt · 메인 x.txt 는 남의 변경 · 메인에서 세션이 끝남
+      edit(owt, 'OS1', path.join(owt, 'x.txt'), 'lane x\n');
+      write(path.join(own, 'x.txt'), 'other x\n');
+      h0 = head(own); const s1 = oend(own, 'OS1');
+      R.check('[own/S1] SessionEnd 도 다른 checkout 의 같은 상대 경로를 커밋하지 않는다 · 사유 root_mismatch · 기록은 남긴다',
+        isAllow(s1) && head(own) === h0 && text(path.join(own, 'x.txt')) === 'other x\n' && endSkipped('OS1', 'x.txt', 'root_mismatch') && (readSession(own, 'OS1').files || []).includes('x.txt'), JSON.stringify(readSession(own, 'OS1')));
+      // S2 옛 문자열 원장
+      write(path.join(own, 'n1.txt'), 'legacy n1\n');
+      write(sessionFile(own, 'OS2'), JSON.stringify({ session_id: 'OS2', runtime: 'claude', files: ['n1.txt'], updated_at: new Date().toISOString() }));
+      h0 = head(own); const s2 = oend(own, 'OS2');
+      R.check('[own/S2] SessionEnd 는 옛 문자열 원장 항목을 커밋하지 않는다 · 사유 legacy_no_fingerprint',
+        isAllow(s2) && head(own) === h0 && /^\?\? n1\.txt$/m.test(status(own)) && endSkipped('OS2', 'n1.txt', 'legacy_no_fingerprint'), JSON.stringify(readSession(own, 'OS2')));
+      // S3 마지막 기록 뒤 외부 변경
+      edit(own, 'OS3', path.join(own, 'k1.txt'), 'mine k1\n');
+      write(path.join(own, 'k1.txt'), 'mine k1\nother k1\n');
+      h0 = head(own); const s3 = oend(own, 'OS3');
+      R.check('[own/S3] SessionEnd 는 마지막 기록 뒤 바뀐 파일을 커밋하지 않는다 · 사유 external_change',
+        isAllow(s3) && head(own) === h0 && /^\?\? k1\.txt$/m.test(status(own)) && endSkipped('OS3', 'k1.txt', 'external_change'), JSON.stringify(readSession(own, 'OS3')));
+      // S4 정상 자기 변경 — 그 파일만 커밋 · 남이 스테이징해 둔 stg.txt 는 index 에 그대로 · 깨끗하면 files 비움(지금 정책)
+      write(path.join(own, 'stg.txt'), 'staged by someone\n'); git(own, 'add', 'stg.txt');
+      edit(own, 'OS4', path.join(own, 'k2.txt'), 'mine k2\n');
+      h0 = head(own); const s4 = oend(own, 'OS4');
+      R.check('[own/S4] SessionEnd 정상 자기 변경은 그 파일만 커밋 · 남의 스테이징(stg.txt) index 보존 · files 비움',
+        isAllow(s4) && head(own) !== h0 && git(own, 'show', '--name-only', '--format=', 'HEAD') === 'k2.txt' && /^A  stg\.txt$/m.test(status(own))
+        && (readSession(own, 'OS4').files || []).length === 0 && (readSession(own, 'OS4').last_commit || {}).by === 'session-end', status(own) + ' | ' + JSON.stringify(readSession(own, 'OS4')));
+
+      // ── Codex Stop(막지 않고 훅이 바로 커밋) — 정상은 그대로 · 불명확하면 커밋 0 ──
+      const cedit = (cwd, sid, rel, body) => {             // Codex apply_patch: 쓰기 전(PreToolUse) · 쓰기 · 쓰기 뒤(PostToolUse)
+        const patch = `*** Begin Patch\n*** Add File: ${rel}\n+${body}\n*** End Patch`;
+        hook('board', { hook_event_name: 'PreToolUse', session_id: sid, turn_id: 't', cwd, tool_name: 'apply_patch', tool_input: { command: patch } }, ['--codex']);
+        write(path.join(cwd, rel), body + '\n');
+        hook('track', { hook_event_name: 'PostToolUse', session_id: sid, turn_id: 't', cwd, tool_name: 'apply_patch', tool_input: { command: patch } }, ['--codex']);
+      };
+      const cstop = (cwd, sid) => hook('stop', { hook_event_name: 'Stop', session_id: sid, turn_id: 't', cwd, stop_hook_active: false, last_assistant_message: 'done' }, ['--codex']);
+      // C1 정상 — 그 파일만 · 남의 스테이징 보존
+      cedit(own, 'codex-own-c1', 'cx1.txt', 'mine cx1');
+      h0 = head(own); const c1 = cstop(own, 'codex-own-c1');
+      R.check('[own/C1] Codex Stop 정상 자기 변경은 막지 않고 그 파일만 커밋 · stg.txt 스테이징 그대로',
+        isAllow(c1) && head(own) !== h0 && git(own, 'show', '--name-only', '--format=', 'HEAD') === 'cx1.txt' && /^A  stg\.txt$/m.test(status(own)), status(own));
+      // C2 쓰기 전 기록 없음(PostToolUse 만) — 첫 쓰기 전 상태를 모른다
+      write(path.join(own, 'cx2.txt'), 'unknown cx2\n');
+      hook('track', { hook_event_name: 'PostToolUse', session_id: 'codex-own-c2', turn_id: 't', cwd: own, tool_name: 'apply_patch', tool_input: { command: '*** Begin Patch\n*** Add File: cx2.txt\n+unknown cx2\n*** End Patch' } }, ['--codex']);
+      h0 = head(own); const c2 = cstop(own, 'codex-own-c2');
+      R.check('[own/C2] Codex Stop 은 쓰기 전 기록이 없는 파일을 커밋하지 않는다(불명확 → 커밋 0 · 사유 기록)',
+        isAllow(c2) && head(own) === h0 && /^\?\? cx2\.txt$/m.test(status(own)) && ((readSession(own, 'codex-own-c2') || {}).stop_skipped || []).some(x => x && x.path === 'cx2.txt'), JSON.stringify(readSession(own, 'codex-own-c2')));
+      // C3 checkout 이동 — 레인 1 에서 쓰고 메인에서 멈춤 · 메인 같은 경로는 남의 미추적 파일
+      cedit(owt, 'codex-own-c3', 'cx3.txt', 'lane cx3');
+      write(path.join(own, 'cx3.txt'), 'other cx3\n');
+      h0 = head(own); const c3 = cstop(own, 'codex-own-c3');
+      R.check('[own/C3] Codex Stop 도 다른 checkout 의 같은 상대 경로를 커밋하지 않는다 · 사유 root_mismatch',
+        isAllow(c3) && head(own) === h0 && text(path.join(own, 'cx3.txt')) === 'other cx3\n' && skipped('codex-own-c3', 'cx3.txt', 'root_mismatch'), JSON.stringify(readSession(own, 'codex-own-c3')));
+
+      // M1 같은 파일에 남의 staged(B1) + unstaged(B2) 가 있는데 세션이 그 파일을 고쳤다 — Stop 2회 · SessionEnd · Codex Stop 어느 자동 경로도
+      //   HEAD · index blob(git ls-files -s) · 작업 파일 바이트를 바꾸지 않는다(add 뒤 커밋 거절로 index 만 바뀌는 것도 잡는다)
+      const snap = rel => [head(own), git(own, 'ls-files', '-s', '--', rel), fs.readFileSync(path.join(own, rel)).toString('base64')].join('|');
+      for (const [n, rel, run] of [
+        ['stop', 'm1.txt', sid => twice(own, sid)],
+        ['end', 'm2.txt', sid => [oend(own, sid)]],
+        ['codex', 'm3.txt', sid => [cstop(own, sid)]],
+      ]) {
+        write(path.join(own, rel), 'B1\n'); git(own, 'add', '--', rel); write(path.join(own, rel), 'B1\nB2\n');
+        const sid = `OM1-${n}`;
+        if (n === 'codex') { const sid2 = `codex-om1-${n}`; cedit(own, sid2, rel, 'B1\nB2\nmine'); const before = snap(rel); const out = run(sid2);
+          R.check(`[own/M1] ${n}: 남의 staged+unstaged 위 내 편집 — 전후 HEAD · index blob · 파일 바이트 같음 · 대신 커밋 0`, out.every(isAllow) && snap(rel) === before, before + ' ≠ ' + snap(rel)); continue; }
+        edit(own, sid, path.join(own, rel), 'B1\nB2\nmine\n');
+        const before = snap(rel); const out = run(sid);
+        R.check(`[own/M1] ${n}: 남의 staged+unstaged 위 내 편집 — 전후 HEAD · index blob · 파일 바이트 같음 · 대신 커밋 0`, out[out.length - 1] && isAllow(out[out.length - 1]) && snap(rel) === before, before + ' ≠ ' + snap(rel));
+      }
+      // X1 쓴 뒤 작업 파일은 그대로인데 남이 index 만 바꿈(git add) — 대신 커밋하면 그 index 를 덮는다 → 커밋 0 · 사유 index_changed
+      edit(own, 'OX1', path.join(own, 'ix.txt'), 'mine ix\n');
+      git(own, 'add', '--', 'ix.txt');
+      { const before = snap('ix.txt'); const x1 = twice(own, 'OX1');
+        R.check('[own/X1] 쓴 뒤 남이 index 만 바꾼 파일은 대신 커밋하지 않는다 · 전후 HEAD · index blob · 파일 바이트 같음 · 사유 index_changed',
+          isAllow(x1[1]) && snap('ix.txt') === before && skipped('OX1', 'ix.txt', 'index_changed'), before + ' ≠ ' + snap('ix.txt') + ' | ' + JSON.stringify(readSession(own, 'OX1'))); }
+      // X2 쓴 뒤 남이 index 만 바꿈 → 같은 세션이 그 파일을 다시 씀 — 두 번째 Post 의 index 로 남의 변경을 씻어 내지 않는다 · 사유 index_changed
+      edit(own, 'OX2', path.join(own, 'ix2.txt'), 'mine ix2\n');
+      git(own, 'add', '--', 'ix2.txt');
+      edit(own, 'OX2', path.join(own, 'ix2.txt'), 'mine ix2\nmore\n');
+      { const before = snap('ix2.txt'); const x2 = twice(own, 'OX2');
+        R.check('[own/X2] index 만 바뀐 뒤 같은 세션이 다시 써도 대신 커밋하지 않는다 · 전후 HEAD · index blob · 파일 바이트 같음 · 사유 index_changed',
+          isAllow(x2[1]) && snap('ix2.txt') === before && skipped('OX2', 'ix2.txt', 'index_changed'), before + ' ≠ ' + snap('ix2.txt') + ' | ' + JSON.stringify(readSession(own, 'OX2'))); }
+      // P 앞선 정상 쓰기(Pre → Post) 뒤 Pre 없이 Post 만 온 쓰기(누락 · 실패) — 옛 Pre 로 소유를 인정하지 않는다 · 사유 pre_unknown
+      const postOnly = (cwd, sid, file, body, codex) => { write(file, body); if (codex) hook('track', { hook_event_name: 'PostToolUse', session_id: sid, turn_id: 't', cwd, tool_name: 'apply_patch', tool_input: { command: `*** Begin Patch\n*** Update File: ${path.relative(cwd, file).split(path.sep).join('/')}\n*** End Patch` } }, ['--codex']); else claudeWrite(cwd, sid, file); };
+      for (const [n, rel, run, sid] of [['stop', 'p1.txt', s => twice(own, s), 'OP1'], ['end', 'p2.txt', s => [oend(own, s)], 'OP2'], ['codex', 'p3.txt', s => [cstop(own, s)], 'codex-op3']]) {
+        if (n === 'codex') cedit(own, sid, rel, 'first'); else edit(own, sid, path.join(own, rel), 'first\n');
+        postOnly(own, sid, path.join(own, rel), 'first\nsecond\n', n === 'codex');
+        const before = snap(rel); const out = run(sid);
+        const sk = ((readSession(own, sid) || {})[n === 'end' ? 'end_skipped' : 'stop_skipped'] || []).some(x => x && x.path === rel && x.reason === 'pre_unknown');
+        R.check(`[own/P] ${n}: 앞선 정상 쓰기 뒤 Pre 없는 Post — 대신 커밋 0 · 전후 HEAD · index · 바이트 같음 · 사유 pre_unknown`, isAllow(out[out.length - 1]) && snap(rel) === before && sk, before + ' ≠ ' + snap(rel) + ' | ' + JSON.stringify(readSession(own, sid)));
+      }
+      // P4 같은 세션의 연속 정상 쓰기(Pre → Post 두 번)는 그대로 대신 커밋
+      edit(own, 'OP4', path.join(own, 'p4.txt'), 'one\n'); edit(own, 'OP4', path.join(own, 'p4.txt'), 'one\ntwo\n');
+      { const h4 = head(own); const p4 = twice(own, 'OP4');
+        R.check('[own/P4] 같은 세션 연속 Pre → Post 편집은 정상 정책대로 그 파일만 대신 커밋', isAllow(p4[1]) && head(own) !== h4 && git(own, 'log', '-1', '--name-only', '--format=') === 'p4.txt', JSON.stringify(p4.map(r => r.stdout))); }
+      // B1 깨끗한 Pre → 쓰기 실패(Post 없음) → 남이 그 파일을 고침 → 이 세션이 다시 Pre → 쓰기 → Post — 옛 clean 증거로 남의 WIP 를 세탁하지 않는다 · 사유 post_unknown
+      hook('board', { hook_event_name: 'PreToolUse', session_id: 'OB1', cwd: own, prompt_id: 'p', tool_name: 'Write', tool_input: { file_path: path.join(own, 'q1.txt'), content: 'x' } });
+      write(path.join(own, 'q1.txt'), 'other q1\n');
+      edit(own, 'OB1', path.join(own, 'q1.txt'), 'other q1\nmine q1\n');
+      { const before = snap('q1.txt'); const b1 = twice(own, 'OB1');
+        R.check('[own/B1] 짝 Post 없는 앞 Pre 뒤 남의 변경 위에 쓴 파일은 대신 커밋하지 않는다 · 전후 HEAD · index · 바이트 같음 · 사유 post_unknown',
+          isAllow(b1[1]) && snap('q1.txt') === before && skipped('OB1', 'q1.txt', 'post_unknown'), before + ' ≠ ' + snap('q1.txt') + ' | ' + JSON.stringify(readSession(own, 'OB1'))); }
+      if (agentsWas === undefined) delete ENV.HARNESS_AGENTS_JSON; else ENV.HARNESS_AGENTS_JSON = agentsWas;
+    }
 
     R.check('[격리] 가짜 HOME 에 .claude · .codex 가 생기지 않았다', !fs.existsSync(path.join(home, '.claude')) && !fs.existsSync(path.join(home, '.codex')));
   } catch (e) { R.check('예외 없이 끝난다', false, String(e && e.stack || e).slice(0, 800)); }

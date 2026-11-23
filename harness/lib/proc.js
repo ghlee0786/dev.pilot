@@ -23,10 +23,15 @@ function isolationEnv(cwd) {
   return require('./resources').envFor(cwd);
 }
 
+// → { status, signal, error, ms } — 실패를 버리지 않고 호출자에게 돌려준다(GS-04 진단: taskkill 결과가 버려져 원인을 알 수 없었다).
 function killTree(pid) {
-  if (pid == null) return;
-  if (IS_WIN) spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true, timeout: 15000 });
-  else { try { process.kill(-pid, 'SIGKILL'); } catch { try { process.kill(pid, 'SIGKILL'); } catch { /* 이미 끝났다 */ } } }
+  if (pid == null) return null;
+  if (IS_WIN) {
+    const t0 = Date.now();
+    const r = spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true, timeout: 15000 });
+    return { status: r.status, signal: r.signal, error: r.error ? r.error.code || String(r.error) : null, ms: Date.now() - t0 };
+  }
+  try { process.kill(-pid, 'SIGKILL'); return { status: 0 }; } catch { try { process.kill(pid, 'SIGKILL'); return { status: 0 }; } catch (e) { return { status: null, error: e.code || String(e) }; } }
 }
 
 module.exports = { isolationEnv, IS_WIN, SCRUB, childEnv, killTree };

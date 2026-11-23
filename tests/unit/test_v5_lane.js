@@ -89,12 +89,19 @@ const parents = (cwd, ref) => git(cwd, ['rev-list', '--parents', '-n', '1', ref]
     commitIn(Pb.wt, 'feature.txt', 'feature\n');
     write(path.join(Pb.wt, 'notes.txt'), 'still editing\n');   // 커밋하지 않은 변경
     const mainB = git(B.dir, ['rev-parse', 'main']);
+    // [2026-11-05 소유권] 옛 계약은 이 미커밋분을 하네스가 대신 커밋했다 — 주인을 증명할 수 없어(남의 파일 · 설치 산출물일 수 있다) 이제 거부한다.
+    const headB = git(Pb.wt, ['rev-parse', 'HEAD']);
+    const ab0 = await I.accept({ ...quiet, root: B.dir, id: lb.id });
+    R.check('[LA-06] 주인 모를 미커밋분이 있으면 accept 거부 · 이유에 그 파일 · main · 칸 HEAD 그대로 · 파일은 미추적으로 남는다',
+      ab0.refused === true && /owner cannot be proven/.test(ab0.reason) && /notes\.txt/.test(ab0.reason) && git(B.dir, ['rev-parse', 'main']) === mainB && git(Pb.wt, ['rev-parse', 'HEAD']) === headB
+      && git(Pb.wt, ['status', '--porcelain', '--untracked-files=all']) === '?? notes.txt' && read(path.join(Pb.wt, 'notes.txt')) === 'still editing\n' && B.runs() === 0, `${ab0.status} ${ab0.reason}`);
+    git(Pb.wt, ['add', '--', 'notes.txt']); git(Pb.wt, ['commit', '-qm', 'notes (the lane owner commits it)', '--', 'notes.txt']);   // 칸의 주인이 자기 파일을 직접 커밋
     const ab = await I.accept({ ...quiet, root: B.dir, id: lb.id });
     const tb = S.readTask(B.dir, lb.id);
     R.check('[LA-06] 열린 light 칸은 --force 없이 accept → accepted · main 에 병합 커밋(부모 2) · 강제 표시 없음',
       ab.status === 'accepted' && !ab.refused && parents(B.dir, 'main') === 2 && git(B.dir, ['rev-parse', 'main^1']) === mainB && !tb.forced_from && /ACCEPTED$/m.test(ab.report.split('\n')[0]), `${ab.status} ${ab.reason} ${ab.report}`);
     R.check('[LA-06] 검사는 accept 때 정확히 한 번 · 기록에 남는다', B.runs() === 1 && tb.checks.last && tb.checks.last.ok === true, `runs=${B.runs()}`);
-    R.check('[LA-06] 커밋되지 않았던 파일을 커밋해 함께 병합하고 보고에 그 파일 이름', read(path.join(B.dir, 'notes.txt')) === 'still editing\n' && /notes\.txt/.test(ab.report) && S.readLog(B.dir, lb.id).some(e => e.event === 'leftovers_committed' && e.files.includes('notes.txt')), ab.report);
+    R.check('[LA-06] 주인이 직접 커밋한 뒤에는 그 파일이 함께 병합되고 하네스가 대신 커밋한 기록은 없다', read(path.join(B.dir, 'notes.txt')) === 'still editing\n' && !S.readLog(B.dir, lb.id).some(e => e.event === 'leftovers_committed'), ab.report);
 
     // ── 나빠지면 거부(main 그대로 · 칸은 open) ───────────────────────────
     const C = mkRepo();

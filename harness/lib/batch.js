@@ -48,6 +48,16 @@ function pickMembers(root, target, o) {
       add({ id: t.id, branch: t.branch, goal: clip(t.goal, 120) });
     }
   }
+  // --ready: 다음 batch 후보로 표시한 레인(ready <id>) — 같은 대상만 · 표시한 끝(tip)을 들고 가 그 뒤 커밋이 있으면 build 가 건너뛴다(#87)
+  if (o.ready) {
+    let n = 0;
+    for (const t of S.listTasks(root)) {
+      if (!eligible(t) || !t.ready || !G.branchExists(root, t.branch) || I.acceptTarget(t, {}, root) !== target) continue;
+      n++; add({ id: t.id, branch: t.branch, goal: clip(t.goal, 120), ready_tip: t.ready.tip });
+    }
+    // [#87 리뷰 N2] --ready 만 줬을 때만 오류 — ids · --all · --branch 와 함께면 나머지로 묶는다
+    if (!n && !(o.ids || []).length && !o.all && !(o.branches || []).length) throw usage(`no lanes marked ready for ${target} — mark one with: node harness/cli.js ready <id> [--note "…"]`);
+  }
   for (const b0 of o.branches || []) {
     const b = strip(b0), tm = TASK_BRANCH_RE.exec(b);
     if (tm && S.readTask(root, tm[1])) { addTask(tm[1]); continue; }
@@ -72,7 +82,9 @@ function liveSessionIn(root, wt) {
   let agents = null; try { agents = Ch.platformAgents(common); } catch { agents = null; }
   const now = Date.now(), live = cand.filter(s => Ch.sessionLive(s, agents, now));
   if (!live.length) return null;
-  return `live session ${live.map(s => Ch.sid8(s.session_id)).join(', ')} is working in ${wt} — let it finish (or end it), then batch again; --force bundles it anyway`;
+  // [자동 이슈 #88] 기록상 cwd · 기록 시각 · 플랫폼 cwd 를 실어 낡은 세션 기록인지 알아볼 수 있게(integrate.sessionWhere 와 같다)
+  const who = live.map(s => { const a = Ch.agentOf(s, agents); return `${Ch.sid8(s.session_id)}${I.sessionWhere({ cwd: s.cwd || s.root || null, last_seen: s.last_seen || null, platform_cwd: a && a.cwd || null })}`; });
+  return `live session ${who.join(', ')} is working in ${wt} — let it finish (or end it), then batch again; --force bundles it anyway`;
 }
 
 // 칸의 작업 폴더를 묶어도 되는가 → 안 되면 이유(문자열). accept(integrate.js)와 같은 보호 —
@@ -148,7 +160,7 @@ async function create(o) {
   const target = o.into ? strip(o.into) : G.currentBranch(root);
   if (!target) throw usage(`the main checkout ${root} is on a detached HEAD — pass --into <branch>`);
   if (!G.branchExists(root, target)) throw usage(`target branch ${target} does not exist`);
-  if (!(o.ids || []).length && !o.all && !(o.branches || []).length) throw usage('batch needs task ids, --all or --branch <name>');
+  if (!(o.ids || []).length && !o.all && !o.ready && !(o.branches || []).length) throw usage('batch needs task ids, --all, --ready or --branch <name>');
   const members = pickMembers(root, target, o);
   if (!members.length) throw usage(`nothing to bundle — no done tasks or open light lanes for ${target}`);
   const bid = newBid(), wt = path.join(S.paths(root).worktreesDir, bid);
@@ -177,13 +189,15 @@ async function build(root, b, o, log) {
         // light 칸의 미커밋분은 그 칸에 먼저 커밋한다(accept 와 같이) — 묶음에는 커밋된 것만 들어간다
         if (t.mode === 'light') {
           try { const files = I.commitLeftovers(t, P.wt, `uncommitted work before batch ${bid}`); if (files.length) { m.committed = files.slice(0, 50); S.writeTask(root, t); S.log(root, t.id, { event: 'leftovers_committed', phase: 'batch', batch: bid, files: files.slice(0, 200) }); } }
-          catch (e) { m.leftover_error = String(e.message).slice(0, 200); }
+          // [2026-11-05] 실패를 기록만 하고 넘어가면 미커밋분이 빠진 옛 끝(stale tip)을 합쳐 pass 를 냈다 — 그 구성원은 건너뛴다
+          catch (e) { m.leftover_error = String(e.message).slice(0, 200); m.status = 'skipped'; m.why = String(e.message).slice(0, 300); continue; }
         }
       }
     }
     const ref = t ? t.branch : m.branch, before = G.headSha(wt);
     // 묶은 때의 구성원 끝 — batch accept 가 그 뒤에 더한 커밋(들어가지 않는다)을 알아본다
     m.tip = G.headSha(root, ref);
+    if (m.ready_tip && m.tip !== m.ready_tip) { m.status = 'skipped'; m.why = `new commits since it was marked ready (${String(m.ready_tip).slice(0, 10)} → ${String(m.tip).slice(0, 10)}) — mark it again`; continue; }
     if (G.isAncestor(wt, ref, 'HEAD')) { m.status = 'skipped'; m.why = `already in ${target}`; continue; }
     const msg = `harness batch ${bid}: merge ${m.id || ref}${m.goal ? ` — ${clip(m.goal, 72)}` : ''}`;
     const r = G.git(wt, [...G.identityArgs(wt), 'merge', '--no-ff', '--no-edit', '--no-verify', '-m', msg, ref], { allowFail: true, retryLock: true });
@@ -240,6 +254,7 @@ async function build(root, b, o, log) {
     b.checks = K.brief(j);
     b.failed_tests = ((j.failed_tests) || []).slice(0, 50);
     if (b.verdict !== 'pass') b.failing = j.results.filter(r => !r.ok).map(r => r.command);
+    if (b.verdict !== 'pass' || (rj.flaky && rj.flaky.length)) recordFailures(root, b, rj.first, j);
   }
   // 3. 린트 — accept 와 같이 묶음이 바꾼 파일에서({files}) 또는 저장소 전체에서 한 번. 실패면 판정은 fail.
   //   [2026-10-29 감사] batch 는 lint_command 를 돌리지 않아 accept 가 린트로 거절한 변경이 묶음으로는 사용자 브랜치에 들어갔다.
@@ -256,6 +271,26 @@ async function build(root, b, o, log) {
   b.status = 'ready';
   saveBatch(root, b);
   return result(root, b);
+}
+
+// 실패 출력 — [dev.pilot #84] batch 기록에 실패한 시험 이름만 남아, 동시 실행에서만 실패하는 시험의 원인을 보려면 같은 검사를 다시 돌려야 했다.
+//   실패 · 불안정(다시 돌려 통과)할 때 첫 실행과 마지막 실행의 실패한 검사 출력을 batches/<bid>.logs/<n>-<first|final>.log 에 쓰고(비밀을 가린다)
+//   기록 b.failures 에 발췌 · 실패한 시험 · TRX 경로 · 로그 경로를 둔다. 크기는 runCheck 가 모은 것 그대로(앞 256KB + 꼬리 256KB).
+//   대상 끝 · 기준선 출력은 남기지 않는다. 쓰기 실패는 판정을 막지 않는다(b.log_error). 로그는 batch drop · gc 가 함께 지운다.
+const logsOf = (root, bid) => path.join(dirOf(root), `${bid}.logs`);
+function recordFailures(root, b, first, final) {
+  const dir = logsOf(root, b.id), out = [];
+  try { fs.mkdirSync(dir, { recursive: true }); } catch (e) { b.log_error = clip(e.message, 200); }
+  for (const [run, j] of [['first', first], ['final', final]]) {
+    if (!j) continue;
+    const bad = j.results.filter(r => !r.ok);
+    K.failureRecord(j.results, run).forEach((f, i) => {
+      const file = path.join(dir, `${i + 1}-${run}.log`);
+      try { fs.writeFileSync(file, K.maskOutput(String(bad[i].output || ''))); f.log = file; } catch (e) { b.log_error = clip(e.message, 200); }
+      out.push(f);
+    });
+  }
+  if (out.length) b.failures = out.slice(0, 20);
 }
 
 function result(root, b) {
@@ -283,6 +318,9 @@ function format(b) {
     if ((b.flaky || []).length) L.push(`  불안정(실패했다가 다시 돌리니 통과): ${b.flaky.join(' ; ')}`);
     if ((b.failing || []).length) L.push(`  실패한 검사: ${b.failing.join(' ; ')}`);
     if ((b.failed_tests || []).length) L.push(`  실패한 시험: ${b.failed_tests.slice(0, 10).join(', ')}${b.failed_tests.length > 10 ? ` … (+${b.failed_tests.length - 10})` : ''}`);
+    for (const f of (b.failures || []).slice(0, 5)) L.push(`  실패 출력(${f.run === 'first' ? '첫 실행' : '마지막 실행'}): ${f.command}${f.log ? ` → ${f.log}` : ''}${(f.artifacts || []).length ? ` · TRX: ${f.artifacts.join(', ')}` : ''}`);
+    const ex = (b.failures || []).find(f => f.excerpt && f.excerpt.trim());
+    if (ex) for (const l of ex.excerpt.split(/\r?\n/).filter(x => x.trim()).slice(0, 5)) L.push(`    | ${l.slice(0, 200)}`);
     if (b.baseline_error) L.push(`  대상 끝을 재지 못했다: ${b.baseline_error}`);
     if (b.checks_source === 'user' && b.verdict === 'fail') L.push('  사용자가 준 검사(--check)다 — 원래부터 실패여도 "나빠지지 않음" 으로 넘기지 않는다(accept 와 같다)');
   }
@@ -297,7 +335,11 @@ function format(b) {
         : `다음: 실패를 고친 뒤 다시 묶는다 · 그래도 합치려면 ${cli} batch accept ${b.id} --force · 버리려면 ${cli} batch drop ${b.id}`);
     L.push('사용자 브랜치는 그대로다.');
   }
-  if (b.status === 'accepted') L.push(`구성원은 accepted 로 기록했다(되돌리기: ${cli} cancel <id> — 그 구성원의 병합만 되돌린다)${b.worktree_kept ? ` · 작업 폴더 남김: ${b.worktree} (${b.worktree_kept})` : ''}`);
+  if (b.status === 'accepted') {
+    L.push(`구성원은 accepted 로 기록했다(되돌리기: ${cli} cancel <id> — 그 구성원의 병합만 되돌린다)${b.worktree_kept ? ` · 작업 폴더 남김: ${b.worktree} (${b.worktree_kept})` : ''}`);
+    // [dev.pilot #86] 인증 실패를 마지막 push 에서야 알았다 — 올리기 전에 쓰기 권한을 먼저 본다(사용자가 push 를 말했을 때 · 하네스가 스스로 원격에 접속하지 않는다)
+    L.push(`push 하기 전에(사용자가 말했을 때): ${cli} push --dry-run 으로 쓰기 권한 · 계정을 먼저 확인한다(아무것도 보내지 않는다)`);
+  }
   return L.join('\n');
 }
 
@@ -356,7 +398,7 @@ function acceptLocked(root, b, o) {
     const live = !o.force && fs.existsSync(P.wt) && liveSessionIn(root, P.wt);
     if (live) return refuse(`member ${mm.id}: ${live}`, `구성원 ${mm.id} 의 worktree 에서 산 세션이 일하고 있다 — 끝난 뒤 다시 하거나(그 세션을 끝내고) --force`);
     if (t.mode === 'light' && fs.existsSync(P.wt) && G.worktreeRegistered(root, P.wt)) {
-      const dirty = G.dirtyFiles(P.wt).map(e => e.path).filter(f => !f.startsWith('.harness/'));
+      const dirty = I.unownedLeftovers(P.wt).unowned;   // commitLeftovers 와 같은 규칙(내용만 바뀐 서브모듈 · 검사 캐시는 빼고)
       if (dirty.length) return refuse(`lane ${mm.id} has uncommitted changes since it was batched: ${dirty.slice(0, 5).join(', ')} — commit them and run batch again`, `칸 ${mm.id} 에 묶은 뒤의 미커밋 변경이 있다: ${dirty.slice(0, 5).join(', ')} — 커밋하고 batch 를 다시 하세요`);
     }
   }
@@ -433,6 +475,7 @@ function drop(o) {
       const d = G.git(root, ['branch', '-D', b.branch], { allowFail: true, retryLock: true });
       if (!d.ok) return { id: bid, status: b.status, refused: true, reason: `could not delete ${b.branch}: ${clip(d.err, 200)}`, report: `pilot batch ${bid} — 브랜치 ${b.branch} 를 지우지 못했다: ${clip(d.err, 200)}` };
     }
+    try { fs.rmSync(logsOf(root, bid), { recursive: true, force: true }); } catch { /* 남으면 gc 가 지운다 */ }
     if (b.status !== 'accepted') b.status = 'dropped';
     b.dropped_at = S.nowIso();
     saveBatch(root, b);
@@ -440,4 +483,37 @@ function drop(o) {
   });
 }
 
-module.exports = { create, accept, status, drop, format, readBatch, listBatches, pickMembers, removeBatchWorktree, BID_RE };
+// ready <id> [--note "…"] | --clear — 다음 batch 후보 표시(#87). 상태가 아니라 "이 끝(tip)에서 다음 batch 에 실어도 된다" 는 사람 · 총괄의 표시다.
+//   [dev.pilot #87] 표적 시험까지 끝났지만 이번 클로징 밖이라 기다리는 레인을 status 가 일반 열린 레인과 구분하지 못해 batch 대기열에서 빠졌다.
+//   하네스는 판정하지 않는다 — 묶을 수 있는 작업(done · 열린 light 칸)인지 · 주인 모를 미커밋이 없는지만 보고, 표시한 끝을 적는다.
+function markReady(o) {
+  const root = S.mainRoot(o.root || process.cwd()), id = o.id;
+  // [#87 리뷰 N3] 잠금을 산 프로세스가 쥐고 있으면 예외가 아니라 거부 — integrate.withTaskLock 과 같은 말
+  let h;
+  try { h = S.acquire(root, `task-${id}`); }
+  catch (e) { if (e.code === 'LOCK_HELD') { const t0 = S.readTask(root, id); return { id, status: t0 ? t0.status : 'unknown', refused: true, reason: `task is owned by a live process (pid ${e.owner && e.owner.pid})`, report: `pilot ready ${id} — 바뀐 것 없음: 다른 프로세스(pid ${e.owner && e.owner.pid})가 이 작업을 쥐고 있다` }; } throw e; }
+  try {
+    const t = S.readTask(root, id);
+    if (!t) throw Object.assign(new Error(`unknown task: ${id}`), { code: 'UNKNOWN_TASK' });
+    const refused = (why, ko) => ({ id, status: t.status, refused: true, reason: why, report: `pilot ready ${id} — 바뀐 것 없음: ${ko}` });
+    if (o.clear) {
+      const had = !!t.ready;
+      delete t.ready; S.writeTask(root, t); S.log(root, id, { event: 'ready_cleared' });
+      return { id, status: t.status, report: `pilot ready ${id} — ${had ? '다음 batch 후보 표시를 지웠다' : '표시가 없었다'}` };
+    }
+    if (!eligible(t)) return refused(`task ${id} is ${t.status} — only done tasks and open light lanes can be marked ready`, `${t.status} 작업은 표시할 수 없다(done · 열린 light 칸만)`);
+    if (!G.branchExists(root, t.branch)) return refused(`branch ${t.branch} does not exist`, `브랜치 ${t.branch} 가 없다`);
+    const P = S.taskPathsFor(root, t);
+    const dirty = fs.existsSync(P.wt) ? I.unownedLeftovers(P.wt).unowned : [];
+    if (dirty.length) return refused(`uncommitted changes in ${P.wt}: ${dirty.slice(0, 10).join(', ')} — commit only the files you changed in this lane, then mark it ready`, `레인에 커밋하지 않은 변경이 있다(${dirty.slice(0, 5).join(', ')}) — 자기가 고친 파일만 커밋한 뒤 다시 표시한다`);
+    const note = String(o.note || '').replace(/[\r\n]+/g, ' ').trim().slice(0, 200) || null;
+    // [#87 리뷰 S1] 쓰기 직전에 다시 읽는다 — 그사이 다른 경로(batch accept 등 이 잠금을 쥐지 않는 쓰기)가 상태를 바꿨으면 조용히 덮어쓰지 않고 거부한다
+    const now = S.readTask(root, id);
+    if (!now || now.status !== t.status || !eligible(now)) return refused(`task ${id} changed to ${now ? now.status : 'missing'} while it was being marked — nothing was written`, `표시하는 사이 작업이 ${now ? now.status : '없음'} 으로 바뀌었다 — 아무것도 쓰지 않았다`);
+    now.ready = { at: S.nowIso(), tip: G.headSha(root, now.branch), note };
+    S.writeTask(root, now); S.log(root, id, { event: 'ready_marked', tip: now.ready.tip, note });
+    return { id, status: now.status, ready: now.ready, report: `pilot ready ${id} — 다음 batch 후보로 표시했다(끝 ${now.ready.tip.slice(0, 10)}${note ? ` · ${note}` : ''}) · 묶기: node harness/cli.js batch --ready · 표시 뒤 커밋하면 다시 표시한다` };
+  } finally { h.release(); }
+}
+
+module.exports = { create, accept, status, drop, format, readBatch, listBatches, pickMembers, removeBatchWorktree, markReady, eligible, logsOf, BID_RE };

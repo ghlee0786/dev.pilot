@@ -38,7 +38,9 @@ function main() {
     if (!sess) return;
     const runtime = C.detectRuntime(input);
     const files = Array.isArray(sess.files) ? sess.files : [];
-    const { mine, secrets } = files.length ? C.uncommittedOf(info.root, files) : { mine: [], secrets: [] };
+    const { mine: cand, secrets } = files.length ? C.uncommittedOf(info.root, files) : { mine: [], secrets: [] };
+    // [2026-11-02 소유권] stop 과 같은 거르기 — 경로 기록만으로 대신 커밋하지 않는다(C.ownedGate).
+    const { ok: mine, skipped } = cand.length ? C.ownedGate(info, sid, sess, cand) : { ok: [], skipped: [] };
     const now = new Date().toISOString();
     let res = { ok: true, sha: null };
     if (mine.length) {
@@ -48,7 +50,8 @@ function main() {
     C.updateSession(info.common, sid, runtime, s => {
       s.ended_at = now;
       s.end_reason = input.reason || null;
-      if (res.ok && !secrets.length) s.files = [];           // 깨끗하게 끝났다 — 파일 기록을 비운다
+      if (res.ok && !secrets.length && !skipped.length) { s.files = []; delete s.file_meta; }   // 깨끗하게 끝났다 — 파일 기록을 비운다
+      if (skipped.length) s.end_skipped = skipped.map(x => ({ ...x, at: now })); else delete s.end_skipped;   // 남긴 파일 · 이유(기록은 그대로)
       if (res.sha) s.last_commit = { sha: res.sha, files: mine, at: now, by: 'session-end' };
       if (!res.ok) s.commit_error = { error: res.error, files: mine, at: now };
       if (secrets.length) s.secrets_left = secrets;

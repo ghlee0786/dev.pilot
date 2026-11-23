@@ -37,7 +37,16 @@ function decide(input, runtime) {
     // 자동 갱신 확인 — 대화형 세션은 하네스 명령을 거의 부르지 않으므로 사용자가 말할 때도 본다(하루 한 번 · 별도 프로세스).
     if (info) { try { require('../lib/autoupdate').maybe(info.root); } catch { /* 훅을 멈추지 않는다 */ } }
     const ko = isKorean(input.prompt);
-    if (info && sid) C.updateSession(info.common, sid, runtime, s => { s.user_lang = ko ? 'ko' : (s.user_lang || null); return s; });
+    // [#93] 세션 기록 잠금을 못 잡아도(부하 · 다른 훅이 쥠) 이번 턴의 언어 규칙은 싣는다 — 기록 실패는 남기기만 한다.
+    //   user_lang 은 거의 매 턴 같은 값이라, 이미 그 값이면 잠그지 않는다(board 훅과 같은 잠금을 다투지 않게).
+    if (info && sid) {
+      const cur = C.loadSession(info.common, sid);
+      const want = ko ? 'ko' : ((cur && cur.user_lang) || null);
+      if (!cur || (cur.user_lang ?? null) !== want) {
+        try { C.updateSession(info.common, sid, runtime, s => { s.user_lang = ko ? 'ko' : (s.user_lang || null); return s; }); }
+        catch (e) { C.logError('lang', e, cwd); }
+      }
+    }
     return ko ? { hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: CONTEXT } } : null;
   }
   if (ev === 'Stop') {

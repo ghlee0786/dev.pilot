@@ -265,12 +265,22 @@ function analyzeTexts(texts, mode, ctx) {
 }
 
 // $NAME · ${NAME} · $env:NAME · %NAME% → 같은 명령에서 정한 값 · 환경 변수(없으면 그대로 — 풀 수 없는 경로로 남는다)
+//   [자동 이슈 #95 #96] 값은 정한 그대로(`x='$x$x$x$x$x$x'`) 기억하므로, 명령 자리에서 거듭 풀면 자기 참조가 지수로 불어나
+//   `Invalid string length` 로 죽었다(그 전에 수 초를 쓴다). 결과가 상한을 넘으면 풀지 않는다(풀 수 없는 값과 같다).
+const EXPAND_MAX = 1 << 20;
 function expandVars(s, ctx) {
-  const v = name => { const k = String(name).toLowerCase(); if (ctx && ctx.vars && ctx.vars[k] != null) return ctx.vars[k]; const e = Object.keys(process.env).find(x => x.toLowerCase() === k); return e ? process.env[e] : null; };
+  const src = String(s);
+  let size = src.length;
+  const cap = (m, val) => { size += String(val).length - m.length; return size > EXPAND_MAX ? m : val; };
+  const r = expandVarsRaw(src, ctx, cap);
+  return size > EXPAND_MAX || r.length > EXPAND_MAX ? src : r;
+}
+function expandVarsRaw(s, ctx, cap) {
+  const v = name => { const k = String(name).toLowerCase(); if (ctx && ctx.vars && ctx.vars[k] != null) return ctx.vars[k]; if (ctx && ctx.remote) return null; const e = Object.keys(process.env).find(x => x.toLowerCase() === k); return e ? process.env[e] : null; };
   return String(s)
-    .replace(/\$env:([A-Za-z_]\w*)/gi, (m, n) => v(n) != null ? v(n) : m)
-    .replace(/%([A-Za-z_]\w*)%/g, (m, n) => v(n) != null ? v(n) : m)
-    .replace(/\$\{([A-Za-z_]\w*)\}|\$([A-Za-z_]\w*)/g, (m, a, b) => { const n = a || b; if (/^pwd$/i.test(n) && ctx && ctx.cwd) return ctx.cwdUnknown ? m : ctx.cwd; if (/^(home|null)$/i.test(n)) return m; return v(n) != null ? v(n) : m; });
+    .replace(/\$env:([A-Za-z_]\w*)/gi, (m, n) => v(n) != null ? cap(m, v(n)) : m)
+    .replace(/%([A-Za-z_]\w*)%/g, (m, n) => v(n) != null ? cap(m, v(n)) : m)
+    .replace(/\$\{([A-Za-z_]\w*)\}|\$([A-Za-z_]\w*)/g, (m, a, b) => { const n = a || b; if (/^pwd$/i.test(n) && ctx && ctx.cwd) return ctx.cwdUnknown ? m : ctx.cwd; if (/^(home|null)$/i.test(n)) return m; return v(n) != null ? cap(m, v(n)) : m; });
 }
 // 단어 하나가 통째로 변수면($p · ${p}) 따옴표 없는 확장처럼 공백으로 나눈다.
 function expandWord(word, ctx) {
@@ -361,12 +371,69 @@ function analyzeCommand(words0, mode, ctx) {
     try { return analyzeString(body, mode, ctx) || (p === 'eval' ? null : analyzeTexts(stdin(), 'ps', ctx)); } finally { ctx.depth--; }
   }
   if (START.has(p)) return checkStart(p, args, mode, ctx);
+  if (p === 'hc') return checkHc(args, mode, ctx, docs, piped);
   if (p === 'git') return checkGit(args, ctx);
   if (p === 'gh' || p === 'glab') return checkForgeCli(p, args);
   if (DELETERS.has(p)) return checkDelete(p, args, mode, ctx, (viaXargs || mode === 'ps') ? piped : null);
   const spec = INLINE_CODE[p] || (/^python[\d.]*w?$/.test(p) ? INLINE_CODE.python : null);
   if (spec) return checkInlineCode(args, spec, child(ctx));
   return null;
+}
+
+// Herdr Core: run/exec만 명령이다. send의 지시·결과 보고는 실행 코드가 아니다.
+// 설치된 hc run/exec --help 기준. 첫 argv 또는 -- 뒤는 프로그램 인자로 그대로 둔다.
+function parseHc(args) {
+  let i = 0;
+  while (args[i] === '--json') i++;
+  const sub = args[i++];
+  if (sub !== 'run' && sub !== 'exec') return null;
+  const out = { sub, argv: [], bg: false, stdin: false, cwd: null, remote: false, env: [] };
+  const values = sub === 'run' ? ['--name', '--cwd', '--on', '--label', '--parent', '--timeout'] : ['--cwd', '--on', '--env', '--timeout'];
+  const flags = sub === 'run' ? ['--json', '--no-parent', '--no-notify', '--outlive-parent', '--rm', '--keep', '--bg'] : ['--json', '-i', '--stdin'];
+  for (; i < args.length; i++) {
+    const a = args[i];
+    if (a === '--') { i++; break; }
+    if (a === '--help' || a === '-h') return null;
+    const eq = a.indexOf('='), key = eq < 0 ? a : a.slice(0, eq);
+    if (values.includes(key)) {
+      const value = eq < 0 ? args[++i] : a.slice(eq + 1);
+      if (value == null) return null;
+      if (key === '--cwd') out.cwd = value;
+      if (key === '--on') out.remote = true;
+      if (key === '--env') out.env.push(value);
+      continue;
+    }
+    if (flags.includes(a)) {
+      if (a === '--bg') out.bg = true;
+      if (a === '-i' || a === '--stdin') out.stdin = true;
+      continue;
+    }
+    break;
+  }
+  out.argv = args.slice(i);
+  return out;
+}
+function checkHc(args, mode, ctx, docs, piped) {
+  const hc = parseHc(args);
+  if (!hc || !hc.argv.length) return null;
+  const next = child(ctx);
+  next.vars = { ...ctx.vars };
+  // 원격의 상대 삭제 경로는 알 수 없다. 위치에 무관한 git 금지는 그대로 검사한다.
+  if (hc.remote) { next.remote = true; next.cwdUnknown = 'unknown'; next.vars = {}; next.aliases = {}; }
+  else if (hc.cwd != null) changeDir('cd', [hc.cwd], next);
+  for (const env of hc.env) { const at = env.indexOf('='); if (at > 0) setVar(next, env.slice(0, at), env.slice(at + 1)); }
+  // run의 단일 문자열은 호출 도구가 아니라 Core 쪽 셸이 실행한다(원격은 OS도 다를 수 있다).
+  // 암묵 셸은 양쪽 문법으로 보수적으로 검사한다. 명시한 bash/pwsh argv는 아래 기존 분석을 쓴다.
+  if (hc.sub === 'run' && hc.argv.length === 1) {
+    for (const shell of ['bash', 'ps']) {
+      const reason = analyzeString(hc.argv[0], shell, { ...child(next), vars: { ...next.vars }, aliases: { ...next.aliases } });
+      if (reason) return reason;
+    }
+    return null;
+  }
+  const argv = hc.argv.slice();
+  if (hc.stdin) { argv.push(...docs.map(t => HD + t)); argv.pipedFrom = piped; }
+  return analyzeCommand(argv, mode, next);
 }
 
 // 셸 · iex 가 stdin 으로 받는 문자열: heredoc · here-string, 그리고 파이프 앞 명령이 내보내는 것을 알 수 있을 때(echo · printf · cat <<EOF · cat 파일 · PS 문자열).
@@ -641,11 +708,16 @@ function gitOpt(o, longs, shorts) {
 }
 const gitShort = (o, c) => o.toks.some(t => t.short === c);
 // --pathspec-from-file=<f> 의 경로들(‘-’ = stdin 은 알 수 없다 → unknown).
-function fromFile(o, gitCwd) {
+function fromFile(o, gitCwd, remote) {
   const t = o.toks.find(x => x.long && 'pathspec-from-file'.startsWith(x.long) && x.long.length >= 2);
   if (!t || t.value == null) return { specs: [], unknown: false };
-  if (t.value === '-') return { specs: [], unknown: true };
+  if (remote || t.value === '-') return { specs: [], unknown: true };
   try { return { specs: fs.readFileSync(path.resolve(gitCwd, t.value), 'utf8').split(/\r?\n|\0/).map(x => x.trim()).filter(Boolean), unknown: false }; } catch { return { specs: [], unknown: true }; }
+}
+
+// 원격 상태를 로컬 저장소에서 대신 읽지 않는다. 기존 조회불가 판정만 사용한다.
+function readGitState(cwd, args, remote) {
+  return remote ? { status: -1, stdout: '', stderr: '' } : C.git(cwd, args);
 }
 
 function checkGit(args0, ctx) {
@@ -671,7 +743,7 @@ function checkGit(args0, ctx) {
   //   [2026-10-29 감사] 같은 명령 줄에서 정의한 별칭(`git config alias.pp push && git pp`)도 본다.
   if (!GIT_BUILTINS.has(sub) && (ctx.depth || 0) < 6) {
     let val = cliAliases[sub] != null ? cliAliases[sub] : (ctx.aliases || {})[sub];
-    if (val == null) { const r = C.git(gitCwd, ['config', '--get', `alias.${sub}`]); if (r.status === 0) val = r.stdout.replace(/\r?\n$/, ''); }
+    if (val == null) { const r = readGitState(gitCwd, ['config', '--get', `alias.${sub}`], ctx.remote); if (r.status === 0) val = r.stdout.replace(/\r?\n$/, ''); }
     if (val != null && val.trim()) {
       const inner = { ...ctx, cwd: gitCwd, depth: (ctx.depth || 0) + 1 };
       if (val.trim().startsWith('!')) return analyzeString(`${val.trim().slice(1)} ${rest.map(x => JSON.stringify(x)).join(' ')}`, 'bash', inner);
@@ -689,14 +761,14 @@ function checkGit(args0, ctx) {
     case 'pull':
       return REASONS.pull;
     case 'reset':
-      return checkReset(o, gitCwd);
+      return checkReset(o, gitCwd, ctx.remote);
     case 'update-ref':
       return REASONS.branchMove;
     case 'clean':
       if (gitOpt(o, ['dry-run'], 'n')) return null;
       return gitOpt(o, ['force'], 'f') ? REASONS.clean : null;
     case 'branch':
-      return checkBranch(o, gitCwd);
+      return checkBranch(o, gitCwd, ctx.remote);
     case 'checkout': {
       if (gitOpt(o, ['force'], 'f')) return REASONS.force;
       if (gitShort(o, 'B')) return REASONS.branchMove;
@@ -727,16 +799,16 @@ function checkGit(args0, ctx) {
     case 'rm': {
       if (gitOpt(o, ['cached']) || gitOpt(o, ['dry-run'], 'n')) return null;
       if (!gitShort(o, 'r')) return null;
-      const specs = [...(o.dd ? o.after : o.pos), ...fromFile(o, gitCwd).specs];
+      const specs = [...(o.dd ? o.after : o.pos), ...fromFile(o, gitCwd, ctx.remote).specs];
       return specs.some(x => isWholeTree(x, gitCwd, ctx)) ? REASONS.gitRm : null;
     }
     case 'worktree':
       return ((rest[0] || '').toLowerCase() === 'remove' && gitOpt(gitParse(rest.slice(1)), ['force'], 'f')) ? REASONS.worktree : null;
     case 'add': case 'stage':
-      return checkAddSecrets(o, gitCwd);
+      return checkAddSecrets(o, gitCwd, ctx.remote);
     case 'commit':
       if (gitOpt(o, ['amend'])) return REASONS.amend;
-      return checkCommitSecrets(o, gitCwd);
+      return checkCommitSecrets(o, gitCwd, ctx.remote);
     case 'update-index': {
       if (!gitOpt(o, ['add'])) return null;
       const named = [...o.pos, ...o.after].filter(C.isSecretPath);
@@ -766,37 +838,37 @@ function checkGit(args0, ctx) {
 
 // branch: -D · --delete --force 는 지운다. -f 는 옮긴다. -M/-C(= -m/-c --force)는 대상 이름이 이미 있고 원래 이름과 다를 때만 덮어쓴다 —
 //   [2026-10-29 감사 오탐] `git branch -M main`(git init 직후 GitHub 안내) 은 새 이름으로 바꿀 뿐이라 막지 않는다.
-function checkBranch(o, gitCwd) {
+function checkBranch(o, gitCwd, remote) {
   const del = gitOpt(o, ['delete'], 'd'), force = gitOpt(o, ['force'], 'f');
   if (gitShort(o, 'D') || (del && force)) return REASONS.branch;
   const move = gitShort(o, 'M') || gitShort(o, 'C') || ((gitOpt(o, ['move'], 'm') || gitOpt(o, ['copy'], 'c')) && force);
   if (!move) return force ? REASONS.branchMove : null;
   const target = o.pos[o.pos.length - 1];
   if (!target) return null;
-  const source = o.pos.length >= 2 ? o.pos[0] : C.git(gitCwd, ['symbolic-ref', '--short', '-q', 'HEAD']).stdout.trim();
-  const same = (a, b) => C.IS_WIN ? a.toLowerCase() === b.toLowerCase() : a === b;
+  const source = o.pos.length >= 2 ? o.pos[0] : readGitState(gitCwd, ['symbolic-ref', '--short', '-q', 'HEAD'], remote).stdout.trim();
+  const same = (a, b) => !remote && C.IS_WIN ? a.toLowerCase() === b.toLowerCase() : a === b;
   if (source && same(source, target)) return null;
-  const r = C.git(gitCwd, ['show-ref', '--verify', '--quiet', `refs/heads/${target}`]);
+  const r = readGitState(gitCwd, ['show-ref', '--verify', '--quiet', `refs/heads/${target}`], remote);
   return r.status === 1 ? null : REASONS.branchMove;           // 없다(1)면 새 이름 · 있거나 모르면(오류) 막는다
 }
 
 // reset: --hard 는 언제나 막는다. 그 밖(--soft · --mixed · --keep · --merge · 모드 없음)은 브랜치를 옮길 때만 막는다 —
 //   경로를 지정한 reset(`git reset -- f` · `git reset HEAD~1 -- f`)과 인자 없는 reset 은 색인만 바꾼다.
-function checkReset(o, gitCwd) {
+function checkReset(o, gitCwd, remote) {
   if (gitOpt(o, ['hard'])) return REASONS.reset;
   if (gitOpt(o, ['patch'], 'p') || o.toks.some(t => t.long && t.long.length >= 2 && 'pathspec-from-file'.startsWith(t.long))) return null;
   const pos = o.pos;
   if (!pos.length || o.after.length || pos.length > 1) return null;
   const cand = pos[0];
-  if (!o.dd) { try { if (fs.existsSync(path.resolve(gitCwd, cand))) return null; } catch { /* 경로가 아니다 */ } }
-  return movesHead(gitCwd, cand) ? REASONS.resetMove : null;
+  if (!remote && !o.dd) { try { if (fs.existsSync(path.resolve(gitCwd, cand))) return null; } catch { /* 경로가 아니다 */ } }
+  return movesHead(gitCwd, cand, remote) ? REASONS.resetMove : null;
 }
 
 // cand 가 HEAD 와 다른 커밋인가. 풀 수 없으면(저장소 밖 · 없는 이름) 커밋처럼 생긴 이름일 때만 그렇다고 본다(fail-closed).
-function movesHead(gitCwd, cand) {
-  const c = C.git(gitCwd, ['rev-parse', '-q', '--verify', cand + '^{commit}']);
+function movesHead(gitCwd, cand, remote) {
+  const c = readGitState(gitCwd, ['rev-parse', '-q', '--verify', cand + '^{commit}'], remote);
   if (c.status === 0) {
-    const h = C.git(gitCwd, ['rev-parse', '-q', '--verify', 'HEAD^{commit}']);
+    const h = readGitState(gitCwd, ['rev-parse', '-q', '--verify', 'HEAD^{commit}'], remote);
     return !(h.status === 0 && h.stdout.trim() === c.stdout.trim());
   }
   return /[~^@]/.test(cand) || /^[0-9a-f]{7,40}$/i.test(cand) || /^(ORIG_HEAD|FETCH_HEAD|MERGE_HEAD)$/.test(cand);
@@ -807,6 +879,7 @@ function isWholeTree(spec, gitCwd, ctx) {
   if (WHOLE_TREE.has(s)) return true;
   if (/^[.\\/]+$/.test(s) || /^:\/?$/.test(s)) return true;
   if (/[*?]/.test(s) && !/[A-Za-z0-9_]/.test(s.replace(/^:\(top\)|^:\//, ''))) return true;
+  if (ctx.remote) return false;
   // `..` 처럼 저장소 루트나 그 위를 가리키는 경로.
   const abs = resolveTarget(gitCwd, s);
   const root = repoRootOf(gitCwd, ctx);
@@ -816,7 +889,7 @@ function isWholeTree(spec, gitCwd, ctx) {
 // [2026-10-29 감사] 같은 체크아웃의 다른 산 세션이 고치는 미커밋 파일을 checkout/restore 로 되돌리면 그 변경은 되돌릴 수 없게 사라진다
 //   (게시판의 확인은 Write/Edit 에만 걸린다). 세션 기록 · 산 세션 판정은 게시판과 같다. 다른 세션 기록이 없으면 git 을 부르지 않는다.
 function peerReason(gitCwd, ctx, specsFn) {
-  if (!ctx.sid) return null;
+  if (!ctx.sid || ctx.remote) return null;
   const info = C.repoInfo(gitCwd);
   if (!info) return null;
   const peers = C.listSessions(info.common).filter(s => String(s.session_id) !== ctx.sid && !s.ended_at && s.files.length);
@@ -838,16 +911,16 @@ function peerReason(gitCwd, ctx, specsFn) {
 
 // 비밀 파일이 스테이징될 참인가 — 이름으로 직접 지정했거나, 넓은 add(. · -A · 디렉터리)가 쓸어 담을 때.
 //   [2026-10-29 감사] -f/--force 면 .gitignore 된 비밀도 들어간다(`git add -f .`) — 무시된 파일까지 본다.
-function checkAddSecrets(o, gitCwd) {
+function checkAddSecrets(o, gitCwd, remote) {
   if (gitOpt(o, ['dry-run'], 'n')) return null;
-  const ff = fromFile(o, gitCwd);
+  const ff = fromFile(o, gitCwd, remote);
   const specs = [...o.pos, ...o.after, ...ff.specs];
   const named = specs.filter(C.isSecretPath);
   if (named.length) return secretReason('스테이징', named);
   const broad = gitOpt(o, ['all', 'update'], 'Au') || ff.unknown;
   if (!specs.length && !broad) return null;
   const force = gitOpt(o, ['force'], 'f');
-  const st = C.git(gitCwd, ['-c', 'core.quotepath=false', 'status', '--porcelain', '-z', '--untracked-files=all', ...(force ? ['--ignored'] : []), '--', ...(specs.length ? specs : [':/'])]);
+  const st = readGitState(gitCwd, ['-c', 'core.quotepath=false', 'status', '--porcelain', '-z', '--untracked-files=all', ...(force ? ['--ignored'] : []), '--', ...(specs.length ? specs : [':/'])], remote);
   if (st.status !== 0) return null;
   const hits = st.stdout.split('\0').filter(e => e.length > 3).map(e => e.slice(3)).filter(C.isSecretPath);
   return hits.length ? secretReason('스테이징', hits) : null;
@@ -856,20 +929,20 @@ function checkAddSecrets(o, gitCwd) {
 // 커밋에 들어갈 비밀 파일. [2026-10-29 감사]
 //   경로를 준 커밋(`-- <파일>` · `<파일>` · --only)은 그 경로만 커밋한다(작업 트리 내용 그대로) — 색인의 남이 스테이징한 것은 보지 않고(오탐이었다),
 //   그 경로가 고르는 추적 파일의 변경을 본다(`git commit -m x .env` 가 새 비밀값을 커밋했다). -i/--include 면 색인 전체 + 경로.
-function checkCommitSecrets(o, gitCwd) {
+function checkCommitSecrets(o, gitCwd, remote) {
   const found = new Set();
   const take = r => { if (r.status === 0) r.stdout.split('\0').filter(C.isSecretPath).forEach(f => found.add(f)); };
   const Q = ['-c', 'core.quotepath=false'];
-  const ff = fromFile(o, gitCwd);
+  const ff = fromFile(o, gitCwd, remote);
   const specs = [...o.pos, ...o.after, ...ff.specs];
   const withPaths = specs.length > 0 || ff.unknown;
   specs.filter(C.isSecretPath).forEach(f => found.add(f));
-  if (!withPaths || gitOpt(o, ['include'], 'i')) take(C.git(gitCwd, [...Q, 'diff', '--cached', '--name-only', '-z']));
-  if (!withPaths && gitOpt(o, ['all'], 'a')) take(C.git(gitCwd, [...Q, 'diff', '--name-only', '-z']));
+  if (!withPaths || gitOpt(o, ['include'], 'i')) take(readGitState(gitCwd, [...Q, 'diff', '--cached', '--name-only', '-z'], remote));
+  if (!withPaths && gitOpt(o, ['all'], 'a')) take(readGitState(gitCwd, [...Q, 'diff', '--name-only', '-z'], remote));
   if (withPaths) {
     const sp = ff.unknown ? [':/'] : specs;
-    let r = C.git(gitCwd, [...Q, 'diff', 'HEAD', '--name-only', '-z', '--', ...sp]);
-    if (r.status !== 0) r = C.git(gitCwd, [...Q, 'ls-files', '-z', '--', ...sp]);   // 첫 커밋(HEAD 없음)
+    let r = readGitState(gitCwd, [...Q, 'diff', 'HEAD', '--name-only', '-z', '--', ...sp], remote);
+    if (r.status !== 0) r = readGitState(gitCwd, [...Q, 'ls-files', '-z', '--', ...sp], remote);   // 첫 커밋(HEAD 없음)
     take(r);
   }
   return found.size ? secretReason('커밋', [...found]) : null;
@@ -1001,6 +1074,7 @@ function isAncestor(a, b) {           // a 가 b 의 (엄격한) 상위인가
 
 // cwd 가 속한 저장소의 작업 트리 루트들(그 worktree · 메인 체크아웃)과 공통 git 디렉터리 — cwd 마다 한 번만 묻는다.
 function rootsOf(cwd, ctx) {
+  if (ctx && ctx.remote) return { roots: [], common: null };
   const cache = (ctx && ctx.rootCache) || {};
   if (cache[cwd]) return cache[cwd];
   const info = C.repoInfo(cwd);
@@ -1189,4 +1263,4 @@ function main() {
 }
 
 if (require.main === module) { main(); process.exitCode = 0; }
-module.exports = { lex, analyze, decide, isDangerousTarget, checkGit, checkMcp };
+module.exports = { lex, analyze, decide, isDangerousTarget, checkGit, checkMcp, parseHc };

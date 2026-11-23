@@ -7,6 +7,7 @@
 //   engine 의 status 는 앞의 네 필드만 읽는다. 나머지(stop_blocks 등)는 훅끼리의 기록이다.
 //   게시판(board.js): cwd · root(작업 트리 루트) · branch · goal(첫 요청 ≤ 200자) · last_seen · warned_sessions — 끝나면 ended_at(session-end).
 const fs = require('node:fs');
+const crypto = require('node:crypto');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 
@@ -381,6 +382,86 @@ function commitFiles(root, files, message) {
   return { ok: true, sha: h.stdout.trim() };
 }
 
+// ── [2026-11-02 소유권] 대신 커밋(stop · stop-fallback · session-end)은 '이 세션이 이 checkout 에서 쓴 그 내용' 만 ──
+//   사고: 원장(공통 .git · 상대 경로만)이 다른 checkout 의 같은 상대 경로(남의 미커밋 변경)를 '내 파일' 로 보고 대신 커밋했다.
+//   s.files(문자열 배열 · 다른 소비자 그대로) 옆에 s.file_meta[<checkout 실경로>\0<경로>] = {root, rel, pre_seen, pre_dirty, tainted, post_seen, post_sha, at}.
+//   쓰기 전(PreToolUse · board) = 그때 미커밋이었나 · 쓰기 뒤(PostToolUse · track) = 내용 지문. 하나라도 불확실하면 그 파일은 대신 커밋하지 않는다.
+//   경로 기록만으로는 소유가 아니다 — 모델이 직접 커밋하는 길은 그대로 열려 있다(막을 때 이유를 알린다).
+function rootKey(root) { const r = real(root).replace(/[\\/]+$/, ''); return IS_WIN ? r.toLowerCase() : r; }
+function metaKey(root, rel) { return rootKey(root) + '\0' + keyOf(rel); }
+// 작업 파일 내용 지문 — 확정된 없음(ENOENT · 지움)은 'absent' · 그 밖의 읽기 실패는 'error:<code>'(불명확 — 대신 커밋하지 않는다).
+function fileSha(root, rel) {
+  try { return crypto.createHash('sha256').update(fs.readFileSync(path.join(root, rel))).digest('hex'); }
+  catch (e) { return e && e.code === 'ENOENT' ? 'absent' : `error:${(e && e.code) || 'read'}`; }
+}
+const shaFailed = v => typeof v !== 'string' || v.startsWith('error:');
+// index 의 그 파일 항목(모드 · blob · stage) — 작업 파일이 같아도 남이 `git add -p` 등으로 index 만 바꾼 것을 잡는다.
+function indexSig(root, rel) {
+  const r = module.exports.git(root, ['--literal-pathspecs', 'ls-files', '-s', '-z', '--', rel]);
+  return r.status === 0 ? r.stdout : null;
+}
+// 쓰기 전: 처음이거나 깨끗해진 뒤의 첫 쓰기면 그때 상태를 새로 적는다. 이미 적은 파일이 그 사이 남의 손을 탔으면 tainted(사유 문자열).
+//   작업 파일 지문뿐 아니라 index 항목도 본다 — 남이 index 만 바꾼 뒤 이 세션이 다시 쓰면 새 Post 가 남의 index 를 '내 것' 으로 덮어 씻어 낸다.
+//   한 번 tainted 면 깨끗해지기(커밋 · 되돌림) 전까지 남는다(새 Post 로 지우지 않는다).
+function notePre(meta, root, rels) {
+  const dirty = dirtyPaths(root, rels), now = new Date().toISOString();
+  for (const rel of rels) {
+    const k = metaKey(root, rel), m = meta[k], isDirty = dirty.has(keyOf(rel));
+    if (!m || !isDirty) { meta[k] = { root: real(root), rel, pre_seen: true, pre_dirty: isDirty, tainted: false, post_seen: false, post_sha: null, pre_pending: true, at: now }; continue; }
+    if (!m.tainted) {
+      if (!m.post_seen) m.tainted = 'no_post';         // 앞 Pre 의 짝 Post 가 없는데 미커밋 — 그 사이 누가 바꿨는지 모른다(옛 clean 증거로 세탁 0)
+      else {                                         // 마지막 내 Post 뒤 바뀌었나(겹친 Pre · 끼어든 쓰기 · 남의 index 포함)
+        const now = fileSha(root, rel), idx = indexSig(root, rel);
+        if (shaFailed(now) || idx === null) m.tainted = 'read';
+        else if (now !== m.post_sha) m.tainted = 'content';
+        else if (idx !== m.post_index) m.tainted = 'index';
+      }
+    }
+    m.pre_pending = true;                              // 이번 쓰기의 쓰기 전 증거 — 다음 Post 가 소비한다
+  }
+  return meta;
+}
+// 쓰기 뒤: 지문. 쓰기 전 기록이 없으면 pre_seen false 로 남긴다(불명확 — 대신 커밋하지 않는다).
+//   쓰기마다 그 쓰기의 Pre 증거(pre_pending)를 소비한다 — 앞선 정상 쓰기 뒤 Pre 없이 온 Post(누락 · 실패)는 tainted 'no_pre'(깨끗해지기 전까지 남음).
+function notePost(meta, root, rels) {
+  const now = new Date().toISOString();
+  for (const rel of rels) {
+    const k = metaKey(root, rel);
+    const m = meta[k] || { root: real(root), rel, pre_seen: false, pre_dirty: false, tainted: false };
+    const tainted = m.tainted || (m.pre_seen && !m.pre_pending ? 'no_pre' : false);
+    meta[k] = { ...m, tainted, pre_pending: false, post_seen: true, post_sha: fileSha(root, rel), post_index: indexSig(root, rel), at: now };
+  }
+  return meta;
+}
+// 다른 세션이 이 checkout 의 이 파일을 기록 중인가 — 살아 있는지와 무관하다(남은 기록 = 그 세션의 미커밋 몫).
+//   옛 원장(file_meta 없음)은 checkout 을 알 수 없으므로 같은 경로면 그 세션 것으로 본다(보수적).
+function heldByOther(p, root, rel) {
+  if (p.file_meta && typeof p.file_meta === 'object') return !!p.file_meta[metaKey(root, rel)];
+  return (p.files || []).some(f => keyOf(f) === keyOf(rel));
+}
+// 대신 커밋 대상 거르기 — files: uncommittedOf 의 mine(이 세션 기록 ∩ 지금 미커밋). ok 만 커밋 · 나머지는 {path, reason}.
+function ownedGate(info, sid, sess, files) {
+  const meta = sess && sess.file_meta && typeof sess.file_meta === 'object' ? sess.file_meta : {};
+  const others = listSessions(info.common).filter(p => p.session_id !== String(sid));
+  const ok = [], skipped = [];
+  for (const rel of files) {
+    const m = meta[metaKey(info.root, rel)];
+    let reason = null, cur = null;
+    if (!m) reason = Object.values(meta).some(x => x && keyOf(String(x.rel || '')) === keyOf(rel)) ? 'root_mismatch' : 'legacy_no_fingerprint';
+    else if (m.pre_dirty) reason = 'pre_existing_dirty';
+    else if (!m.pre_seen) reason = 'pre_unknown';
+    else if (!m.post_seen) reason = 'post_unknown';
+    else if (shaFailed(m.post_sha)) reason = 'read_error';
+    else if (m.tainted) reason = m.tainted === 'index' ? 'index_changed' : m.tainted === 'read' ? 'read_error' : m.tainted === 'no_pre' ? 'pre_unknown' : m.tainted === 'no_post' ? 'post_unknown' : 'external_change';
+    else if ((cur = fileSha(info.root, rel)) && shaFailed(cur)) reason = 'read_error';
+    else if (cur !== m.post_sha) reason = 'external_change';
+    else if (m.post_index === undefined || m.post_index === null || indexSig(info.root, rel) !== m.post_index) reason = 'index_changed';
+    else if (others.some(p => heldByOther(p, info.root, rel))) reason = 'other_session_same_file';
+    if (reason) skipped.push({ path: rel, reason }); else ok.push(rel);
+  }
+  return { ok, skipped };
+}
+
 function listForReason(files, max) {
   const m = max || 30;
   const shown = files.slice(0, m).map(f => '`' + f + '`').join(', ');
@@ -391,4 +472,5 @@ module.exports = {
   real, IS_WIN, readStdinJson, git, repoInfo, harnessDir, safeId, sessionPath, sid8, sleepMs,
   loadSession, updateSession, writeJsonAtomic, logError, detectRuntime, isSecretPath, samePath, repoRel,
   isHarnessWorktree, laneOf, harnessOwned, listSessions, platformAgents, parseAgents, agentOf, sessionLive, LIVE_MS, dirtyPaths, uncommittedOf, commitFiles, listForReason, keyOf, LOCK,
+  fileSha, indexSig, notePre, notePost, ownedGate,
 };

@@ -241,6 +241,8 @@ function spawnSpec(argv, forceShell) {
 
 // 출력이 이만큼 멈추면 멈춘 것으로 본다 — 멈춘 테스트를 떼어 낼 줄 아는 러너(언어 팩 hang)에만. o.stallMs: 0 이면 끔.
 const STALL_MS = Number(process.env.HARNESS_CHECK_STALL_MS) || 5 * 60 * 1000;   // 환경 값은 테스트용
+// 검사의 부모가 끝난 뒤 남은 출력을 기다리는 시간 — 그 뒤에도 파이프가 닫히지 않으면 자손이 붙든 것으로 본다(#53).
+const EXIT_GRACE_MS = 3000;
 function runCheck(cwd, argv, o) {
   const timeoutMs = Math.max(1000, (o && o.timeoutMs) || CHECK_TIMEOUT_MS);
   const opt = o || {};
@@ -258,7 +260,7 @@ function runCheck(cwd, argv, o) {
       const ok = code === 0 && !timedOut && !(s.found && s.fail > 0);
       resolve({ command: opt.label || display(argv), argv, exit_code: code, timed_out: timedOut, ...(stalled ? { stalled: true } : {}), found: s.found, pass: s.found ? s.pass : (ok ? 1 : 0), fail: s.found ? s.fail : (ok ? 0 : 1), ok, output, ms: Date.now() - t0 });
     };
-    try { child = spawn(spec.cmd, spec.args, { cwd, env: { ...childEnv(opt.bin), ...require('./proc').isolationEnv(cwd) }, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, shell: spec.shell, detached: !IS_WIN }); }
+    try { child = spawn(spec.cmd, spec.args, { cwd, env: { ...childEnv(opt.bin), ...require('./proc').isolationEnv(cwd), ...(opt.slotHeld ? { HARNESS_SLOT_HELD: opt.slotHeld } : {}) }, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, shell: spec.shell, detached: !IS_WIN }); }
     catch (e) { return finish(null, e.message); }
     // [2026-10-29 다른 세션 실측] Node 타이머는 2^31-1ms(약 24.8일)를 넘으면 1ms 로 바뀐다 — 상한을 크게 풀면(check_timeout_min 100000) 검사가 곧바로 "시간 초과" 로 끝났다. 한도로 자른다.
     timer = setTimeout(() => stop('timeout'), Math.min(timeoutMs, MAX_TIMER_MS));
@@ -266,22 +268,85 @@ function runCheck(cwd, argv, o) {
     child.stdout.on('data', push); child.stderr.on('data', push);
     child.on('error', e => finish(null, e.message));
     child.on('close', code => finish(code));
+    // [자동 이슈 #53] 검사(dotnet test)는 끝났는데 남은 자손(MSBuild 노드 · nodeReuse)이 출력 파이프를 붙들어 'close' 가 오지 않았다 —
+    //   결과가 상한(15분)까지 돌아오지 않았다. 부모가 끝나면 잠시 남은 출력을 받고, 그래도 닫히지 않으면 파이프를 닫고 결과를 낸다.
+    //   남은 자손은 여기서 거두지 않는다(부모가 없어 트리로 못 찾는다) — 레인 프로세스 정리에 맡긴다. 유예 뒤의 출력은 판정에서 빠진다.
+    //   유예는 exit 뒤 마지막 출력부터 센다 — 부모가 끝난 뒤에도 출력이 이어지면 그때마다 다시 기다린다(#53 리뷰 S1).
+    child.on('exit', code => {
+      if (done || timedOut) return;
+      const close = () => {
+        if (done || timedOut) return;
+        try { child.stdout.destroy(); child.stderr.destroy(); } catch { /* 이미 닫힘 */ }
+        finish(code);
+      };
+      let grace = setTimeout(close, EXIT_GRACE_MS); grace.unref();
+      const rearm = () => { clearTimeout(grace); grace = setTimeout(close, EXIT_GRACE_MS); grace.unref(); };
+      child.stdout.on('data', rearm); child.stderr.on('data', rearm);
+    });
   });
 }
 
 // o.serialRoot 가 있으면 그 프로젝트의 검사를 하나씩 돌린다(줄 선 잠금 "checks" · 기본 켬 · 프로젝트 블록 serial_checks: off 로 끈다).
 //   [2026-10-15 자동 이슈 #4] 같은 시험 DB 를 쓰는 작업 둘이 동시에 검사하다 서로 멈췄다. 기다리는 동안 이벤트 루프를 막지 않는다(stop 을 받는다).
 //   차례는 먼저 온 순서 · o.priority 0(사용자의 accept)이 1(나머지)을 앞지른다. o.label 은 줄에 보일 이름(검사 이름이 아니다).
+//   serial_checks: machine 이면 같은 줄을 PC 공용 폴더에 선다 — 같은 PC 의 다른 저장소 검사 · slot 명령과 번갈아 쓴다.
+//   잡은 이는 자식 환경에 HARNESS_SLOT_HELD(잠금 폴더)를 넘긴다 — 그 자식이 같은 줄에 다시 서면(slot 안의 batch · 검사 안의 slot) 교착하므로 줄 없이 돈다.
 function inQueue(o, fn) {
-  const S = require('./state');
-  return S.acquireQueued(o.serialRoot, 'checks', { priority: o.priority ?? 1, label: o.label || null }).then(async h => {
-    try { return await fn({ ...o, serialRoot: null, label: undefined }); } finally { h.release(); }
+  const S = require('./state'), base = slotBase(o.serialRoot), held = S.lockDir(o.serialRoot, 'checks', base);
+  if (holdsSlot(held)) return Promise.resolve().then(() => fn({ ...o, serialRoot: null, label: undefined }));
+  const meta = { repo: S.paths(o.serialRoot).root, timeout_ms: Math.max(1000, o.timeoutMs || CHECK_TIMEOUT_MS) };
+  return S.acquireQueued(o.serialRoot, 'checks', { priority: o.priority ?? 1, label: o.label || null, dir: base, meta }).then(async h => {
+    try { return await fn({ ...o, serialRoot: null, label: undefined, slotHeld: held }); } finally { h.release(); }
   });
 }
-// 프로젝트 블록 serial_checks — 기본 켬, off|false|no 일 때만 끈다. 여러 곳을 주면 값이 있는 첫 곳이 정한다(부른 체크아웃 → worktree).
-function serialChecksOn(...roots) {
-  for (const r of roots.filter(Boolean)) { const v = yamlString(r, 'serial_checks'); if (v) return !/^(off|false|no)$/i.test(v); }
-  return true;
+// 프로젝트 블록 serial_checks — on(기본 · 저장소마다 줄) | machine(PC 공용 줄) | off|false|no(줄 없음 → null). 여러 곳을 주면 값이 있는 첫 곳이 정한다(부른 체크아웃 → worktree).
+//   무엇이 무거운지는 프로젝트가 정한다 — 기본을 PC 줄로 하면 가벼운 저장소가 남의 긴 빌드 뒤에서 기다린다.
+function serialScope(...roots) {
+  for (const r of roots.filter(Boolean)) { const v = yamlString(r, 'serial_checks'); if (v) return /^(off|false|no)$/i.test(v) ? null : /^machine$/i.test(v) ? 'machine' : 'repo'; }
+  return 'repo';
+}
+function serialChecksOn(...roots) { return serialScope(...roots) !== null; }
+// 검사 줄의 잠금 · 번호표 폴더(lockDir 의 base) — machine 이면 PC 공용, 아니면 undefined(그 저장소의 locks).
+const slotBase = root => (serialScope(root) === 'machine' ? require('./resources').machineLocksDir() : undefined);
+// 이 프로세스가 그 줄을 이미 쥔 이의 자식인가 — 실경로로 비교한다(Windows 는 대소문자 · 짧은 이름 무시).
+const holdsSlot = held => !!process.env.HARNESS_SLOT_HELD && require('../hooks/_common').samePath(process.env.HARNESS_SLOT_HELD, held);
+
+// slot — 하네스 밖 무거운 명령(sln 빌드 · 이미지 빌드)을 검사 줄에 세워 돌린다. 차례가 오면 출력을 그대로 보이며 실행하고 끝나면 놓는다.
+//   [dev.pilot #85] 저장소를 넘는 무거운 일의 차례를 총괄이 손 장부와 GO 메시지로 넘겼다 — 총괄이 깨어 있을 때만 다음 차례가 됐다.
+//   잡기 · 놓기를 따로 부르는 짝은 두지 않는다 — 주인의 생존은 pid 와 시작 시각으로 보므로, CLI 가 끝나는 순간 잠금이 죽은 것으로 보인다.
+//   종료 코드는 명령의 것 그대로(하네스가 성패를 판정하지 않는다) · 상한을 넘으면 프로세스 트리를 끊고 124 · 실행하지 못하면 127.
+//   o: { cwd, label, timeoutMs, log, pollMs }
+async function runInSlot(root, argv, o) {
+  const S = require('./state'), opt = o || {}, log = opt.log || (x => process.stderr.write(x + '\n'));
+  const min = yamlNumber(root, 'check_timeout_min');
+  const timeoutMs = Math.max(1000, opt.timeoutMs || (min > 0 ? min * 60000 : CHECK_TIMEOUT_MS));
+  const scope = serialScope(root), base = slotBase(root);
+  let h = null, held = null;
+  if (!scope) log('[pilot] slot: serial_checks is off — running without the checks queue');
+  else {
+    held = S.lockDir(root, 'checks', base);
+    if (!holdsSlot(held)) {
+      let seen = '';
+      const label = `slot ${opt.label || path.basename(String(argv[0] || ''))}`;
+      h = await S.acquireQueued(root, 'checks', { priority: 1, label, dir: base, pollMs: opt.pollMs, meta: { repo: S.paths(root).root, kind: 'slot', timeout_ms: timeoutMs },
+        onWait: (n, owner) => { const now = `${n}|${owner ? owner.token : ''}`; if (now === seen) return; seen = now; log(`[pilot] slot: waiting (${Math.max(0, n - 1)} ahead) — now ${owner ? `${owner.label || 'pid ' + owner.pid}${owner.repo ? ' · ' + path.basename(owner.repo) : ''} (since ${owner.at})` : 'free'}`); } });
+    }
+  }
+  const spec = spawnSpec(argv);
+  return new Promise(resolve => {
+    let timedOut = false, done = false, child, timer;
+    // Ctrl+C · 종료 신호 · 터미널(콘솔) 닫힘: 기본 동작은 exit 훅 없이 끝나 자식(POSIX 는 분리된 프로세스 그룹)이 남는다 — 트리를 끊고 놓은 뒤 끝낸다.
+    const SIGS = ['SIGINT', 'SIGTERM', 'SIGHUP'];
+    const onSig = sig => { killTree(child && child.pid); if (h) h.release(); process.exit(sig === 'SIGINT' ? 130 : sig === 'SIGHUP' ? 129 : 143); };
+    const finish = code => { if (done) return; done = true; clearTimeout(timer); for (const x of SIGS) process.off(x, onSig); if (h) h.release(); resolve(code); };
+    for (const x of SIGS) process.on(x, onSig);
+    // POSIX 는 runCheck 처럼 분리해 띄운다 — 상한 초과 때 프로세스 그룹째(손자까지) 끊는다. Windows 는 taskkill /T 가 트리를 끊는다.
+    try { child = spawn(spec.cmd, spec.args, { cwd: opt.cwd || process.cwd(), env: { ...process.env, ...(held ? { HARNESS_SLOT_HELD: held } : {}) }, stdio: 'inherit', windowsHide: true, shell: spec.shell, detached: !IS_WIN }); }
+    catch (e) { log(`[pilot] slot: cannot run ${display(argv)}: ${e.message}`); return finish(127); }
+    timer = setTimeout(() => { timedOut = true; log(`[pilot] slot: ${display(argv)} ran past ${Math.round(timeoutMs / 60000)} min — stopping it`); killTree(child.pid); }, Math.min(timeoutMs, MAX_TIMER_MS));
+    child.on('error', e => { log(`[pilot] slot: cannot run ${display(argv)}: ${e.message}`); finish(127); });
+    child.on('close', code => finish(timedOut ? 124 : code == null ? 1 : code));
+  });
 }
 async function runAll(cwd, commands, o) {
   if (o && o.serialRoot) return inQueue(o, q => runAll(cwd, commands, q));
@@ -296,6 +361,7 @@ async function runAll(cwd, commands, o) {
 // 실패한 검사는 한 번 더 돌린다 — 다시 돌려 통과하면 불안정(flaky)이다. 그 결과로 판정하고 불안정한 명령 이름을 돌려준다.
 //   [2026-10-03 실측] 코드 변경 없이 1 · 2 · 16 건 실패 후 통과 — 작업자가 없는 버그를 고치느라 이어 가기를 썼다. 모델 판정이 아니라 재실행이다.
 //   직렬이면 다시 돌리기까지 한 차례 안에서 한다(줄 뒤로 다시 서지 않는다).
+//   다시 돌렸으면 first(첫 실행 결과 · 출력 포함)도 돌려준다 — [dev.pilot #84] 판정은 재실행 결과로 바뀌어 "동시 실행에서만 실패" 한 첫 출력이 사라졌다.
 async function runJudged(cwd, commands, o) {
   if (o && o.serialRoot) return inQueue(o, q => runJudged(cwd, commands, q));
   const first = await runAll(cwd, commands, o);
@@ -305,7 +371,7 @@ async function runJudged(cwd, commands, o) {
   const again = await runAll(cwd, idx.map(i => commands[i]), o);
   const results = first.results.slice(), flaky = [];
   idx.forEach((i, k) => { results[i] = again.results[k]; if (again.results[k].ok) flaky.push(first.results[i].command); });
-  return { judged: summarize(results), flaky };
+  return { judged: summarize(results), flaky, first };
 }
 // 멈춘 테스트 떼어 내기 — 기준선에서 시간 초과된 검사의 멈춘 테스트를 언어 팩이 짚어 빼고 다시 돌린다(최대 4번).
 //   [2026-10-20 실측 · 음성 비서 Python 저장소] 오디오 장치를 기다리는 테스트 하나가 2% 지점에서 영원히 멈춰, 전체 pytest 가 매번 15분 상한에 걸렸다 —
@@ -429,6 +495,23 @@ function clip(text, head, tail) {
   if (s.length <= head + tail) return s;
   return s.slice(0, head) + `\n…[${s.length - head - tail} chars omitted]…\n` + s.slice(s.length - tail);
 }
+// 기록용 출력 가리기 — 쓰는 쪽에서 비밀을 가린다(board.maskSecrets · 없는 판이면 그대로).
+function maskOutput(s) { try { return require('../hooks/board').maskSecrets(s); } catch { return String(s || ''); } }
+// 실패한 검사의 기록용 요약 — [dev.pilot #84] batch 기록에 실패한 시험 이름만 남아, 원인을 보려면 같은 검사를 다시 돌려야 했다.
+//   run: 'first' | 'final' · tests: 실패한 시험(앞 20) · excerpt: 첫 실패 시험 이름 근처부터(없으면 꼬리) 4000자 · 비밀을 가린다 ·
+//   artifacts: 출력에 찍힌 TRX 경로(dotnet test --logger trx 의 "Results File:" · 한국어 SDK "결과 파일:") — 복사하지 않는다. 실패한 검사 20개까지.
+const EXCERPT_MAX = 4000;
+const TRX_RE = /^[ \t]*(?:Results File|결과 파일)[ \t]*:[ \t]*(.+?\.trx)[ \t]*\r?$/gim;
+function failureRecord(results, run) {
+  return (results || []).filter(r => !r.ok).slice(0, 20).map(r => {
+    const out = maskOutput(String(r.output || '').replace(ANSI, ''));
+    const tests = failedTests(out).slice(0, 20);
+    const at = tests.length ? out.indexOf(tests[0]) : -1;
+    const excerpt = at >= 0 ? out.slice(Math.max(0, at - 200), Math.max(0, at - 200) + EXCERPT_MAX) : out.slice(-EXCERPT_MAX);
+    return { command: r.command, run, exit_code: r.exit_code, timed_out: !!r.timed_out, pass: r.pass, fail: r.fail, tests, excerpt,
+      artifacts: [...new Set([...out.matchAll(TRX_RE)].map(m => m[1].trim()))].slice(0, 10) };
+  });
+}
 // 실패한 테스트 이름이 있으면 맨 앞에 — 출력 앞부분이 빌드 잡음이어도 무엇이 실패했는지 보인다.
 function failureExcerpt(judged) {
   const bad = judged.results.filter(r => !r.ok);
@@ -438,5 +521,5 @@ function failureExcerpt(judged) {
 }
 
 module.exports = { lintArgv, syncLint, yamlNumber, yamlString, yamlList, yamlListOf, spawnSpec, CHECK_TIMEOUT_MS, splitCommand, display, isShellString, discover, repoKinds, programName, parseSummary,
-  runCheck, runAll, runJudged, inQueue, serialChecksOn, failedTests, isolateHangs, STALL_MS, summarize, brief, judge, worseThan, signature, firstAssertion, failureExcerpt, clip, killTree, childEnv,
+  runCheck, runAll, runJudged, inQueue, serialChecksOn, serialScope, runInSlot, failedTests, isolateHangs, STALL_MS, summarize, brief, judge, worseThan, signature, firstAssertion, failureExcerpt, failureRecord, maskOutput, clip, killTree, childEnv,
   definitions, commandsForJudge, isNpmTest, npmTestScript, yamlTestCommandOf };

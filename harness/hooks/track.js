@@ -48,6 +48,7 @@ function main() {
         const k = C.IS_WIN ? rel.toLowerCase() : rel;
         if (!have.has(k)) { s.files.push(rel); have.add(k); }
       }
+      s.file_meta = C.notePost(s.file_meta && typeof s.file_meta === 'object' ? s.file_meta : {}, info.root, rels);   // 쓴 뒤 지문(소유권 · stop)
       return s;
     });
   } catch (e) {

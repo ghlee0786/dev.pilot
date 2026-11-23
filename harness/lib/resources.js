@@ -43,6 +43,8 @@ function portEnv(root, id) {
 //   프로젝트 yaml: port_range: "20000-39999" · port_block: 20 (없거나 이상하면 기본).
 const PORT_FINAL = new Set(['accepted', 'cancelled']);
 const machinePortsFile = () => process.env.HARNESS_PORTS_FILE || path.join(baseTmp(), 'harness', 'ports.json');
+// PC 공용 검사 줄(serial_checks: machine)의 잠금 · 번호표 폴더 — 포트 장부와 같은 바탕이라 작업 환경(TEMP 를 바꾼 레인)에서도 같은 곳이다.
+const machineLocksDir = () => path.join(baseTmp(), 'harness', 'locks');
 const okEntry = e => !!e && typeof e === 'object' && Number.isInteger(e.base) && Number.isInteger(e.count) && e.count > 0;
 function readLedger(file) {
   const raw = require('./state').readJson(file, null), led = {};
@@ -240,5 +242,5 @@ function record(task, r) {
   return r;
 }
 
-module.exports = { envFor, tmpDirFor, dataNs, composeProject, repoKey, teardownCompose, listProcesses: defaultProcs, killProcess: defaultKill, runCleanupCommand, removeTmp, release, WT_RE,
+module.exports = { machineLocksDir, envFor, tmpDirFor, dataNs, composeProject, repoKey, teardownCompose, listProcesses: defaultProcs, killProcess: defaultKill, runCleanupCommand, removeTmp, release, WT_RE,
   portBlock, freePorts, portsOf };

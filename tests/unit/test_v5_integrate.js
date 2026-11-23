@@ -245,6 +245,14 @@ const hasMergeHead = cwd => spawnSync('git', ['rev-parse', '-q', '--verify', 'ME
     const task11 = S.readTask(r11, t11.id);
     R.check('[IN-13][M4] 무시된 파일(out.log)이 바뀐 worktree 는 accept 뒤에도 남는다 · 파일 그대로', a11.status === 'accepted' && read(path.join(P11.wt, 'out.log')) === 'build output the user wants\n', `${a11.status} ${a11.reason}`);
     R.check('[IN-13][M4] 남긴 이유(worktree_kept)에 파일 이름 · 보고에도', /out\.log/.test(task11.worktree_kept || '') && /out\.log/.test(a11.report || ''), `${task11.worktree_kept} | ${a11.report}`);
+    // [#91] 남긴 이유가 권하는 명령은 guard 가 막지 않아야 한다(--force 는 막힌다) — 그대로 실행하면 무시된 파일만 남은 worktree 가 지워진다.
+    const cmd11 = ((task11.worktree_kept || '').match(/git worktree remove "[^"]+"/) || [])[0] || '';
+    const GD11 = require('../../harness/hooks/guard.js');
+    const guard11 = c => GD11.decide({ hook_event_name: 'PreToolUse', session_id: 'g11', cwd: r11, tool_name: 'Bash', tool_input: { command: c } }, 'claude');
+    R.check('[IN-13b][#91] 남긴 이유는 --force 없이 그 worktree 경로로 git worktree remove 를 권한다', !!cmd11 && cmd11.includes(P11.wt) && !/remove --force/.test(task11.worktree_kept || ''), task11.worktree_kept);
+    R.check('[IN-13b][#91] 권하는 명령은 guard 가 통과시킨다(같은 명령의 --force 는 막힌다)', !!cmd11 && guard11(cmd11) === null && guard11(`git worktree remove --force "${P11.wt}"`) !== null, `${cmd11} → ${JSON.stringify(guard11(cmd11))}`);
+    const rm11 = spawnSync('git', ['worktree', 'remove', P11.wt], { cwd: r11, encoding: 'utf8', windowsHide: true });
+    R.check('[IN-13b][#91] 권하는 명령(--force 없음)으로 무시된 파일만 남은 worktree 가 지워진다', rm11.status === 0 && !fs.existsSync(P11.wt), `${rm11.status} ${rm11.stderr}`);
 
     // ── [M7] cancel/restore 의 임시 worktree 에도 .worktreeinclude 복사 · --skip-checks ─
     const r12 = mkRepo({ check: CHECK_ENV_JS, files: ENV_FILES, untracked: { '.env': 'TOKEN=1\n' } });
@@ -313,6 +321,13 @@ const hasMergeHead = cwd => spawnSync('git', ['rev-parse', '-q', '--verify', 'ME
     fs.mkdirSync(path.join(r17, 'nested'), { recursive: true });
     let thrown = null; try { G.commitAll(path.join(r17, 'nested'), 'x'); } catch (e) { thrown = e; }
     R.check('[IN-18] commitAll 은 worktree 루트가 아닌 폴더에서 NOT_WORKTREE_ROOT 로 거부한다', thrown && thrown.code === 'NOT_WORKTREE_ROOT' && git(r17, ['rev-parse', 'HEAD']) === main17, thrown ? thrown.message : 'no throw');
+    // [자동 이슈 #58] 다시 시도해도 남은 index.lock — 하네스 결함(GIT_FAILED → 결함 보고)이 아니라 운영 오류(GIT_LOCKED)로 던지고, 그 파일을 지우라고 알린다
+    const r18 = mkRepo(), main18 = git(r18, ['rev-parse', 'HEAD']), lock18 = path.join(r18, '.git', 'index.lock');
+    write(path.join(r18, 'c.txt'), 'pending\n'); write(lock18, '');
+    let thrown18 = null; try { G.commitAll(r18, 'x'); } catch (e) { thrown18 = e; }
+    fs.rmSync(lock18, { force: true });
+    R.check('[IN-18b] (#58) 남은 index.lock — commitAll 은 GIT_LOCKED 로 던지고 · 메시지에 잠금 파일과 지우라는 안내 · 커밋 없음', thrown18 && thrown18.code === 'GIT_LOCKED' && /index\.lock is left over; if no git command is running/.test(thrown18.message) && git(r18, ['rev-parse', 'HEAD']) === main18,
+      thrown18 ? `${thrown18.code}: ${thrown18.message}` : 'no throw');
 
     // ── accept 의 검사는 작업에 기록된 검사 상한(check_timeout_min · --check-timeout-min)을 쓴다 ──
     //   [적대 2026-10-02] accept · cancel 은 o.checkTimeoutMs 만 봐서 작업의 상한(예: 20분 저장소)을 버리고 기본 15분으로 돌았다.

@@ -268,6 +268,15 @@ console.log(out.join('\\n'));console.log('# pass '+p+'\\n# fail '+f);process.exi
           a1.refused && /live session/.test(a1.reason) && /lane-1|lane-sess/.test(a1.reason) && /--force/.test(a1.reason) && k1.refused && c1.refused && /live session/.test(c1.reason)
             && git(r, ['rev-parse', 'main']) === main0 && fs.existsSync(path.join(wt, 'half.txt')) && S.readTask(r, t.id).status === 'open',
           JSON.stringify({ a1: a1.reason, k1: k1.reason, c1: c1.reason }));
+        // [자동 이슈 #88] 세션 기록의 cwd 는 낡았고(레인) 플랫폼 목록의 cwd 는 이미 메인 체크아웃 — 거부 이유에 기록상 cwd · 기록 시각 · 플랫폼 cwd 를 싣는다
+        const rec = JSON.parse(fs.readFileSync(Ch.sessionPath(common, sid), 'utf8'));
+        write(agentsFile, JSON.stringify([{ sessionId: sid, pid: process.pid, cwd: r, kind: 'interactive', name: 'lane-1', status: 'idle' }]));
+        const k88 = await I.check({ ...quiet, root: r, id: t.id });
+        write(agentsFile, JSON.stringify([{ sessionId: sid, pid: process.pid, cwd: wt, kind: 'interactive', name: 'lane-1', status: 'busy' }]));
+        R.check('[AC2-14c] (#88) 낡은 세션 기록으로 거부할 때 이유에 기록상 cwd · 기록 시각 · 플랫폼 cwd 가 있다',
+          k88.refused && /live session/.test(k88.reason) && k88.reason.includes(`recorded cwd ${rec.cwd} at ${rec.last_seen}`) && k88.reason.includes(`platform cwd ${r}`) && /--force/.test(k88.reason)
+            && I.refuseKo(k88.reason).includes(`platform cwd ${r}`) && !/live session/.test(I.refuseKo(k88.reason)),
+          JSON.stringify(k88.reason));
         // [자동 이슈 #67] 부른 세션 자신 — 예전에 cwd 가 그 레인에 있었다가 메인으로 돌아와 accept 를 부른다(세션 파일의 cwd 는 아직 레인). 자기 자신은 산 작업자가 아니다
         const hadSid = process.env.CLAUDE_CODE_SESSION_ID;
         process.env.CLAUDE_CODE_SESSION_ID = sid;
@@ -277,8 +286,14 @@ console.log(out.join('\\n'));console.log('# pass '+p+'\\n# fail '+f);process.exi
         a2 = await I.accept({ ...quiet, root: r, id: t.id, into: 'nope-branch' });
         R.check('[AC2-14] 세션이 끝나면(플랫폼 목록에 없음) 세션 때문에 거부하지 않는다', !/live session/.test(a2.reason || ''), a2.reason);
         write(agentsFile, JSON.stringify([{ sessionId: sid, pid: process.pid, cwd: wt, kind: 'interactive', name: 'lane-1', status: 'busy' }]));
+        // [2026-11-05 소유권] --force 는 산 세션 거부만 넘는다 — 그 세션이 반쯤 쓴 half.txt 를 하네스가 대신 커밋하지 않는다
         a3 = await I.accept({ ...quiet, root: r, id: t.id, force: true });
-        R.check('[AC2-14] --force 면 산 세션이 있어도 받아들인다', a3.status === 'accepted', JSON.stringify([a3.status, a3.reason]));
+        R.check('[AC2-14] --force 여도 주인 모를 미커밋분(half.txt)이 있으면 거부 · main · half.txt 내용 그대로 · 작업 open',
+          a3.refused === true && /owner cannot be proven/.test(a3.reason || '') && /half\.txt/.test(a3.reason || '') && git(r, ['rev-parse', 'main']) === main0
+            && fs.readFileSync(path.join(wt, 'half.txt'), 'utf8') === 'HALF WRITTEN\n' && S.readTask(r, t.id).status === 'open', JSON.stringify([a3.status, a3.reason]));
+        git(wt, ['add', '--', 'half.txt']); git(wt, ['commit', '-qm', 'half (the session commits its own file)', '--', 'half.txt']);   // 그 세션이 자기 파일을 직접 커밋
+        const a4 = await I.accept({ ...quiet, root: r, id: t.id, force: true });
+        R.check('[AC2-14] 그 세션이 직접 커밋한 뒤에는 --force 면 산 세션이 있어도 받아들인다', a4.status === 'accepted', JSON.stringify([a4.status, a4.reason]));
       } finally { if (had == null) delete process.env.HARNESS_AGENTS_JSON; else process.env.HARNESS_AGENTS_JSON = had; }
     }
 
